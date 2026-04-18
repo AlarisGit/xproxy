@@ -75,6 +75,16 @@ def write_xray_config(content: str, info: PlatformInfo | None = None) -> None:
 
 def restart_xray(info: PlatformInfo | None = None) -> None:
     info = info or detect_platform()
+    # На Linux/systemd сбрасываем накопленный start-limit state перед рестартом.
+    # Во время агрессивных ротаций (xproxy быстро пробует несколько серверов подряд)
+    # systemd может пометить unit как "start-request-repeated-too-quickly" и
+    # отказывать в запуске до ручного reset-failed. Делаем это идемпотентно:
+    # если предыдущих отказов не было, команда просто ничего не изменит.
+    if info.name == "linux":
+        subprocess.run(
+            ["sudo", "-n", "systemctl", "reset-failed", "xray"],
+            capture_output=True,
+        )
     proc = subprocess.run(info.restart_cmd, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(
