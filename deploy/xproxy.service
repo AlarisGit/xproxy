@@ -13,7 +13,7 @@ Environment=PYTHONUNBUFFERED=1
 # XRAY_LOCATION_ASSET нужен для `xray -test`, который xproxy запускает при
 # валидации сгенерированного конфига (см. xproxy/xray_control.py). Тот же
 # путь должен быть прописан и в юните самого xray — см. deploy/install.sh.
-Environment=XRAY_LOCATION_ASSET=__HOME__/.config/xproxy/geo
+Environment=XRAY_LOCATION_ASSET=/var/lib/xproxy/geo
 ExecStart=__PYTHON__ __PROJECT_DIR__/main.py --daemon
 Restart=on-failure
 RestartSec=10

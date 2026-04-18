@@ -124,7 +124,7 @@ sudo visudo -c
 sudo systemctl edit xray
 # добавить:
 # [Service]
-# Environment=XRAY_LOCATION_ASSET=/home/<user>/.config/xproxy/geo
+# Environment=XRAY_LOCATION_ASSET=/var/lib/xproxy/geo
 sudo systemctl daemon-reload
 sudo systemctl restart xray
 ```
@@ -154,13 +154,21 @@ from xproxy.xray_control import restore_backup
 restore_backup()
 ```
 
-Custom `geosite.dat`/`geoip.dat` (с расширенным набором ru-категорий из `GeositeUrl` в `routing.json`) скачиваются в `~/.config/xproxy/geo/`. xray читает их оттуда через переменную `XRAY_LOCATION_ASSET`, которая прописывается один раз при установке (см. «Автозапуск» выше).
+Custom `geosite.dat`/`geoip.dat` (с расширенным набором ru-категорий из `GeositeUrl` в `routing.json`) скачиваются в shared-каталог и читаются xray-ом через переменную `XRAY_LOCATION_ASSET`, которая прописывается один раз при установке (см. «Автозапуск»).
 
-**Почему так, а не копирование в `/usr/local/share/xray/`:**
+Пути платформо-специфичные:
 
-- Не требуется sudo и специальных правил в sudoers — демон работает как обычный пользователь.
-- Нет класса ошибок FS (`EACCES`/`EROFS`) на системах, где системный каталог только для чтения (NixOS, immutable rootfs, squashfs-пакеты).
-- Конфигурация декларативна: один `Environment=XRAY_LOCATION_ASSET=...` в юните xray — и всё.
+- **Linux**: `/var/lib/xproxy/geo/` — каталог создаётся `deploy/install.sh` с правами `0755`, владелец — пользователь xproxy. xray-сервис (обычно от `nobody`) может читать эту директорию, потому что она не прячется внутри `$HOME`.
+- **macOS**: `~/.config/xproxy/geo/` — на macOS `brew services` запускает xray от текущего пользователя, home-директории по умолчанию world-executable, проблем с доступом нет.
+
+**Почему именно так, а не `~/.config/xproxy/geo/` на Linux:**
+
+`$HOME` на большинстве Linux-дистрибутивов имеет права `0750`, а `~/.config/` — `0700`. Пользователь `nobody`, под которым systemd обычно запускает xray-сервис, **не может войти** в эту цепочку директорий, даже если сами файлы world-readable — `open()` возвращает `permission denied`. Выносить geo-файлы в `/var/lib/xproxy/geo/` проще и безопаснее, чем менять права на `$HOME`.
+
+**Почему не `/usr/local/share/xray/`:**
+
+- Требует sudo и whitelist в sudoers для конкретных путей.
+- Ломается на системах с read-only системными каталогами (NixOS, immutable rootfs, squashfs-пакеты).
 
 Если `XRAY_LOCATION_ASSET` **не** задан у xray — xray возьмёт устаревшие geo-файлы, пришедшие с его пакетом, и правила маршрутизации `geosite:...`/`geoip:...` могут работать не так, как ожидается. Это наиболее частая причина «xproxy скачал свежую базу, но роутинг не изменился».
 

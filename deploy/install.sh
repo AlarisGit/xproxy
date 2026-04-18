@@ -28,6 +28,21 @@ ensure_log_dir() {
     echo "log dir $log_dir created"
 }
 
+# На Linux geo-файлы лежат в системном shared-каталоге, чтобы xray-сервис
+# (обычно запущен от nobody) мог их читать, не требуя ослабления прав на $HOME.
+ensure_geo_dir_linux() {
+    local geo_dir="/var/lib/xproxy/geo"
+    if [ -d "$geo_dir" ] && [ -w "$geo_dir" ]; then
+        echo "geo dir $geo_dir OK"
+        return
+    fi
+    echo "Creating $geo_dir (requires sudo)..."
+    sudo install -d -m 0755 -o "$user_name" -g "$(id -gn)" "$geo_dir"
+    # Убедимся, что промежуточная /var/lib/xproxy существует с нормальными правами
+    # (install -d создаст её автоматически как 0755 root:root — это то, что нужно).
+    echo "geo dir $geo_dir created"
+}
+
 ensure_log_dir
 
 os="$(uname -s)"
@@ -49,6 +64,7 @@ case "$os" in
         echo "  brew services restart xray"
         ;;
     Linux)
+        ensure_geo_dir_linux
         unit_target="/etc/systemd/system/xproxy.service"
         tmp="$(mktemp)"
         render "$here/xproxy.service" > "$tmp"
@@ -67,12 +83,14 @@ case "$os" in
         echo "  sudo visudo -c"
         echo
         echo "=== Шаг 3 (ОБЯЗАТЕЛЬНО): указать xray путь к geo-файлам ==="
-        echo "xproxy скачивает geosite.dat/geoip.dat в $user_home/.config/xproxy/geo."
+        echo "xproxy скачивает geosite.dat/geoip.dat в /var/lib/xproxy/geo"
+        echo "(shared-каталог с правами 0755, читается любым пользователем,"
+        echo " включая nobody, под которым обычно запущен xray-сервис)."
         echo "Без этой переменной xray использует устаревшие geo-файлы из своего пакета."
         echo "  sudo systemctl edit xray"
         echo "  # и вставьте:"
         echo "  # [Service]"
-        echo "  # Environment=XRAY_LOCATION_ASSET=$user_home/.config/xproxy/geo"
+        echo "  # Environment=XRAY_LOCATION_ASSET=/var/lib/xproxy/geo"
         echo "  sudo systemctl daemon-reload"
         echo "  sudo systemctl restart xray"
         ;;

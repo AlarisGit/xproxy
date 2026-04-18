@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import platform as _platform
 from pathlib import Path
 
 # ---------- Пути проекта ----------
@@ -27,8 +28,21 @@ ROUTING_JSON: Path = CONF_DIR / "routing.json"
 SERVERS_CACHE: Path = STATE_DIR / "servers.json"
 ACTIVE_STATE: Path = STATE_DIR / "active.json"
 
-# Директория для geosite.dat / geoip.dat (XRAY_LOCATION_ASSET)
-GEO_DIR: Path = Path.home() / ".config" / "xproxy" / "geo"
+# Директория для geosite.dat / geoip.dat (XRAY_LOCATION_ASSET).
+#
+# Linux: /var/lib/xproxy/geo — системный shared-кеш.
+#   Причина: на Linux xray-сервис обычно запущен под отдельным пользователем
+#   (обычно `nobody`). Он не может войти в /home/<user>/.config/, потому что
+#   $HOME на большинстве дистрибутивов имеет права 0750, а ~/.config — 0700.
+#   /var/lib/xproxy/geo с правами 0755 читается всеми, а пишется владельцем
+#   демона (sergey) без sudo. Директорию создаёт deploy/install.sh.
+#
+# macOS: ~/.config/xproxy/geo — xray под brew services работает от текущего
+#   пользователя, home-директории традиционно 0755, никаких проблем с доступом.
+if _platform.system().lower() == "linux":
+    GEO_DIR: Path = Path("/var/lib/xproxy/geo")
+else:
+    GEO_DIR: Path = Path.home() / ".config" / "xproxy" / "geo"
 
 # ---------- Локальный xray ----------
 SOCKS_HOST = "127.0.0.1"
