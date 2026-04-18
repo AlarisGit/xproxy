@@ -4,7 +4,45 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
-python_bin="${PYTHON:-$(command -v python3)}"
+
+# Выбор интерпретатора: приоритет — venv в проекте, чтобы зависимости из
+# requirements.txt (PySocks и т.п.) были гарантированно доступны демону.
+# Поведение:
+#   - PYTHON=/path/to/python ./install.sh  → использовать указанный интерпретатор
+#   - иначе: если есть .venv/ или venv/    → использовать его python3
+#   - иначе: создать .venv/ из системного python3 и установить requirements.txt
+venv_dir=""
+if [ -n "${PYTHON:-}" ]; then
+    python_bin="$PYTHON"
+    echo "using PYTHON override: $python_bin"
+elif [ -x "$root/.venv/bin/python3" ]; then
+    venv_dir="$root/.venv"
+    python_bin="$venv_dir/bin/python3"
+    echo "using existing venv: $venv_dir"
+elif [ -x "$root/venv/bin/python3" ]; then
+    venv_dir="$root/venv"
+    python_bin="$venv_dir/bin/python3"
+    echo "using existing venv: $venv_dir"
+else
+    sys_py="$(command -v python3 || true)"
+    if [ -z "$sys_py" ]; then
+        echo "ERROR: python3 не найден в PATH" >&2
+        exit 1
+    fi
+    venv_dir="$root/.venv"
+    echo "creating fresh venv at $venv_dir (using $sys_py)"
+    "$sys_py" -m venv "$venv_dir"
+    python_bin="$venv_dir/bin/python3"
+fi
+
+# Установить/обновить зависимости, если у нас venv и есть requirements.txt.
+if [ -n "$venv_dir" ] && [ -f "$root/requirements.txt" ]; then
+    echo "installing requirements from $root/requirements.txt"
+    "$python_bin" -m pip install --upgrade pip --quiet
+    "$python_bin" -m pip install -r "$root/requirements.txt" --quiet
+    echo "dependencies OK"
+fi
+
 user_home="$HOME"
 user_name="$(id -un)"
 
@@ -82,15 +120,25 @@ case "$os" in
         echo "  sudo install -m 0440 $sudoers_tmp /etc/sudoers.d/xproxy"
         echo "  sudo visudo -c"
         echo
-        echo "=== Шаг 3 (ОБЯЗАТЕЛЬНО): указать xray путь к geo-файлам ==="
+        echo "=== Шаг 3: override xray.service → XRAY_LOCATION_ASSET ==="
         echo "xproxy скачивает geosite.dat/geoip.dat в /var/lib/xproxy/geo"
-        echo "(shared-каталог с правами 0755, читается любым пользователем,"
-        echo " включая nobody, под которым обычно запущен xray-сервис)."
-        echo "Без этой переменной xray использует устаревшие geo-файлы из своего пакета."
-        echo "  sudo systemctl edit xray"
-        echo "  # и вставьте:"
-        echo "  # [Service]"
-        echo "  # Environment=XRAY_LOCATION_ASSET=/var/lib/xproxy/geo"
+        echo "(shared-каталог 0755, читается любым пользователем, в т.ч. nobody"
+        echo " под которым обычно запущен xray-сервис). Без этой переменной"
+        echo "xray использует устаревшие geo-файлы из своего пакета."
+        echo
+        xray_dropin_dir="/etc/systemd/system/xray.service.d"
+        xray_override="$xray_dropin_dir/xproxy-geo.conf"
+        xray_override_tmp="$(mktemp)"
+        cat > "$xray_override_tmp" <<EOF
+# Managed by xproxy deploy/install.sh.
+# Без этой директивы xray не увидит свежие geo-файлы, скачанные xproxy.
+[Service]
+Environment=XRAY_LOCATION_ASSET=/var/lib/xproxy/geo
+EOF
+        echo "xray override rendered → $xray_override_tmp"
+        echo "Install with:"
+        echo "  sudo install -d -m 0755 $xray_dropin_dir"
+        echo "  sudo install -m 0644 $xray_override_tmp $xray_override"
         echo "  sudo systemctl daemon-reload"
         echo "  sudo systemctl restart xray"
         ;;

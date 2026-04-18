@@ -1,2 +1,1 @@
-requests>=2.31
-PySocks>=1.7.1
+requests[socks]>=2.31
