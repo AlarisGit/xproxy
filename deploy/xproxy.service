@@ -1,0 +1,23 @@
+[Unit]
+Description=xproxy — xray watchdog / subscription updater
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Замените на своего пользователя и путь к репо.
+User=__USER__
+Group=__USER__
+WorkingDirectory=__PROJECT_DIR__
+Environment=PYTHONUNBUFFERED=1
+# XRAY_LOCATION_ASSET для самого xproxy (используется при --once тестах).
+Environment=XRAY_LOCATION_ASSET=__HOME__/.config/xproxy/geo
+ExecStart=__PYTHON__ __PROJECT_DIR__/main.py --daemon
+Restart=on-failure
+RestartSec=10
+# Ограничить запись — демону нужен только свой репо и ~/.config/xproxy/geo.
+ProtectSystem=full
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

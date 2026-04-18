@@ -1,0 +1,14 @@
+# /etc/sudoers.d/xproxy  (chmod 0440)
+# Разрешает xproxy-демону рестартить xray и переписывать его config.json
+# без пароля. Замените __USER__ на своего пользователя.
+
+Cmnd_Alias XPROXY_CMDS = \
+    /bin/systemctl restart xray, \
+    /usr/bin/systemctl restart xray, \
+    /usr/bin/tee /usr/local/etc/xray/config.json, \
+    /bin/tee /usr/local/etc/xray/config.json, \
+    /usr/bin/install -m 0644 /home/__USER__/.config/xproxy/geo/geosite.dat /usr/local/share/xray/geosite.dat, \
+    /usr/bin/install -m 0644 /home/__USER__/.config/xproxy/geo/geoip.dat /usr/local/share/xray/geoip.dat
+
+__USER__ ALL=(root) NOPASSWD: XPROXY_CMDS
+Defaults!XPROXY_CMDS !requiretty

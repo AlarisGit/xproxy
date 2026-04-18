@@ -1,0 +1,159 @@
+"""Управление процессом xray: запись конфига, рестарт, ожидание поднятия порта.
+
+Ключевая страховка: перед записью боевого config.json мы ВСЕГДА прогоняем
+`xray -test` на временном файле. Если тест не прошёл — боевой конфиг не
+трогаем, xray остаётся с предыдущим рабочим состоянием.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+from .logger import get_logger
+from .platform_utils import (
+    PlatformInfo,
+    detect_platform,
+    restart_xray as _platform_restart,
+    write_xray_config,
+    xray_is_running,
+)
+from .servers import Server
+from .settings import BOOT_GRACE, SOCKS_HOST, SOCKS_PORT, STATE_DIR
+from .xray_config import build_xray_config_text
+
+log = get_logger("xproxy.xray_control")
+
+BACKUP_PATH: Path = STATE_DIR / "xray_config.backup.json"
+_TEST_TIMEOUT = 20
+
+
+class XrayConfigError(RuntimeError):
+    """Сгенерированный конфиг не прошёл xray -test."""
+
+
+def apply_server(server: Server, *, dry_run: bool = False,
+                 info: PlatformInfo | None = None) -> None:
+    """Сгенерировать конфиг, провалидировать, забэкапить, записать и рестартовать."""
+    info = info or detect_platform()
+    cfg_text = build_xray_config_text(server)
+
+    # 1. Валидация: xray -test на временном файле.
+    ok, err = validate_config_text(cfg_text, info)
+    if not ok:
+        short = err.strip().splitlines()[-1] if err.strip() else "unknown error"
+        raise XrayConfigError(
+            f"xray -test failed for {server.host}:{server.port}: {short}"
+        )
+
+    if dry_run:
+        log.info("[dry-run] config valid; would write %d bytes to %s and restart xray",
+                 len(cfg_text), info.xray_config)
+        return
+
+    # 2. Бэкап текущего конфига (best-effort).
+    try:
+        _backup_current_config(info)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("config backup skipped: %s", exc)
+
+    log.info("write xray config → %s (%s:%d, %s)",
+             info.xray_config, server.host, server.port, server.country)
+    write_xray_config(cfg_text, info)
+
+    log.info("restart xray: %s", " ".join(info.restart_cmd))
+    _platform_restart(info)
+
+    if wait_for_proxy_port():
+        log.info("xray listener ready on %s:%d", SOCKS_HOST, SOCKS_PORT)
+    else:
+        log.warning("xray listener on %s:%d did not come up in %ds",
+                    SOCKS_HOST, SOCKS_PORT, BOOT_GRACE)
+
+
+def validate_config_text(cfg_text: str,
+                         info: PlatformInfo | None = None) -> tuple[bool, str]:
+    """Прогнать `xray -test` на произвольной JSON-строке. Возвращает (ok, stderr+stdout)."""
+    info = info or detect_platform()
+    xray_bin = shutil.which("xray")
+    if xray_bin is None:
+        return False, "xray binary not found in PATH"
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8",
+                                     delete=False) as fh:
+        fh.write(cfg_text)
+        tmp_path = fh.name
+    try:
+        env = os.environ.copy()
+        # Тест читает те же geo-файлы, что будет использовать боевой процесс.
+        env["XRAY_LOCATION_ASSET"] = str(info.xray_asset_dir)
+        proc = subprocess.run(
+            [xray_bin, "-test", "-c", tmp_path],
+            capture_output=True,
+            env=env,
+            timeout=_TEST_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "xray -test timed out"
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    output = (proc.stderr or b"").decode(errors="replace") + \
+             (proc.stdout or b"").decode(errors="replace")
+    return proc.returncode == 0, output
+
+
+def restore_backup(info: PlatformInfo | None = None) -> bool:
+    """Восстановить бэкап config.json, если он есть. Возвращает True при успехе."""
+    info = info or detect_platform()
+    if not BACKUP_PATH.exists():
+        log.warning("no backup at %s", BACKUP_PATH)
+        return False
+    text = BACKUP_PATH.read_text(encoding="utf-8")
+    ok, err = validate_config_text(text, info)
+    if not ok:
+        log.error("backup at %s is not valid (%s) — refusing to restore",
+                  BACKUP_PATH, err.strip().splitlines()[-1:])
+        return False
+    write_xray_config(text, info)
+    _platform_restart(info)
+    return wait_for_proxy_port()
+
+
+def wait_for_proxy_port(timeout: float = BOOT_GRACE) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _port_open(SOCKS_HOST, SOCKS_PORT):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def is_running() -> bool:
+    return xray_is_running()
+
+
+# ---------- internals ----------
+
+def _backup_current_config(info: PlatformInfo) -> None:
+    src = info.xray_config
+    if not src.exists():
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, BACKUP_PATH)
+    log.debug("backed up %s → %s", src, BACKUP_PATH)
+
+
+def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
