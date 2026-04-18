@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -83,9 +84,17 @@ def validate_config_text(cfg_text: str,
     if xray_bin is None:
         return False, "xray binary not found in PATH"
 
+    # В конфиге log.access/log.error обычно указывают на /var/log/xray/*.log,
+    # куда может писать только боевой процесс xray (запущен от root). При
+    # `xray -test` из-под нашего пользователя открытие этих файлов на запись
+    # падает с permission denied, хотя сам конфиг валиден. Подменяем пути на
+    # "none" (штатное значение xray = отключить файл-лог) — тест становится
+    # чистой проверкой синтаксиса и разрешения geo-правил.
+    test_text = _neutralize_log_paths(cfg_text)
+
     with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8",
                                      delete=False) as fh:
-        fh.write(cfg_text)
+        fh.write(test_text)
         tmp_path = fh.name
     try:
         env = os.environ.copy()
@@ -109,6 +118,32 @@ def validate_config_text(cfg_text: str,
     output = (proc.stderr or b"").decode(errors="replace") + \
              (proc.stdout or b"").decode(errors="replace")
     return proc.returncode == 0, output
+
+
+def _neutralize_log_paths(cfg_text: str) -> str:
+    """Вернуть копию конфига, где log.access/log.error заменены на "none".
+
+    "none" — штатное значение xray, которое означает «не писать файл-лог»
+    (см. https://xtls.github.io/config/log.html). Это нужно только для
+    `xray -test`, чтобы валидация не требовала прав на запись в /var/log/xray.
+    Боевой config.json на диске остаётся с оригинальными путями.
+    Если JSON невалиден — возвращаем исходный текст, пусть xray сам
+    диагностирует проблему через свой парсер.
+    """
+    try:
+        cfg = json.loads(cfg_text)
+    except (ValueError, TypeError):
+        return cfg_text
+    log_section = cfg.get("log")
+    if isinstance(log_section, dict):
+        changed = False
+        for key in ("access", "error"):
+            if isinstance(log_section.get(key), str) and log_section[key] != "none":
+                log_section[key] = "none"
+                changed = True
+        if changed:
+            return json.dumps(cfg, ensure_ascii=False, indent=2)
+    return cfg_text
 
 
 def restore_backup(info: PlatformInfo | None = None) -> bool:
