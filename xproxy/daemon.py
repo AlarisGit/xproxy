@@ -1,6 +1,7 @@
 """Главный цикл демона и one-shot итерация."""
 from __future__ import annotations
 
+import random
 import signal
 import time
 from typing import Optional
@@ -21,10 +22,14 @@ from .platform_utils import PlatformInfo, detect_platform
 from .servers import Server, filter_and_sort, load_country_ranks, parse_subscription, tcp_probe
 from .settings import (
     FAIL_THRESHOLD,
+    GEO_REFRESH,
     GIT_PULL_INTERVAL,
     HEALTH_INTERVAL,
     HEARTBEAT_HOUR,
+    HEARTBEAT_JITTER_MIN,
     ROTATION_COOLDOWN,
+    SCHEDULE_JITTER_RATIO,
+    STARTUP_JITTER,
     SUBSCR_REFRESH,
 )
 from .state import DaemonState, load_active
@@ -32,6 +37,17 @@ from .subscription import SubscriptionError, fetch_subscription_text
 from .xray_control import apply_server, is_running
 
 log = get_logger("xproxy.daemon")
+
+
+def _jittered(interval: float, ratio: float = SCHEDULE_JITTER_RATIO) -> float:
+    """Вернуть interval с равномерным jitter'ом ±ratio.
+
+    ratio=0.15, interval=1800 → uniformly in [1530, 2070].
+    Нулевой/отрицательный interval возвращается как есть (отключённая задача).
+    """
+    if interval <= 0 or ratio <= 0:
+        return interval
+    return interval * random.uniform(1.0 - ratio, 1.0 + ratio)
 
 
 class Daemon:
@@ -43,6 +59,21 @@ class Daemon:
         self._stop = False
         self._stop_signal: Optional[int] = None
         self._country_ranks = load_country_ranks()
+        # --- Jitter / анти-стампед ---
+        # Каждый инстанс получает СВОИ периоды для периодических задач.
+        # Перерисовываются после каждого успешного события в tick().
+        self._subscr_period = _jittered(SUBSCR_REFRESH)
+        self._geo_period = _jittered(GEO_REFRESH)
+        self._git_period = _jittered(GIT_PULL_INTERVAL)
+        # Следующий геопулл планируем в будущем — первый запуск сделает
+        # run_once()/run_forever() после startup-jitter'а, здесь не стартуем.
+        self._next_geo_at: float = 0.0
+        # Минутный offset для heartbeat: HEARTBEAT_HOUR + 0..HEARTBEAT_JITTER_MIN мин,
+        # фиксируется на весь процесс (чтобы не дрейфовать в течение дня).
+        self._heartbeat_minute_offset = random.randint(0, max(0, HEARTBEAT_JITTER_MIN))
+        log.debug("jitter init: subscr=%.0fs geo=%.0fs git=%.0fs hb_offset=%dmin",
+                  self._subscr_period, self._geo_period, self._git_period,
+                  self._heartbeat_minute_offset)
         # Восстановить активный сервер, если был сохранён.
         prev = load_active()
         if prev is not None:
@@ -71,9 +102,23 @@ class Daemon:
         if tg_configured():
             log.info("telegram notifications enabled")
         notify(f"🟢 xproxy started (active: {_fmt(self.state.active)})")
-        # Первый проход — немедленно.
+        # Startup jitter: рандомная пауза перед первым обращением к внешним
+        # ресурсам, чтобы несколько хостов, перезапущенных одновременно
+        # (после ребута / сетевого сбоя / деплоя), не стучали в subscription/
+        # GitHub/Telegram в одну и ту же секунду. SIGTERM во время паузы
+        # прерывает её штатно.
+        if STARTUP_JITTER > 0 and not self.dry_run:
+            delay = random.uniform(0, STARTUP_JITTER)
+            log.info("startup jitter: sleeping %.1fs before first external fetch",
+                     delay)
+            _sleep_interruptible(delay, lambda: self._stop)
+        if self._stop:
+            return
+        # Первый проход — немедленно (после startup jitter'а).
         self.refresh_subscription(force=True)
         self.refresh_geo(force=False)
+        # Следующий geo-фетч — не раньше, чем через jittered период.
+        self._next_geo_at = time.time() + self._geo_period
         self.tick_health()
 
         while not self._stop:
@@ -103,14 +148,22 @@ class Daemon:
     # ---------- periodic tasks ----------
     def tick(self) -> None:
         now = time.time()
-        if now - self.state.last_subscription_refresh >= SUBSCR_REFRESH:
+        # Все периоды — jittered. После каждого срабатывания перерисовываем
+        # интервал, чтобы при множественной установке на нескольких хостах
+        # события не слипались в одну секунду.
+        if now - self.state.last_subscription_refresh >= self._subscr_period:
             self.refresh_subscription()
-        self.refresh_geo(force=False)
+            self._subscr_period = _jittered(SUBSCR_REFRESH)
+        if now >= self._next_geo_at:
+            self.refresh_geo(force=False)
+            self._geo_period = _jittered(GEO_REFRESH)
+            self._next_geo_at = time.time() + self._geo_period
         self.tick_health()
         self.tick_heartbeat()
         if GIT_PULL_INTERVAL > 0 and \
-                now - self.state.last_git_pull >= GIT_PULL_INTERVAL:
+                now - self.state.last_git_pull >= self._git_period:
             self.tick_autoupdate()
+            self._git_period = _jittered(GIT_PULL_INTERVAL)
 
     def tick_heartbeat(self) -> None:
         """Один раз в сутки (локальное время >= HEARTBEAT_HOUR) посылаем статус.
@@ -122,7 +175,14 @@ class Daemon:
             return
         now_struct = time.localtime()
         today = time.strftime("%Y-%m-%d", now_struct)
+        # Триггер: локальное время >= HEARTBEAT_HOUR:MM, где MM — случайное
+        # число минут, зафиксированное при старте (см. __init__). Это
+        # размазывает суточные heartbeat'ы от разных хостов по окну в час,
+        # вместо того чтобы все били в Telegram ровно в HH:00.
         if now_struct.tm_hour < HEARTBEAT_HOUR:
+            return
+        if now_struct.tm_hour == HEARTBEAT_HOUR and \
+                now_struct.tm_min < self._heartbeat_minute_offset:
             return
         if self.state.last_heartbeat_date == today:
             return
@@ -139,7 +199,10 @@ class Daemon:
 
     def refresh_subscription(self, force: bool = False) -> None:
         now = time.time()
-        if not force and now - self.state.last_subscription_refresh < SUBSCR_REFRESH:
+        # Внутренний guard согласован с jittered-периодом из tick(): если
+        # tick решил, что пора — мы здесь точно пропускаем проверку (period
+        # уже истёк). Force=True (стартовый fetch) проходит всегда.
+        if not force and now - self.state.last_subscription_refresh < self._subscr_period:
             return
         try:
             source, body = fetch_subscription_text()
