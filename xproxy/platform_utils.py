@@ -46,11 +46,16 @@ def write_xray_config(content: str, info: PlatformInfo | None = None) -> None:
     target = info.xray_config
     target.parent.mkdir(parents=True, exist_ok=True) if _can_mkdir(target.parent) else None
 
-    # Пробуем прямую запись.
+    # Пробуем прямую запись. Ловим широко OSError (а не только PermissionError),
+    # потому что отказы записи прилетают под разными errno:
+    #   - EACCES/EPERM — файл принадлежит root (PermissionError);
+    #   - EROFS       — /usr/local/etc смонтирован read-only (OSError);
+    #   - ENOENT      — asset-структура другая, директория отсутствует.
+    # В любом из этих случаев на Linux имеет смысл попробовать sudo tee.
     try:
         target.write_text(content, encoding="utf-8")
         return
-    except PermissionError:
+    except OSError:
         if not info.needs_sudo_write:
             raise
 

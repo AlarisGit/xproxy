@@ -17,8 +17,13 @@ Environment=XRAY_LOCATION_ASSET=__HOME__/.config/xproxy/geo
 ExecStart=__PYTHON__ __PROJECT_DIR__/main.py --daemon
 Restart=on-failure
 RestartSec=10
-# Ограничить запись — демону нужен только свой репо и ~/.config/xproxy/geo.
+# Sandbox: /usr, /boot, /efi — read-only в приватном mount namespace.
+# ВАЖНО: ReadWritePaths обязательно должен включать директорию xray-конфига,
+# иначе даже sudo tee из-под этого юнита получит EROFS (дочерние процессы
+# наследуют namespace). Если xray читает конфиг из другого пути — обновите
+# этот список.
 ProtectSystem=full
+ReadWritePaths=/usr/local/etc/xray
 NoNewPrivileges=false
 
 [Install]

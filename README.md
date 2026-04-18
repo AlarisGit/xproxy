@@ -135,6 +135,18 @@ sudo systemctl restart xray
 
 На время теста пути `log.access` / `log.error` в копии конфига заменяются на `"none"` — иначе `xray -test`, запущенный из-под пользователя xproxy, пытался бы открыть боевой `/var/log/xray/*.log` (принадлежит root) и падал бы с `permission denied`, хотя сам конфиг валиден. Боевой файл на диске пишется с оригинальными путями.
 
+### systemd-sandbox: `ReadWritePaths`
+
+Юнит `xproxy.service` использует `ProtectSystem=full` — `/usr`, `/boot`, `/efi` делаются read-only для процесса в приватном mount namespace. Это хорошая практика безопасности, но у неё есть ловушка: **любая запись в `/usr/local/etc/xray/config.json` вернёт `[Errno 30] EROFS`**, даже если файл принадлежит вашему пользователю, даже через sudo (дочерние процессы наследуют namespace юнита).
+
+Поэтому в юните обязательно есть:
+
+```
+ReadWritePaths=/usr/local/etc/xray
+```
+
+Если xray на вашей системе читает конфиг из другого пути (например `/etc/xray/config.json` при установке из deb/rpm), поменяйте значение соответственно — иначе демон будет штрафовать все серверы с ошибкой `Read-only file system`, хотя FS на самом деле read-write.
+
 Перед записью также сохраняется бэкап текущего `config.json` в `state/xray_config.backup.json`. Откатиться можно вручную или через Python:
 
 ```python
