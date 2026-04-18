@@ -23,7 +23,7 @@ from .platform_utils import (
     xray_is_running,
 )
 from .servers import Server
-from .settings import BOOT_GRACE, SOCKS_HOST, SOCKS_PORT, STATE_DIR
+from .settings import BOOT_GRACE, GEO_DIR, SOCKS_HOST, SOCKS_PORT, STATE_DIR
 from .xray_config import build_xray_config_text
 
 log = get_logger("xproxy.xray_control")
@@ -89,8 +89,9 @@ def validate_config_text(cfg_text: str,
         tmp_path = fh.name
     try:
         env = os.environ.copy()
-        # Тест читает те же geo-файлы, что будет использовать боевой процесс.
-        env["XRAY_LOCATION_ASSET"] = str(info.xray_asset_dir)
+        # Тест читает те же geo-файлы, что будет использовать боевой процесс
+        # (скачанные нами в GEO_DIR; xray в системе тоже смотрит туда через env).
+        env["XRAY_LOCATION_ASSET"] = str(GEO_DIR)
         proc = subprocess.run(
             [xray_bin, "-test", "-c", tmp_path],
             capture_output=True,

@@ -13,10 +13,9 @@ from typing import List
 @dataclass(frozen=True)
 class PlatformInfo:
     name: str                     # "macos" | "linux"
-    xray_config: Path             # путь к xray config.json
-    xray_asset_dir: Path          # директория с geosite.dat / geoip.dat для xray
+    xray_config: Path             # путь к xray config.json (пишем через sudo при необходимости)
     restart_cmd: List[str]        # команда рестарта xray
-    needs_sudo_write: bool        # писать конфиг/ассеты через sudo?
+    needs_sudo_write: bool        # писать config.json через sudo?
 
 
 def detect_platform() -> PlatformInfo:
@@ -28,7 +27,6 @@ def detect_platform() -> PlatformInfo:
         return PlatformInfo(
             name="macos",
             xray_config=prefix / "etc/xray/config.json",
-            xray_asset_dir=prefix / "share/xray",
             restart_cmd=["brew", "services", "restart", "xray"],
             needs_sudo_write=False,
         )
@@ -36,7 +34,6 @@ def detect_platform() -> PlatformInfo:
         return PlatformInfo(
             name="linux",
             xray_config=Path("/usr/local/etc/xray/config.json"),
-            xray_asset_dir=Path("/usr/local/share/xray"),
             restart_cmd=["sudo", "-n", "systemctl", "restart", "xray"],
             needs_sudo_write=True,
         )

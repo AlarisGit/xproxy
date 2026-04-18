@@ -1,21 +1,24 @@
 """Скачивание geosite.dat и geoip.dat с учётом TTL.
 
-Файлы кладутся в ~/.config/xproxy/geo/. Для использования xray-ом путь
-надо прокинуть через переменную XRAY_LOCATION_ASSET (см. deploy/).
+Файлы кладутся в ~/.config/xproxy/geo/. xray видит их через переменную
+XRAY_LOCATION_ASSET, которая прописывается один раз при установке:
+
+  - macOS (brew services):  launchctl setenv XRAY_LOCATION_ASSET ~/.config/xproxy/geo
+  - Linux  (systemd):       Environment=XRAY_LOCATION_ASSET=/home/<user>/.config/xproxy/geo
+                            в override'е юнита xray.service
+
+Мы НЕ пишем ничего в системные директории xray (/usr/local/share/xray и т.п.) —
+это упрощает конфигурацию (без sudo) и убирает класс ошибок FS (EROFS/EACCES).
 """
 from __future__ import annotations
 
-import hashlib
 import shutil
-import subprocess
 import time
 from pathlib import Path
-from typing import Optional
 
 import requests
 
 from .logger import get_logger
-from .platform_utils import PlatformInfo, detect_platform
 from .routing import load_routing
 from .settings import GEO_DIR, GEO_REFRESH, USER_AGENT
 
@@ -83,72 +86,3 @@ def _download(url: str, target: Path) -> None:
         with tmp.open("wb") as fh:
             shutil.copyfileobj(resp.raw, fh)
     tmp.replace(target)
-
-
-# ---------- Деплой в asset-dir xray ----------
-
-def deploy_to_xray_assets(info: Optional[PlatformInfo] = None,
-                          force: bool = False) -> None:
-    """Скопировать скачанные geo-файлы в xray asset directory.
-
-    macOS: прямой copy (директория обычно принадлежит пользователю brew).
-    Linux: через `sudo -n install` (нужны права в sudoers, см. deploy/).
-    """
-    info = info or detect_platform()
-    dst_dir = info.xray_asset_dir
-    if not dst_dir.exists():
-        log.warning("xray asset dir %s does not exist — skip deploy", dst_dir)
-        return
-
-    for name in _FILES:
-        src = GEO_DIR / name
-        dst = dst_dir / name
-        if not src.exists():
-            continue
-        if not force and _same_file(src, dst):
-            log.debug("%s already deployed to %s", name, dst)
-            continue
-        try:
-            _install_file(src, dst, info)
-            log.info("deployed %s → %s", name, dst)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("deploy %s → %s failed: %s", name, dst, exc)
-
-
-def _same_file(a: Path, b: Path) -> bool:
-    if not b.exists():
-        return False
-    try:
-        if a.stat().st_size != b.stat().st_size:
-            return False
-        return _sha256(a) == _sha256(b)
-    except OSError:
-        return False
-
-
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _install_file(src: Path, dst: Path, info: PlatformInfo) -> None:
-    """Копия с сохранением прав; fallback на sudo для Linux."""
-    try:
-        shutil.copy2(src, dst)
-        return
-    except PermissionError:
-        if not info.needs_sudo_write:
-            raise
-    # Fallback: sudo -n install (атомарнее, чем cp).
-    install_bin = shutil.which("install") or "/usr/bin/install"
-    proc = subprocess.run(
-        ["sudo", "-n", install_bin, "-m", "0644", str(src), str(dst)],
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"sudo install failed: {proc.stderr.decode(errors='replace').strip()}"
-        )

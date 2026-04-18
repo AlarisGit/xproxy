@@ -140,12 +140,15 @@ from xproxy.xray_control import restore_backup
 restore_backup()
 ```
 
-Custom `geosite.dat`/`geoip.dat` (с расширенным набором ru-категорий из `GeositeUrl` в `routing.json`) копируются в asset-dir xray:
+Custom `geosite.dat`/`geoip.dat` (с расширенным набором ru-категорий из `GeositeUrl` в `routing.json`) скачиваются в `~/.config/xproxy/geo/`. xray читает их оттуда через переменную `XRAY_LOCATION_ASSET`, которая прописывается один раз при установке (см. «Автозапуск» выше).
 
-- macOS: `/opt/homebrew/share/xray/` (прямой `cp`, без sudo).
-- Linux: `/usr/local/share/xray/` (через `sudo -n install`, нужна запись в sudoers — см. `deploy/sudoers.xproxy`).
+**Почему так, а не копирование в `/usr/local/share/xray/`:**
 
-Копирование идемпотентное: если файл совпадает по sha256 — повторная запись пропускается.
+- Не требуется sudo и специальных правил в sudoers — демон работает как обычный пользователь.
+- Нет класса ошибок FS (`EACCES`/`EROFS`) на системах, где системный каталог только для чтения (NixOS, immutable rootfs, squashfs-пакеты).
+- Конфигурация декларативна: один `Environment=XRAY_LOCATION_ASSET=...` в юните xray — и всё.
+
+Если `XRAY_LOCATION_ASSET` **не** задан у xray — xray возьмёт устаревшие geo-файлы, пришедшие с его пакетом, и правила маршрутизации `geosite:...`/`geoip:...` могут работать не так, как ожидается. Это наиболее частая причина «xproxy скачал свежую базу, но роутинг не изменился».
 
 ## Автоматическое обновление из git
 

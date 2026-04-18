@@ -37,12 +37,14 @@ case "$os" in
         mkdir -p "$(dirname "$plist_target")"
         render "$here/com.xproxy.daemon.plist" > "$plist_target"
         echo "wrote $plist_target"
-        echo "Next steps:"
+        echo
+        echo "=== Шаг 1: загрузить launchd-агент xproxy ==="
         echo "  launchctl unload  $plist_target 2>/dev/null || true"
         echo "  launchctl load -w $plist_target"
         echo
-        echo "Также убедитесь, что xray видит geosite.dat/geoip.dat из ~/.config/xproxy/geo."
-        echo "Для xray, запущенного через 'brew services', задайте ассет-директорию:"
+        echo "=== Шаг 2 (ОБЯЗАТЕЛЬНО): указать xray путь к geo-файлам ==="
+        echo "xproxy скачивает geosite.dat/geoip.dat в ~/.config/xproxy/geo."
+        echo "Без этой переменной xray использует устаревшие geo-файлы из своего пакета."
         echo "  launchctl setenv XRAY_LOCATION_ASSET $user_home/.config/xproxy/geo"
         echo "  brew services restart xray"
         ;;
@@ -51,23 +53,28 @@ case "$os" in
         tmp="$(mktemp)"
         render "$here/xproxy.service" > "$tmp"
         echo "rendered unit → $tmp"
-        echo "Install as root:"
+        echo
+        echo "=== Шаг 1: установить юнит xproxy.service ==="
         echo "  sudo install -m 0644 $tmp $unit_target"
         echo "  sudo systemctl daemon-reload"
         echo "  sudo systemctl enable --now xproxy.service"
         echo
         sudoers_tmp="$(mktemp)"
         render "$here/sudoers.xproxy" > "$sudoers_tmp"
-        echo "Sudoers snippet rendered → $sudoers_tmp"
-        echo "Install with:"
+        echo "=== Шаг 2: установить sudoers для xproxy (restart xray + write config) ==="
+        echo "Rendered → $sudoers_tmp"
         echo "  sudo install -m 0440 $sudoers_tmp /etc/sudoers.d/xproxy"
         echo "  sudo visudo -c"
         echo
-        echo "Для XRAY_LOCATION_ASSET в systemd-юните xray.service:"
+        echo "=== Шаг 3 (ОБЯЗАТЕЛЬНО): указать xray путь к geo-файлам ==="
+        echo "xproxy скачивает geosite.dat/geoip.dat в $user_home/.config/xproxy/geo."
+        echo "Без этой переменной xray использует устаревшие geo-файлы из своего пакета."
         echo "  sudo systemctl edit xray"
-        echo "  # и добавьте:"
+        echo "  # и вставьте:"
         echo "  # [Service]"
         echo "  # Environment=XRAY_LOCATION_ASSET=$user_home/.config/xproxy/geo"
+        echo "  sudo systemctl daemon-reload"
+        echo "  sudo systemctl restart xray"
         ;;
     *)
         echo "Unsupported OS: $os" >&2

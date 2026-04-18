@@ -13,7 +13,7 @@ from .autoupdate import (
     too_many_restarts,
     validate_new_code,
 )
-from .geo import deploy_to_xray_assets, ensure_geo_assets
+from .geo import ensure_geo_assets
 from .healthcheck import internet_alive, proxy_alive, public_ips
 from .logger import get_logger
 from .notifier import is_configured as tg_configured, notify
@@ -229,15 +229,13 @@ class Daemon:
         restart_self()  # не вернётся при успехе
 
     def refresh_geo(self, force: bool) -> None:
+        # Файлы кладутся в GEO_DIR (~/.config/xproxy/geo). xray видит их через
+        # XRAY_LOCATION_ASSET, которая прописана в юните xray при установке.
+        # Мы НЕ пишем в системные asset-директории xray.
         try:
             ensure_geo_assets(force=force)
         except Exception:  # noqa: BLE001
             log.exception("geo refresh failed")
-        # Деплой в asset-dir xray, чтобы его process тоже видел актуальные файлы.
-        try:
-            deploy_to_xray_assets(info=self.platform, force=force)
-        except Exception:  # noqa: BLE001
-            log.exception("geo deploy to xray asset dir failed")
 
     # ---------- health / rotation ----------
     def tick_health(self) -> None:

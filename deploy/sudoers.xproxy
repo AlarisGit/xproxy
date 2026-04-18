@@ -6,9 +6,11 @@ Cmnd_Alias XPROXY_CMDS = \
     /bin/systemctl restart xray, \
     /usr/bin/systemctl restart xray, \
     /usr/bin/tee /usr/local/etc/xray/config.json, \
-    /bin/tee /usr/local/etc/xray/config.json, \
-    /usr/bin/install -m 0644 /home/__USER__/.config/xproxy/geo/geosite.dat /usr/local/share/xray/geosite.dat, \
-    /usr/bin/install -m 0644 /home/__USER__/.config/xproxy/geo/geoip.dat /usr/local/share/xray/geoip.dat
+    /bin/tee /usr/local/etc/xray/config.json
 
 __USER__ ALL=(root) NOPASSWD: XPROXY_CMDS
 Defaults!XPROXY_CMDS !requiretty
+
+# Примечание: geo-файлы (geosite.dat, geoip.dat) в системный /usr/local/share/xray
+# демон НЕ пишет — они лежат в ~/.config/xproxy/geo и xray читает их
+# через XRAY_LOCATION_ASSET (см. deploy/install.sh).
