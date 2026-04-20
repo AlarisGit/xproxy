@@ -211,7 +211,7 @@ class Daemon:
             notify(f"⚠️ subscription unavailable: {exc}", urgent=True)
             return
         if source == "cache":
-            notify("⚠️ using cached subscription (live fetch failed)")
+            log.info("subscription served from cache (live fetch failed; will retry next cycle)")
         servers = parse_subscription(body)
         ranked = filter_and_sort(servers, self._country_ranks)
         if not ranked:
