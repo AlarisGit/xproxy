@@ -223,8 +223,9 @@ class Daemon:
         # Для не-force вызовов: обновляем timestamp ДО попытки фетча,
         # чтобы при неудаче следующий retry был не раньше subscr_period,
         # а не каждый HEALTH_INTERVAL. Для force=True (стартовый fetch)
-        # не обновляем — при кратковременном сбое сети демон быстро
-        # восстановится на следующей итерации.
+        # не обновляем заранее — при кратковременном сбое сети демон
+        # быстро восстановится на следующей итерации. Успешный фетч
+        # обновит timestamp ниже, независимо от force.
         if not force:
             self.state.last_subscription_refresh = now
         try:
@@ -233,6 +234,10 @@ class Daemon:
             log.warning("subscription unavailable: %s", exc)
             notify(f"⚠️ subscription unavailable: {exc}")
             return
+        # Фетч прошёл (live или cache) — обновляем timestamp для всех
+        # путей, включая force=True, чтобы следующий плановый refresh
+        # был через subscr_period, а не почти сразу после старта.
+        self.state.last_subscription_refresh = now
         if source == "cache":
             stale_sec = now - self.state.last_live_fetch
             if stale_sec >= STALE_SUBSCRIPTION_SEC and not self.state._stale_notified:
