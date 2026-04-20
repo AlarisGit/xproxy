@@ -6,6 +6,7 @@ state/ содержит чувствительные данные (UUID подп
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -18,15 +19,20 @@ def secure_mkdir(path: Path) -> None:
 def secure_write(path: Path, content: str, *, encoding: str = "utf-8") -> None:
     """Записать файл с режимом 0600 (только владелец).
 
-    Атомарная запись через временный файл + rename: при крахе процесса
-    не останется наполовину записанного файла. Переименование на той же
-    ФС атомарно в POSIX.
+    Атомарная запись через tempfile + rename: при крахе процесса
+    не останется наполовину записанного файла. Временный файл создаётся
+    с уникальным именем (tempfile), чтобы параллельные записи в один
+    target не конфликтовали за один и тот же *.tmp.
     """
     secure_mkdir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=path.name + ".",
+        suffix=".tmp",
+    )
     try:
         os.write(fd, content.encode(encoding))
     finally:
         os.close(fd)
-    os.replace(str(tmp), str(path))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, str(path))

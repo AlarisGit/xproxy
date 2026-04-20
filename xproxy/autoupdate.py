@@ -94,11 +94,14 @@ def _head() -> str:
     return _git("rev-parse", "HEAD")
 
 
-def rollback_to(old_head: str) -> None:
+def rollback_to(old_head: str) -> bool:
     """Откатить working tree на old_head после неудачного pull.
 
     Безопасно, т.к. перед pull мы проверили _tree_clean() — локальных
     изменений нет, reset не затирает пользовательские данные.
+
+    Возвращает True при успехе, False при неудаче (working tree
+    остаётся на плохом коммите).
     """
     log.warning("rolling back working tree to %s", old_head[:7])
     try:
@@ -106,8 +109,9 @@ def rollback_to(old_head: str) -> None:
     except GitError as exc:
         log.error("rollback to %s FAILED: %s — working tree stuck on bad commit!",
                   old_head[:7], exc)
-    else:
-        log.info("working tree rolled back to %s", old_head[:7])
+        return False
+    log.info("working tree rolled back to %s", old_head[:7])
+    return True
 
 
 def _commits_behind(branch: str, upstream: str) -> int:

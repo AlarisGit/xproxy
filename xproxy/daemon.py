@@ -220,9 +220,13 @@ class Daemon:
         # уже истёк). Force=True (стартовый fetch) проходит всегда.
         if not force and now - self.state.last_subscription_refresh < self._subscr_period:
             return
-        # Обновляем timestamp ДО попытки фетча, чтобы при неудаче следующий
-        # retry был не раньше subscr_period, а не каждый HEALTH_INTERVAL.
-        self.state.last_subscription_refresh = now
+        # Для не-force вызовов: обновляем timestamp ДО попытки фетча,
+        # чтобы при неудаче следующий retry был не раньше subscr_period,
+        # а не каждый HEALTH_INTERVAL. Для force=True (стартовый fetch)
+        # не обновляем — при кратковременном сбое сети демон быстро
+        # восстановится на следующей итерации.
+        if not force:
+            self.state.last_subscription_refresh = now
         try:
             source, body = fetch_subscription_text()
         except SubscriptionError as exc:
@@ -307,12 +311,19 @@ class Daemon:
                       "staying on %s. Error: %s",
                       result.new_head[:7], result.old_head[:7],
                       err.splitlines()[-1] if err else "?")
-            rollback_to(result.old_head)
-            notify(
-                f"🔴 autoupdate: new code {result.new_head[:7]} failed "
-                f"import check, rolled back to {result.old_head[:7]}",
-                urgent=True,
-            )
+            rolled_back = rollback_to(result.old_head)
+            if rolled_back:
+                notify(
+                    f"🔴 autoupdate: new code {result.new_head[:7]} failed "
+                    f"import check, rolled back to {result.old_head[:7]}",
+                    urgent=True,
+                )
+            else:
+                notify(
+                    f"🔴 autoupdate: new code {result.new_head[:7]} failed "
+                    f"import check, rollback FAILED — working tree stuck on bad commit!",
+                    urgent=True,
+                )
             return
 
         log.info("autoupdate: new code %s validated, restarting self",
