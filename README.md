@@ -113,6 +113,25 @@ launchctl setenv XRAY_LOCATION_ASSET "$HOME/.config/xproxy/geo"
 brew services restart xray
 ```
 
+Управление сервисом:
+
+```bash
+# Статус
+launchctl list | grep xproxy          # PID и exit-код
+
+# Логи
+tail -f /var/log/xproxy/xproxy.log
+
+# Перезапуск (отправляет SIGTERM, ждёт завершения, затем стартует)
+launchctl stop com.xproxy.daemon && launchctl start com.xproxy.daemon
+# Или одной командой:
+launchctl kickstart gui/$(id -u)/com.xproxy.daemon
+
+# Полная перезагрузка конфига
+launchctl unload ~/Library/LaunchAgents/com.xproxy.daemon.plist
+launchctl load -w ~/Library/LaunchAgents/com.xproxy.daemon.plist
+```
+
 ### Linux (systemd)
 
 ```bash
@@ -133,6 +152,25 @@ sudo systemctl edit xray
 # Environment=XRAY_LOCATION_ASSET=/var/lib/xproxy/geo
 sudo systemctl daemon-reload
 sudo systemctl restart xray
+```
+
+Управление сервисом:
+
+```bash
+# Статус
+sudo systemctl status xproxy.service
+
+# Логи
+tail -f /var/log/xproxy/xproxy.log
+# или через journalctl:
+journalctl -u xproxy.service -f
+
+# Перезапуск
+sudo systemctl restart xproxy.service
+
+# Полная перезагрузка (если меняли unit-файл):
+sudo systemctl daemon-reload
+sudo systemctl restart xproxy.service
 ```
 
 ## Fail-safe и geo-файлы
