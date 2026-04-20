@@ -28,6 +28,8 @@ from .settings import (
     HEARTBEAT_HOUR,
     HEARTBEAT_JITTER_MIN,
     ROTATION_COOLDOWN,
+    SERVERS_CACHE,
+    STALE_SUBSCRIPTION_SEC,
     SCHEDULE_JITTER_RATIO,
     STARTUP_JITTER,
     SUBSCR_REFRESH,
@@ -80,6 +82,14 @@ class Daemon:
             self.state.active = prev
             log.info("restored active server: %s:%d (%s)",
                      prev.host, prev.port, prev.country)
+        # Инициализировать время последнего live-фетча подписки из mtime кэша.
+        # Если сервер был выключен >24ч и кэш устарел — staleness обнаружится
+        # сразу при первой же попытке refresh_subscription().
+        if SERVERS_CACHE.exists():
+            try:
+                self.state.last_live_fetch = SERVERS_CACHE.stat().st_mtime
+            except OSError:
+                pass
 
     # ---------- lifecycle ----------
     def install_signal_handlers(self) -> None:
@@ -211,7 +221,20 @@ class Daemon:
             notify(f"⚠️ subscription unavailable: {exc}", urgent=True)
             return
         if source == "cache":
-            log.info("subscription served from cache (live fetch failed; will retry next cycle)")
+            stale_sec = now - self.state.last_live_fetch
+            if stale_sec >= STALE_SUBSCRIPTION_SEC and not self.state._stale_notified:
+                hours = int(stale_sec // 3600)
+                log.warning("subscription stale for %dh (live fetch keeps failing)", hours)
+                notify(
+                    f"🔴 subscription stale for {hours}h — live fetch keeps failing",
+                    urgent=True,
+                )
+                self.state._stale_notified = True
+            else:
+                log.info("subscription served from cache (live fetch failed; will retry next cycle)")
+        else:
+            self.state.last_live_fetch = now
+            self.state._stale_notified = False
         servers = parse_subscription(body)
         ranked = filter_and_sort(servers, self._country_ranks)
         if not ranked:

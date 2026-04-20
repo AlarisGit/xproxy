@@ -39,6 +39,10 @@ class DaemonState:
     rotations_today: int = 0
     rotations_today_date: str = ""         # счётчик сбрасывается при смене даты
 
+    # Stale subscription tracking.
+    last_live_fetch: float = 0.0           # unix_ts последнего успешного live-фетча
+    _stale_notified: bool = False           # уведомление об устаревшей подписке уже отправлено
+
     # ---------- активный сервер ----------
     def set_active(self, server: Server) -> None:
         prev = self.active
