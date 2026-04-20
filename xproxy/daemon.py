@@ -129,6 +129,10 @@ class Daemon:
         self.refresh_geo(force=False)
         # Следующий geo-фетч — не раньше, чем через jittered период.
         self._next_geo_at = time.time() + self._geo_period
+        # Пересобрать конфиг при старте, чтобы подхватить изменения routing/
+        # direct.lst/config.tmpl, полученные через git pull (или сделанные вручную).
+        # Без этого новые маршруты не попадут в xray до следующей ротации сервера.
+        self._rebuild_config_if_active()
         self.tick_health()
 
         while not self._stop:
@@ -153,6 +157,7 @@ class Daemon:
     def run_once(self) -> None:
         self.refresh_subscription(force=True)
         self.refresh_geo(force=False)
+        self._rebuild_config_if_active()
         self.tick_health()
 
     # ---------- periodic tasks ----------
@@ -323,6 +328,25 @@ class Daemon:
             ensure_geo_assets(force=force)
         except Exception:  # noqa: BLE001
             log.exception("geo refresh failed")
+
+    def _rebuild_config_if_active(self) -> None:
+        """Пересобрать xray config, если активный сервер известен.
+
+        Нужно при старте/после autoupdate: конфиг пересобирается из шаблона,
+        routing.json, direct.lst и параметров сервера. Если любой из этих
+        файлов изменился (git pull, ручная правка), изменения попадут в xray.
+        Если конфиг не прошёл xray -test — боевой config.json не трогается.
+        """
+        if self.state.active is None:
+            return
+        if self.dry_run:
+            log.info("[dry-run] would rebuild config for %s", _fmt(self.state.active))
+            return
+        try:
+            apply_server(self.state.active, dry_run=False, info=self.platform)
+            log.info("config rebuilt on startup for %s", _fmt(self.state.active))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("config rebuild on startup failed (keeping current config): %s", exc)
 
     # ---------- health / rotation ----------
     def tick_health(self) -> None:
