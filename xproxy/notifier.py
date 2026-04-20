@@ -60,7 +60,15 @@ def notify(text: str, *, urgent: bool = False, blocking: bool = False) -> None:
     if not token or not chat_id:
         return
 
-    full = f"{_identity()}: {text}"
+    if blocking:
+        # Синхронный путь: процесс сейчас выйдет, резолвим identity здесь.
+        prefix = _identity()
+    else:
+        # Асинхронный путь: не блокируем основной тред на HTTP-пробах.
+        # Используем кэш, если есть; иначе — placeholder (разрешится в треде).
+        prefix = _cached_identity() or f"{_short_hostname()}{_IDENTITY_PLACEHOLDER}"
+
+    full = f"{prefix}: {text}"
     if len(full) > _MAX_LEN:
         full = full[:_MAX_LEN - 3] + "..."
 
@@ -72,15 +80,18 @@ def notify(text: str, *, urgent: bool = False, blocking: bool = False) -> None:
         return
 
     threading.Thread(
-        target=_send_sync,
-        args=(token, chat_id, full),
+        target=_send_async,
+        args=(token, chat_id, text, full),
         name="telegram-notify",
         daemon=True,
     ).start()
 
 
 def _identity() -> str:
-    """`hostname/public_ip` с TTL-кэшем. При недоступном IP — только hostname."""
+    """`hostname/public_ip` с TTL-кэшем. При недоступном IP — только hostname.
+
+    Может блокировать на HTTP-запросах при холодном/просроченном кэше.
+    """
     global _identity_cache
     now = time.time()
     with _identity_lock:
@@ -100,6 +111,16 @@ def _identity() -> str:
     with _identity_lock:
         _identity_cache = (now + NOTIFIER_IDENTITY_TTL, identity)
     return identity
+
+
+def _cached_identity() -> Optional[str]:
+    """Вернуть кэшированный identity, если валиден; иначе None. Не блокирует."""
+    now = time.time()
+    with _identity_lock:
+        expires, cached = _identity_cache
+        if cached and now < expires:
+            return cached
+    return None
 
 
 def refresh_identity() -> None:
@@ -154,6 +175,25 @@ def _make_session(proxies: Optional[dict]) -> requests.Session:
 def _socks_proxies() -> dict:
     socks = f"socks5h://{SOCKS_HOST}:{SOCKS_PORT}"
     return {"http": socks, "https": socks}
+
+
+_IDENTITY_PLACEHOLDER = "/…"  # маркер незарезолвленного identity
+
+
+def _send_async(token: str, chat_id: str, raw_text: str, placeholder_text: str) -> None:
+    """Отправить в фоне: сначала резолвим identity, потом шлём.
+
+    Если identity был placeholder, подставим реальный prefix.
+    """
+    if _IDENTITY_PLACEHOLDER in placeholder_text:
+        # Placeholder — резолвим полный identity и пересобираем текст.
+        prefix = _identity()
+        full = f"{prefix}: {raw_text}"
+        if len(full) > _MAX_LEN:
+            full = full[:_MAX_LEN - 3] + "..."
+        _send_sync(token, chat_id, full)
+    else:
+        _send_sync(token, chat_id, placeholder_text)
 
 
 def _send_sync(token: str, chat_id: str, text: str) -> None:

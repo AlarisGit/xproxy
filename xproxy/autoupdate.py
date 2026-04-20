@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from .fs_utils import secure_write
 from .logger import get_logger
 from .settings import (
     AUTOUPDATE_RESTARTS_LIMIT,
@@ -91,6 +92,22 @@ def _upstream_for(branch: str) -> Optional[str]:
 
 def _head() -> str:
     return _git("rev-parse", "HEAD")
+
+
+def rollback_to(old_head: str) -> None:
+    """Откатить working tree на old_head после неудачного pull.
+
+    Безопасно, т.к. перед pull мы проверили _tree_clean() — локальных
+    изменений нет, reset не затирает пользовательские данные.
+    """
+    log.warning("rolling back working tree to %s", old_head[:7])
+    try:
+        _git("reset", "--hard", old_head)
+    except GitError as exc:
+        log.error("rollback to %s FAILED: %s — working tree stuck on bad commit!",
+                  old_head[:7], exc)
+    else:
+        log.info("working tree rolled back to %s", old_head[:7])
 
 
 def _commits_behind(branch: str, upstream: str) -> int:
@@ -229,13 +246,12 @@ def too_many_restarts() -> bool:
 
 
 def _record_restart(ts: float) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
     history = _load_history()
     history.append(ts)
     # отсекаем старое, чтобы файл не рос
     cutoff = ts - AUTOUPDATE_RESTARTS_WINDOW * 4
     history = [t for t in history if t >= cutoff]
-    _RESTART_HISTORY.write_text(json.dumps(history), encoding="utf-8")
+    secure_write(_RESTART_HISTORY, json.dumps(history))
 
 
 def _load_history() -> list[float]:

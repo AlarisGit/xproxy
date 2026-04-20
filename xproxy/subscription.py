@@ -8,6 +8,7 @@ from typing import Optional
 
 import requests
 
+from .fs_utils import secure_write
 from .env_config import EnvConfigError, require as env_require
 from .logger import get_logger
 from .settings import (
@@ -119,8 +120,7 @@ def fetch_subscription_text() -> tuple[str, str]:
 
 
 def _save_cache(decoded: str) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    SERVERS_CACHE.write_text(decoded, encoding="utf-8")
+    secure_write(SERVERS_CACHE, decoded)
 
 
 def _load_cache() -> Optional[str]:

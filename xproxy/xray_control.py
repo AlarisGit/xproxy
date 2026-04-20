@@ -15,6 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from .fs_utils import secure_write
 from .logger import get_logger
 from .platform_utils import (
     PlatformInfo,
@@ -210,8 +211,8 @@ def _backup_current_config(info: PlatformInfo) -> None:
     src = info.xray_config
     if not src.exists():
         return
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, BACKUP_PATH)
+    content = src.read_text(encoding="utf-8")
+    secure_write(BACKUP_PATH, content)
     log.debug("backed up %s → %s", src, BACKUP_PATH)
 
 

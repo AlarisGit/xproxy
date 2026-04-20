@@ -11,6 +11,7 @@ from .autoupdate import (
     check_and_pull,
     post_restart_banner,
     restart_self,
+    rollback_to,
     too_many_restarts,
     validate_new_code,
 )
@@ -219,11 +220,14 @@ class Daemon:
         # уже истёк). Force=True (стартовый fetch) проходит всегда.
         if not force and now - self.state.last_subscription_refresh < self._subscr_period:
             return
+        # Обновляем timestamp ДО попытки фетча, чтобы при неудаче следующий
+        # retry был не раньше subscr_period, а не каждый HEALTH_INTERVAL.
+        self.state.last_subscription_refresh = now
         try:
             source, body = fetch_subscription_text()
         except SubscriptionError as exc:
             log.warning("subscription unavailable: %s", exc)
-            notify(f"⚠️ subscription unavailable: {exc}", urgent=True)
+            notify(f"⚠️ subscription unavailable: {exc}")
             return
         if source == "cache":
             stale_sec = now - self.state.last_live_fetch
@@ -246,7 +250,6 @@ class Daemon:
             log.warning("subscription returned 0 allowed servers")
             return
         self.state.ranked = ranked
-        self.state.last_subscription_refresh = now
         log.info("subscription refreshed, %d eligible servers", len(ranked))
 
     def tick_autoupdate(self) -> None:
@@ -304,9 +307,10 @@ class Daemon:
                       "staying on %s. Error: %s",
                       result.new_head[:7], result.old_head[:7],
                       err.splitlines()[-1] if err else "?")
+            rollback_to(result.old_head)
             notify(
                 f"🔴 autoupdate: new code {result.new_head[:7]} failed "
-                f"import check, staying on {result.old_head[:7]}",
+                f"import check, rolled back to {result.old_head[:7]}",
                 urgent=True,
             )
             return

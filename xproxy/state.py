@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from .fs_utils import secure_write
 from .logger import get_logger
 from .servers import Server
 from .settings import ACTIVE_STATE, SERVER_PENALTY_DURATION, STATE_DIR
@@ -130,8 +131,7 @@ def load_active() -> Optional[Server]:
 
 
 def _save_active(server: Server) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    ACTIVE_STATE.write_text(
+    secure_write(
+        ACTIVE_STATE,
         json.dumps(server.to_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
