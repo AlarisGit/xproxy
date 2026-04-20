@@ -24,6 +24,7 @@ CONFIG_TMPL: Path = CONF_DIR / "config.tmpl"
 SUBSCRIPTION_TMPL: Path = CONF_DIR / "subscription.tmpl"
 COUNTRY_LIST: Path = CONF_DIR / "country.lst"
 ROUTING_JSON: Path = CONF_DIR / "routing.json"
+DIRECT_LIST: Path = CONF_DIR / "direct.lst"
 
 SERVERS_CACHE: Path = STATE_DIR / "servers.json"
 ACTIVE_STATE: Path = STATE_DIR / "active.json"

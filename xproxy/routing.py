@@ -12,7 +12,7 @@ import json
 from typing import Any, Optional
 
 from .logger import get_logger
-from .settings import ROUTING_JSON
+from .settings import DIRECT_LIST, ROUTING_JSON
 
 log = get_logger("xproxy.routing")
 
@@ -21,11 +21,30 @@ def load_routing() -> dict:
     return json.loads(ROUTING_JSON.read_text(encoding="utf-8"))
 
 
+def _load_direct_extras() -> list[str]:
+    """Прочитать conf/direct.lst — дополнительные домены для DirectSites.
+
+    Пустые строки и строки, начинающиеся с #, игнорируются.
+    Файл может отсутствовать — возвращается пустой список.
+    """
+    if not DIRECT_LIST.exists():
+        return []
+    entries: list[str] = []
+    for line in DIRECT_LIST.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            entries.append(stripped)
+    if entries:
+        log.debug("direct.lst: %d extra direct entries", len(entries))
+    return entries
+
+
 def build_xray_sections() -> dict:
     cfg = load_routing()
+    direct_extras = _load_direct_extras()
     return {
-        "routing": _build_routing(cfg),
-        "dns": _build_dns(cfg),
+        "routing": _build_routing(cfg, direct_extras),
+        "dns": _build_dns(cfg, direct_extras),
         "fakedns": _build_fakedns(cfg),
         "enable_sniffing": bool(cfg.get("FakeDns")),
     }
@@ -33,7 +52,7 @@ def build_xray_sections() -> dict:
 
 # ---------- routing ----------
 
-def _build_routing(cfg: dict) -> dict:
+def _build_routing(cfg: dict, direct_extras: list[str] | None = None) -> dict:
     rules: list[dict] = []
 
     # Порядок правил из RouteOrder, напр. "block-direct-proxy".
@@ -44,9 +63,13 @@ def _build_routing(cfg: dict) -> dict:
     if not order:
         order = ["block", "direct", "proxy"]
 
+    direct_sites = list(cfg.get("DirectSites") or [])
+    if direct_extras:
+        direct_sites.extend(direct_extras)
+
     builders = {
         "block": lambda: _group_rules(cfg.get("BlockIp"), cfg.get("BlockSites"), "block"),
-        "direct": lambda: _group_rules(cfg.get("DirectIp"), cfg.get("DirectSites"), "direct"),
+        "direct": lambda: _group_rules(cfg.get("DirectIp"), direct_sites or None, "direct"),
         "proxy": lambda: _group_rules(cfg.get("ProxyIp"), cfg.get("ProxySites"), "proxy"),
     }
     for group in order:
@@ -89,7 +112,7 @@ def _dns_address(cfg: dict, prefix: str) -> Optional[str]:
     return ip
 
 
-def _build_dns(cfg: dict) -> dict:
+def _build_dns(cfg: dict, direct_extras: list[str] | None = None) -> dict:
     servers: list[Any] = []
 
     remote = _dns_address(cfg, "Remote")
@@ -98,6 +121,8 @@ def _build_dns(cfg: dict) -> dict:
     # Локальный (домашний) DNS — только для домашних доменов/geoip:ru.
     ru_domains: list[str] = []
     ru_domains.extend(cfg.get("DirectSites") or [])
+    if direct_extras:
+        ru_domains.extend(direct_extras)
     if not any(d.startswith("geosite:") and "ru" in d for d in ru_domains):
         ru_domains.append("geosite:category-ru")
     if domestic:
