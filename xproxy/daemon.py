@@ -36,7 +36,7 @@ from .settings import (
 )
 from .state import DaemonState, load_active
 from .subscription import SubscriptionError, fetch_subscription_text
-from .xray_control import apply_server, is_running
+from .xray_control import ConfigUnchanged, apply_server, is_running
 
 log = get_logger("xproxy.daemon")
 
@@ -345,6 +345,8 @@ class Daemon:
         try:
             apply_server(self.state.active, dry_run=False, info=self.platform)
             log.info("config rebuilt on startup for %s", _fmt(self.state.active))
+        except ConfigUnchanged:
+            log.info("config unchanged on startup, skip rebuild")
         except Exception as exc:  # noqa: BLE001
             log.warning("config rebuild on startup failed (keeping current config): %s", exc)
 

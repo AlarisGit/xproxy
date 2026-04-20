@@ -37,11 +37,27 @@ class XrayConfigError(RuntimeError):
     """Сгенерированный конфиг не прошёл xray -test."""
 
 
+class ConfigUnchanged(RuntimeError):
+    """Сгенерированный конфиг идентичен текущему — запись и рестарт не нужны."""
+
+
 def apply_server(server: Server, *, dry_run: bool = False,
                  info: PlatformInfo | None = None) -> None:
-    """Сгенерировать конфиг, провалидировать, забэкапить, записать и рестартовать."""
+    """Сгенерировать конфиг, провалидировать, забэкапить, записать и рестартовать.
+
+    Если сгенерированный конфиг совпадает с текущим на диске — поднимает
+    ConfigUnchanged (xray не перезагружается, соединения не рвутся).
+    """
     info = info or detect_platform()
     cfg_text = build_xray_config_text(server)
+
+    # 0. Diff: если конфиг не изменился — не трогаем xray.
+    if not dry_run and _config_matches_current(cfg_text, info):
+        log.info("config unchanged, skip write+restart (%s:%d)",
+                 server.host, server.port)
+        raise ConfigUnchanged(
+            f"config for {server.host}:{server.port} is identical to current"
+        )
 
     # 1. Валидация: xray -test на временном файле.
     ok, err = validate_config_text(cfg_text, info)
@@ -177,6 +193,18 @@ def is_running() -> bool:
 
 
 # ---------- internals ----------
+
+def _config_matches_current(new_text: str, info: PlatformInfo) -> bool:
+    """True, если new_text совпадает с текущим config.json на диске."""
+    target = info.xray_config
+    if not target.exists():
+        return False
+    try:
+        current = target.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return current == new_text
+
 
 def _backup_current_config(info: PlatformInfo) -> None:
     src = info.xray_config
