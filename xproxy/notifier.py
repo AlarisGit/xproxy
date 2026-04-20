@@ -168,7 +168,7 @@ def _send_sync(token: str, chat_id: str, text: str) -> None:
         ("proxy", _socks_proxies()),
         ("direct", None),
     )
-    last_err = ""
+    errors: list[str] = []
     for label, proxies in routes:
         try:
             session = _make_session(proxies)
@@ -176,11 +176,11 @@ def _send_sync(token: str, chat_id: str, text: str) -> None:
             if resp.status_code == 200:
                 log.debug("telegram sent via %s", label)
                 return
-            last_err = (f"via {label}: http={resp.status_code} "
-                        f"body={_scrub(resp.text[:200], token)}")
+            errors.append(f"via {label}: http={resp.status_code} "
+                          f"body={_scrub(resp.text[:200], token)}")
         except requests.RequestException as exc:
-            last_err = f"via {label}: {_scrub(str(exc), token)}"
+            errors.append(f"via {label}: {_scrub(str(exc), token)}")
         except Exception as exc:  # noqa: BLE001
             # На случай, если where-то внутри стек попадёт token — сразу скрабим.
-            last_err = f"via {label}: {_scrub(''.join(traceback.format_exception_only(type(exc), exc)).strip(), token)}"
-    log.warning("telegram send failed on all routes: %s", last_err)
+            errors.append(f"via {label}: {_scrub(''.join(traceback.format_exception_only(type(exc), exc)).strip(), token)}")
+    log.warning("telegram send failed on all routes: %s", "; ".join(errors))
