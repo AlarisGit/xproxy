@@ -310,7 +310,8 @@ class Daemon:
                  result.new_head[:7])
         notify(
             f"🆙 xproxy updating {result.old_head[:7]} → "
-            f"{result.new_head[:7]}, restarting"
+            f"{result.new_head[:7]}, restarting",
+            blocking=True,
         )
         restart_self()  # не вернётся при успехе
 
