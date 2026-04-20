@@ -315,6 +315,12 @@ class Daemon:
             if self.state.consecutive_proxy_failures:
                 log.info("proxy recovered (active: %s)", _fmt(self.state.active))
             self.state.note_proxy_ok()
+            # Если активный сервер неизвестен — прокси работает, но мы не управляем
+            # выбором сервера (например, xray был сконфигурирован вручную до xproxy).
+            # Ротируем, чтобы xproxy взял управление на себя.
+            if self.state.active is None:
+                log.warning("proxy alive but active server unknown — rotating to take control")
+                self._rotate_until_working(reason="active-unknown")
             return
 
         fails = self.state.note_proxy_fail()
