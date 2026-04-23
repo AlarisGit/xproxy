@@ -16,6 +16,7 @@ from .autoupdate import (
     validate_new_code,
 )
 from .geo import ensure_geo_assets
+from .routing import build_xray_sections
 from .healthcheck import internet_alive, proxy_alive, public_ips
 from .logger import get_logger
 from .notifier import is_configured as tg_configured, notify
@@ -71,6 +72,15 @@ class Daemon:
         # Следующий геопулл планируем в будущем — первый запуск сделает
         # run_once()/run_forever() после startup-jitter'а, здесь не стартуем.
         self._next_geo_at: float = 0.0
+        # Подпись последнего набора отброшенных geo-записей. Меняется при
+        # изменении geosite.dat/geoip.dat или routing.json — только тогда
+        # нужно повторно уведомлять пользователя.
+        self._last_removed_geo_sig: Optional[str] = None
+        # Флаг «тупик»: xray не работает/отвалился, а geo-assets нечитаемы
+        # (ротация заблокирована, см. _rotate_until_working). Нужен только
+        # чтобы не спамить уведомлениями — сбрасывается при первой успешной
+        # проверке geo-assets.
+        self._stuck_notified: bool = False
         # Минутный offset для heartbeat: HEARTBEAT_HOUR + 0..HEARTBEAT_JITTER_MIN мин,
         # фиксируется на весь процесс (чтобы не дрейфовать в течение дня).
         self._heartbeat_minute_offset = random.randint(0, max(0, HEARTBEAT_JITTER_MIN))
@@ -128,8 +138,7 @@ class Daemon:
         # Первый проход — немедленно (после startup jitter'а).
         self.refresh_subscription(force=True)
         self.refresh_geo(force=False)
-        # Следующий geo-фетч — не раньше, чем через jittered период.
-        self._next_geo_at = time.time() + self._geo_period
+        # Следующий geo-фетч планирует сама refresh_geo() (учитывает бэкофф).
         # Пересобрать конфиг при старте, чтобы подхватить изменения routing/
         # direct.lst/config.tmpl, полученные через git pull (или сделанные вручную).
         # Без этого новые маршруты не попадут в xray до следующей ротации сервера.
@@ -172,8 +181,6 @@ class Daemon:
             self._subscr_period = _jittered(SUBSCR_REFRESH)
         if now >= self._next_geo_at:
             self.refresh_geo(force=False)
-            self._geo_period = _jittered(GEO_REFRESH)
-            self._next_geo_at = time.time() + self._geo_period
         self.tick_health()
         self.tick_heartbeat()
         if GIT_PULL_INTERVAL > 0 and \
@@ -341,34 +348,165 @@ class Daemon:
         restart_self()  # не вернётся при успехе
 
     def refresh_geo(self, force: bool) -> None:
-        # Файлы кладутся в GEO_DIR (~/.config/xproxy/geo). xray видит их через
-        # XRAY_LOCATION_ASSET, которая прописана в юните xray при установке.
-        # Мы НЕ пишем в системные asset-директории xray.
+        # Файлы кладутся в GEO_DIR. xray видит их через XRAY_LOCATION_ASSET.
+        # Замена файла только атомарна и только после полного скачивания —
+        # при обрыве соединения остаётся работать старая копия.
         try:
-            ensure_geo_assets(force=force)
+            result = ensure_geo_assets(force=force)
         except Exception:  # noqa: BLE001
             log.exception("geo refresh failed")
+            # Жёсткое падение — перепланируем через самый короткий бэкофф,
+            # чтобы не зацикливаться на каждой итерации health-loop.
+            self._next_geo_at = time.time() + 60.0
+            return
 
-    def _rebuild_config_if_active(self) -> None:
+        # Планируем следующую попытку по данным ensure_geo_assets.
+        delay = _jittered(result.next_attempt_in)
+        self._next_geo_at = time.time() + max(10.0, delay)
+        self._geo_period = delay
+
+        if result.errors:
+            # Не спамим пользователя на каждый ретрай: throttle notifier
+            # отфильтрует одинаковые сообщения. Сообщаем факт ошибок.
+            errs = ", ".join(f"{n}: {e}" for n, e in result.errors.items())
+            notify(f"⚠️ geo download error ({errs}); working copy kept, "
+                   f"next retry in {int(delay)}s")
+
+        # После скачивания: проверим, какие geo-ссылки в routing.json теперь
+        # не резолвятся, и, если набор изменился, уведомим пользователя.
+        # Параллельно получим флаг geo_readable — он управляет решением о
+        # ребилде: если хотя бы один .dat нечитаем/отсутствует, мы НЕ
+        # трогаем live-конфиг (см. дефект #2 предыдущей итерации: иначе
+        # любой parser mismatch превращался в живую смену маршрутизации).
+        geo_readable = self._check_and_notify_removed_geo()
+
+        if not geo_readable:
+            log.warning("geo assets not all readable — skipping config rebuild "
+                        "to preserve last-known-good routing")
+            return
+
+        # Geo вернулись — если раньше сидели в «тупике», расклеиваем флаг,
+        # чтобы следующий реальный stuck-случай снова поднял уведомление.
+        self._stuck_notified = False
+
+        # Если файлы обновились и есть активный сервер — пересобрать конфиг,
+        # чтобы xray подхватил новые geo-данные без ожидания ротации.
+        # geo_ready=True передаём, чтобы не парсить .dat второй раз: мы
+        # только что валидировали их внутри _check_and_notify_removed_geo().
+        if result.freshly_downloaded and self.state.active is not None:
+            log.info("geo files updated (%s) — rebuilding xray config",
+                     ",".join(sorted(result.freshly_downloaded)))
+            self._rebuild_config_if_active(
+                context="post-download rebuild",
+                geo_ready=True,
+            )
+
+    def _check_and_notify_removed_geo(self) -> bool:
+        """Проверить routing против актуальных .dat и уведомить пользователя.
+
+        Возвращает True, если все geo-файлы читаемы (и, значит, список
+        выкинутых записей достоверный). False означает: как минимум один
+        .dat нечитаем — решения об «удалённых категориях» принимать
+        нельзя, уведомление не шлём, чтобы не дергать пользователя на
+        временные FS/парсерные сбои.
+        """
+        try:
+            sections = build_xray_sections()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to validate routing against geo data")
+            return False
+        geo_readable = bool(sections.get("geo_readable"))
+        if not geo_readable:
+            # Не обновляем подпись: когда файлы снова станут читаемы,
+            # последует честное сравнение с предыдущим валидным набором.
+            return False
+
+        removed = sections.get("removed_geo") or []
+        # Подпись: набор групп+записей. Если не изменился — не уведомляем.
+        sig = ";".join(f"{g}:{e}" for g, e in sorted(removed))
+        if sig == self._last_removed_geo_sig:
+            return True
+        self._last_removed_geo_sig = sig
+
+        if not removed:
+            # Если раньше что-то было — сообщим, что всё восстановилось.
+            log.info("routing: no missing geo categories")
+            return True
+
+        # Группируем для компактного отчёта.
+        by_group: dict[str, list[str]] = {}
+        for group, entry in removed:
+            by_group.setdefault(group, []).append(entry)
+        lines = [f"  {g}: {', '.join(sorted(set(items)))}"
+                 for g, items in sorted(by_group.items())]
+        log.warning("routing: dropped %d entries referencing missing geo "
+                    "categories:\n%s", len(removed), "\n".join(lines))
+        notify(
+            "⚠️ routing: dropped entries referencing missing geo "
+            f"categories ({len(removed)} total):\n" + "\n".join(lines),
+            urgent=True,
+        )
+        return True
+
+    def _geo_ready_for_rebuild(self, context: str) -> bool:
+        """Guard: безопасно ли сейчас собирать и писать новый xray-конфиг.
+
+        «Безопасно» ≡ в итоговом построенном routing+dns не осталось
+        geosite:*/geoip:* ссылок на нечитаемые .dat. Это точнее, чем
+        проверка «все .dat на диске»: если routing.json, к примеру, не
+        использует geoip:*, отсутствие geoip.dat не должно блокировать
+        rebuild (build_xray_sections сам это понимает и вернёт
+        geo_readable=True).
+
+        Если нужные .dat нечитаемы — ничего не трогаем: текущий xray
+        (если был жив) продолжает работать, refresh_geo ретраится по
+        бэкоффу.
+        """
+        try:
+            sections = build_xray_sections()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s: skipped — routing build failed: %s", context, exc)
+            return False
+        if not sections.get("geo_readable"):
+            missing = sections.get("unreadable_needed") or ["?"]
+            log.warning("%s: skipped — needed geo assets unreadable (%s), "
+                        "preserving last-known-good xray config",
+                        context, ", ".join(missing))
+            return False
+        return True
+
+    def _rebuild_config_if_active(
+        self,
+        context: str = "startup rebuild",
+        geo_ready: Optional[bool] = None,
+    ) -> None:
         """Пересобрать xray config, если активный сервер известен.
 
-        Нужно при старте/после autoupdate: конфиг пересобирается из шаблона,
-        routing.json, direct.lst и параметров сервера. Если любой из этих
-        файлов изменился (git pull, ручная правка), изменения попадут в xray.
-        Если конфиг не прошёл xray -test — боевой config.json не трогается.
+        Нужно при старте/после autoupdate/после успешного geo-refresh:
+        конфиг пересобирается из шаблона, routing.json, direct.lst и
+        параметров сервера. Если любой из этих файлов изменился (git pull,
+        ручная правка, свежий .dat), изменения попадут в xray. Если конфиг
+        не прошёл xray -test — боевой config.json не трогается.
+
+        `context` — короткая строка для логов (кто инициировал rebuild).
+        `geo_ready` — если вызывающий уже только что проверил geo-assets,
+        пусть передаст True, чтобы избежать повторного парсинга .dat.
         """
         if self.state.active is None:
             return
         if self.dry_run:
             log.info("[dry-run] would rebuild config for %s", _fmt(self.state.active))
             return
+        if geo_ready is not True and not self._geo_ready_for_rebuild(context):
+            return
         try:
             apply_server(self.state.active, dry_run=False, info=self.platform)
-            log.info("config rebuilt on startup for %s", _fmt(self.state.active))
+            log.info("%s: config rebuilt for %s",
+                     context, _fmt(self.state.active))
         except ConfigUnchanged:
-            log.info("config unchanged on startup, skip rebuild")
+            log.info("%s: config unchanged, skip rebuild", context)
         except Exception as exc:  # noqa: BLE001
-            log.warning("config rebuild on startup failed (keeping current config): %s", exc)
+            log.warning("%s: failed (keeping current config): %s", context, exc)
 
     # ---------- health / rotation ----------
     def tick_health(self) -> None:
@@ -409,6 +547,30 @@ class Daemon:
     def _rotate_until_working(self, reason: str) -> None:
         if not self.state.ranked:
             log.error("cannot rotate: server list is empty")
+            return
+
+        # Тот же guard, что на startup rebuild: если geo-assets нечитаемы,
+        # apply_server всё равно не пройдёт xray -test (в конфиге останутся
+        # ссылки на geosite:/geoip:), но зато мы гарантированно не затрём
+        # уже работающий live-конфиг. Лучше продолжить пробовать старый
+        # сервер, чем остаться без xray вообще.
+        if not self._geo_ready_for_rebuild(f"rotation ({reason})"):
+            # Осознанный trade-off: ротация заблокирована, пока не
+            # вернутся валидные .dat. Если в этот момент xray тоже лежит —
+            # мы в тупике и ни одно «no working server found» уведомление
+            # не уйдёт. Отдельным сообщением поднимаем пользователю флаг
+            # (один раз, пока geo не починится).
+            if not self._stuck_notified:
+                log.error("STUCK: rotation blocked (reason=%s) AND geo assets "
+                          "unreadable — cannot switch servers until geo "
+                          "recovers", reason)
+                notify(
+                    f"🔴 xproxy stuck: rotation needed ({reason}) but geo "
+                    f"assets unreadable — cannot rebuild xray config. "
+                    f"Manual intervention may be required.",
+                    urgent=True, blocking=True,
+                )
+                self._stuck_notified = True
             return
 
         direct, via = public_ips()

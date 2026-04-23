@@ -5,6 +5,10 @@
     dns      — dict, всегда присутствует (DNS-сплит)
     fakedns  — list | None (если FakeDns=true)
     enable_sniffing — bool (включать sniffing во входящих)
+    removed_geo — list[tuple[str, str]] — (group, entry) пары, выкинутые
+                  из-за отсутствующих категорий в geosite.dat/geoip.dat.
+                  Нужен, чтобы вышестоящий код мог уведомить пользователя
+                  одним сообщением.
 """
 from __future__ import annotations
 
@@ -42,18 +46,67 @@ def _load_direct_extras() -> list[str]:
 def build_xray_sections() -> dict:
     cfg = load_routing()
     direct_extras = _load_direct_extras()
+    # Загружаем доступные категории из .dat-файлов. Ленивый импорт,
+    # чтобы избежать циклической зависимости routing ↔ geo.
+    from .geo import load_geo_categories, required_geo_kinds
+    categories = load_geo_categories()
+
+    removed: list[tuple[str, str]] = []
+    routing, removed_r = _build_routing(cfg, direct_extras, categories)
+    removed.extend(removed_r)
+    dns, removed_dns = _build_dns(cfg, direct_extras, categories)
+    removed.extend(removed_dns)
+
+    # geo_readable считаем по ФАКТУ: сканируем уже построенные routing+dns
+    # и смотрим, остались ли в них ссылки на нечитаемые .dat. Это точнее,
+    # чем «все .dat должны быть на диске»:
+    #   1) Если routing.json вовсе не ссылается на какой-то kind, отсутствие
+    #      соответствующего .dat допустимо (пример: есть только geosite:*).
+    #   2) `_build_dns` синтезирует `geoip:ru` / `geosite:category-ru`
+    #      поверх cfg — значит нужно смотреть на построенный результат,
+    #      а не на raw routing.json.
+    # strip_missing_geo уже оставил в routing+dns только те geo-ссылки,
+    # которые либо валидны, либо относятся к нечитаемым ассетам (в отсутствие
+    # .dat мы не трогаем правила, см. fix #2 ранее). Если таких «висящих»
+    # ссылок не осталось — xray -test пройдёт, и rebuild безопасен.
+    needed_kinds = required_geo_kinds({"routing": routing, "dns": dns})
+    unreadable_needed = [k for k in needed_kinds if categories.get(k) is None]
+    geo_readable = not unreadable_needed
+
+    if removed:
+        summary = ", ".join(f"{g}:{e}" for g, e in removed[:10])
+        tail = f" (+{len(removed) - 10} more)" if len(removed) > 10 else ""
+        log.warning(
+            "dropped %d routing entries referring to missing geo categories: %s%s",
+            len(removed), summary, tail,
+        )
+    if unreadable_needed:
+        log.warning("geo assets unreadable/missing (%s) — routing references "
+                    "them, rebuild will be blocked until they recover",
+                    ", ".join(sorted(unreadable_needed)))
+
     return {
-        "routing": _build_routing(cfg, direct_extras),
-        "dns": _build_dns(cfg, direct_extras),
+        "routing": routing,
+        "dns": dns,
         "fakedns": _build_fakedns(cfg),
         "enable_sniffing": bool(cfg.get("FakeDns")),
+        "removed_geo": removed,
+        "geo_readable": geo_readable,
+        "unreadable_needed": sorted(unreadable_needed),
     }
 
 
 # ---------- routing ----------
 
-def _build_routing(cfg: dict, direct_extras: list[str] | None = None) -> dict:
+def _build_routing(
+    cfg: dict,
+    direct_extras: list[str] | None,
+    categories: dict[str, set[str] | None],
+) -> tuple[dict, list[tuple[str, str]]]:
+    from .geo import strip_missing_geo
+
     rules: list[dict] = []
+    removed: list[tuple[str, str]] = []
 
     # Порядок правил из RouteOrder, напр. "block-direct-proxy".
     order_key = str(cfg.get("RouteOrder") or "block-direct-proxy").lower()
@@ -67,13 +120,19 @@ def _build_routing(cfg: dict, direct_extras: list[str] | None = None) -> dict:
     if direct_extras:
         direct_sites.extend(direct_extras)
 
-    builders = {
-        "block": lambda: _group_rules(cfg.get("BlockIp"), cfg.get("BlockSites"), "block"),
-        "direct": lambda: _group_rules(cfg.get("DirectIp"), direct_sites or None, "direct"),
-        "proxy": lambda: _group_rules(cfg.get("ProxyIp"), cfg.get("ProxySites"), "proxy"),
+    groups = {
+        "block": (cfg.get("BlockIp"), cfg.get("BlockSites")),
+        "direct": (cfg.get("DirectIp"), direct_sites or None),
+        "proxy": (cfg.get("ProxyIp"), cfg.get("ProxySites")),
     }
+
     for group in order:
-        rules.extend(builders[group]())
+        ips, sites = groups[group]
+        ips_kept, ips_removed = strip_missing_geo(ips, categories)
+        sites_kept, sites_removed = strip_missing_geo(sites, categories)
+        removed.extend((group, e) for e in ips_removed)
+        removed.extend((group, e) for e in sites_removed)
+        rules.extend(_group_rules(ips_kept or None, sites_kept or None, group))
 
     # Глобальный catchall на прокси, если GlobalProxy.
     if cfg.get("GlobalProxy", True):
@@ -83,8 +142,8 @@ def _build_routing(cfg: dict, direct_extras: list[str] | None = None) -> dict:
         "domainStrategy": cfg.get("DomainStrategy") or "IPIfNonMatch",
         "rules": rules,
     }
-    log.debug("routing: %d rules", len(rules))
-    return out
+    log.debug("routing: %d rules (%d removed)", len(rules), len(removed))
+    return out, removed
 
 
 def _group_rules(ips: Optional[list], sites: Optional[list], tag: str) -> list[dict]:
@@ -112,8 +171,15 @@ def _dns_address(cfg: dict, prefix: str) -> Optional[str]:
     return ip
 
 
-def _build_dns(cfg: dict, direct_extras: list[str] | None = None) -> dict:
+def _build_dns(
+    cfg: dict,
+    direct_extras: list[str] | None,
+    categories: dict[str, set[str] | None],
+) -> tuple[dict, list[tuple[str, str]]]:
+    from .geo import strip_missing_geo
+
     servers: list[Any] = []
+    removed: list[tuple[str, str]] = []
 
     remote = _dns_address(cfg, "Remote")
     domestic = _dns_address(cfg, "Domestic")
@@ -123,15 +189,26 @@ def _build_dns(cfg: dict, direct_extras: list[str] | None = None) -> dict:
     ru_domains.extend(cfg.get("DirectSites") or [])
     if direct_extras:
         ru_domains.extend(direct_extras)
-    if not any(d.startswith("geosite:") and "ru" in d for d in ru_domains):
+    if not any(isinstance(d, str) and d.startswith("geosite:") and "ru" in d
+               for d in ru_domains):
         ru_domains.append("geosite:category-ru")
-    if domestic:
-        servers.append({
+
+    ru_domains_kept, ru_removed = strip_missing_geo(ru_domains, categories)
+    removed.extend(("dns-domains", e) for e in ru_removed)
+
+    expect_ips = ["geoip:ru"]
+    expect_kept, expect_removed = strip_missing_geo(expect_ips, categories)
+    removed.extend(("dns-expectIPs", e) for e in expect_removed)
+
+    if domestic and ru_domains_kept:
+        server_entry: dict[str, Any] = {
             "address": domestic,
-            "domains": sorted(set(ru_domains)),
-            "expectIPs": ["geoip:ru"],
+            "domains": sorted(set(ru_domains_kept)),
             "skipFallback": True,
-        })
+        }
+        if expect_kept:
+            server_entry["expectIPs"] = expect_kept
+        servers.append(server_entry)
 
     # Удалённый DNS — всё остальное (и блок-домены тоже спрашиваем у него, ничего страшного).
     if remote:
@@ -140,11 +217,12 @@ def _build_dns(cfg: dict, direct_extras: list[str] | None = None) -> dict:
         # fallback на публичный резолвер, чтобы конфиг всегда был валиден.
         servers.append("1.1.1.1")
 
-    return {
+    dns_section = {
         "hosts": cfg.get("DnsHosts") or {},
         "servers": servers,
         "queryStrategy": "UseIP",
     }
+    return dns_section, removed
 
 
 # ---------- fakedns ----------
