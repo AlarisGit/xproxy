@@ -136,6 +136,21 @@ class Daemon:
         if self._stop:
             return
         # Первый проход — немедленно (после startup jitter'а).
+        # Порядок важен:
+        #   1) autoupdate — если есть новый код, restart_self() сделает
+        #      os.execv и мы не вернёмся; на следующем витке новый процесс
+        #      снова зайдёт сюда и продолжит со свежим кодом. Любая ошибка
+        #      pull'а не критична (остаёмся на старом коде, tick_autoupdate
+        #      сам уведомит пользователя).
+        #   2) подписка и geo — уже в «новом» (или old-but-good) коде.
+        # Без этого блока первый git pull случался только через один
+        # HEALTH_INTERVAL (~15с), а geo — через startup jitter, но
+        # семантика «при рестарте берём самое свежее» была неявной.
+        if GIT_PULL_INTERVAL > 0 and not self.dry_run:
+            try:
+                self.tick_autoupdate()
+            except Exception:  # noqa: BLE001
+                log.exception("startup autoupdate failed (continuing on old code)")
         self.refresh_subscription(force=True)
         self.refresh_geo(force=False)
         # Следующий geo-фетч планирует сама refresh_geo() (учитывает бэкофф).

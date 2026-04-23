@@ -100,6 +100,18 @@ def ensure_geo_assets(force: bool = False) -> GeoResult:
             continue
 
         exists = target.exists()
+        # Опортунистически чиним права на старых файлах, записанных до
+        # того, как мы начали выставлять 0644 в _download(). Без этого
+        # xray-сервис под другим пользователем не сможет их прочитать
+        # до следующей ПОЛНОЙ перезакачки (через GEO_REFRESH часов).
+        if exists:
+            try:
+                mode = target.stat().st_mode & 0o777
+                if mode != 0o644:
+                    os.chmod(target, 0o644)
+                    log.info("fixed perms on %s: 0o%o → 0o644", target, mode)
+            except OSError as exc:
+                log.debug("could not chmod %s: %s", target, exc)
         age = (now - target.stat().st_mtime) if exists else float("inf")
         # Валидность текущего файла проверяем ПАРСЕРОМ, а не только
         # по mtime: старая версия кода могла опубликовать битый .dat (до
@@ -328,6 +340,14 @@ def _download(url: str, target: Path) -> None:
             raise IOError("downloaded file contains no geodata entries "
                           "(likely HTML error page or truncated)")
 
+        # Выставляем 0644 ДО replace: tempfile.mkstemp() создаёт .part с
+        # безопасными правами 0600 (владелец), а `os.replace` сохраняет
+        # их при переименовании. В итоге xray-сервис под отдельным
+        # пользователем (на Linux обычно `nobody`/`xray`) не может
+        # прочитать файл — xray молча стартует со встроенными geo-данными
+        # либо падает. Содержимое geosite.dat/geoip.dat не секретно,
+        # стандартный набор 0644 корректен для shared-ассета.
+        os.chmod(tmp, 0o644)
         # Успех — атомарно заменяем боевой файл.
         os.replace(tmp, target)
     except BaseException:
