@@ -61,7 +61,7 @@ GEO_REFRESH = 6 * 3600        # максимальный интервал меж
 GEO_RETRY_SCHEDULE = (10, 60, 5 * 60, 30 * 60, 60 * 60, 6 * 3600)
 GIT_PULL_INTERVAL = 3600      # 0 = выключить autoupdate
 BOOT_GRACE = 10               # ожидание после рестарта xray
-HEALTH_TIMEOUT = 5            # таймаут HTTP-пробы
+HEALTH_TIMEOUT = 10           # таймаут HTTP-пробы
 TCP_PROBE_TIMEOUT = 3         # таймаут TCP-pre-probe сервера
 
 # ---------- Autoupdate ----------
@@ -107,11 +107,14 @@ HEARTBEAT_JITTER_MIN = 60
 # ВНИМАНИЕ: ipinfo.io/ip исключён намеренно — он возвращает IP upstream-провайдера
 # по peering/anycast таблицам, а не реальный source-IP соединения. На сетях с CGNAT
 # или Tier-2 ISP это приводит к расхождению с остальными IP-чекерами.
+# Порядок важен: быстрые/надёжные источники идут первыми и пробуются
+# приоритизированно. Медленные или нестабильные — в резерве.
+# _any_probe() использует приоритизированный обход, а не случайный shuffle.
 IP_CHECK_URLS = (
-    "https://ifconfig.me/ip",
-    "https://api.ipify.org",
-    "https://ipecho.net/plain",
-    "https://icanhazip.com",
+    "https://icanhazip.com",       # стабильно быстрый, почти не таймаутит
+    "https://ifconfig.me/ip",      # стабильно быстрый
+    "https://api.ipify.org",       # иногда медленный через CDN
+    "https://ipecho.net/plain",    # резерв — чаще таймаутит через прокси
 )
 
 # ---------- HTTP ----------

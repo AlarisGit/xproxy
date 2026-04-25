@@ -49,9 +49,14 @@ def _probe(session: requests.Session, url: str, via: str) -> Optional[str]:
 
 def _any_probe(urls: Iterable[str], proxies: Optional[dict],
                attempts: int = 2) -> Optional[str]:
-    """Случайный обход — один успех → True. Возвращает тело ответа."""
+    """Приоритизированный обход — быстрые URL пробуются первыми.
+
+    Порядок в IP_CHECK_URLS важен: стабильные/быстрые источники в начале,
+    медленные в резерве. Мы не шафлим — идём по порядку, первые успехи
+    закрывают потребность. attempts ограничивает число попыток (не URL),
+    чтобы не тратить время на все 4 чекера при первой же удаче.
+    """
     pool = list(urls)
-    random.shuffle(pool)
     via = "proxy" if proxies else "direct"
     session = _make_session(proxies)
     tried = 0
