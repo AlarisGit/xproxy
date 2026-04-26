@@ -61,7 +61,7 @@ GEO_REFRESH = 6 * 3600        # максимальный интервал меж
 GEO_RETRY_SCHEDULE = (10, 60, 5 * 60, 30 * 60, 60 * 60, 6 * 3600)
 GIT_PULL_INTERVAL = 3600      # 0 = выключить autoupdate
 BOOT_GRACE = 10               # ожидание после рестарта xray
-HEALTH_TIMEOUT = 10           # таймаут HTTP-пробы
+HEALTH_TIMEOUT = 8            # таймаут HTTP-пробы
 TCP_PROBE_TIMEOUT = 3         # таймаут TCP-pre-probe сервера
 
 # ---------- Autoupdate ----------
@@ -75,7 +75,7 @@ NOTIFIER_IDENTITY_TTL = 6 * 3600   # как часто освежать внеш
 STALE_SUBSCRIPTION_SEC = 24 * 3600  # подписка считается устаревшей через 24ч без live-фетча
 
 # ---------- Анти-флаппинг ----------
-FAIL_THRESHOLD = 3            # сколько подряд-фейлов прокси нужно до ротации
+FAIL_THRESHOLD = 5            # сколько подряд-фейлов прокси нужно до ротации
 ROTATION_COOLDOWN = 60        # не ротируем чаще, чем раз в минуту
 SERVER_PENALTY_DURATION = 5 * 60   # на сколько уводим упавший сервер в конец списка
 
