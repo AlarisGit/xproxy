@@ -188,20 +188,29 @@ class Daemon:
     # ---------- periodic tasks ----------
     def tick(self) -> None:
         now = time.time()
-        # Все периоды — jittered. После каждого срабатывания перерисовываем
-        # интервал, чтобы при множественной установке на нескольких хостах
-        # события не слипались в одну секунду.
-        if now - self.state.last_subscription_refresh >= self._subscr_period:
-            self.refresh_subscription()
-            self._subscr_period = _jittered(SUBSCR_REFRESH)
-        if now >= self._next_geo_at:
-            self.refresh_geo(force=False)
-        self.tick_health()
+        # Проверка доступности интернет-канала — один раз за tick.
+        # Если сети нет (хост в suspend / автономном режиме), все сетевые
+        # задачи теряют смысл: подписка, geo, autoupdate — пропускаем.
+        # Результат передаём в tick_health(), чтобы не делать повторный HTTP-
+        # запрос (internet_alive() уже выполнен здесь).
+        has_internet = internet_alive()
+        if not has_internet:
+            log.info("no direct internet — skipping subscription, geo, autoupdate")
+        else:
+            # Все периоды — jittered. После каждого срабатывания перерисовываем
+            # интервал, чтобы при множественной установке на нескольких хостах
+            # события не слипались в одну секунду.
+            if now - self.state.last_subscription_refresh >= self._subscr_period:
+                self.refresh_subscription()
+                self._subscr_period = _jittered(SUBSCR_REFRESH)
+            if now >= self._next_geo_at:
+                self.refresh_geo(force=False)
+            if GIT_PULL_INTERVAL > 0 and \
+                    now - self.state.last_git_pull >= self._git_period:
+                self.tick_autoupdate()
+                self._git_period = _jittered(GIT_PULL_INTERVAL)
+        self.tick_health(has_internet=has_internet)
         self.tick_heartbeat()
-        if GIT_PULL_INTERVAL > 0 and \
-                now - self.state.last_git_pull >= self._git_period:
-            self.tick_autoupdate()
-            self._git_period = _jittered(GIT_PULL_INTERVAL)
 
     def tick_heartbeat(self) -> None:
         """Один раз в сутки (локальное время >= HEARTBEAT_HOUR) посылаем статус.
@@ -524,13 +533,17 @@ class Daemon:
             log.warning("%s: failed (keeping current config): %s", context, exc)
 
     # ---------- health / rotation ----------
-    def tick_health(self) -> None:
+    def tick_health(self, *, has_internet: bool | None = None) -> None:
         if not is_running():
             log.warning("xray is not running; trying to start with best server")
             self._rotate_until_working(reason="xray-not-running")
             return
 
-        if not internet_alive():
+        # Переиспользуем результат internet_alive() из tick(), если он
+        # передан; иначе проверяем сами (для run_once / run_forever startup).
+        if has_internet is None:
+            has_internet = internet_alive()
+        if not has_internet:
             log.info("no direct internet — skipping proxy health check")
             return
 
