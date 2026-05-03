@@ -236,9 +236,20 @@ class Daemon:
 
         uptime = _format_uptime(time.time() - self.state.start_time)
         proxy_status = "ok" if proxy_alive() else "DOWN"
+
+        # Системные метрики
+        try:
+            from .sysinfo import system_report
+            sys = system_report()
+        except Exception:  # noqa: BLE001
+            log.debug("sysinfo collection failed, skipping system metrics")
+            sys = None
+
         msg = (f"💚 daily heartbeat: active={_fmt(self.state.active)}, "
                f"proxy={proxy_status}, uptime={uptime}, "
                f"rotations_today={self.state.rotations_today}")
+        if sys:
+            msg += f"\n⚙️ {sys}"
         log.info("heartbeat: %s", msg)
         # urgent=True — throttle не должен мешать; без blocking, чтоб не замедлять tick.
         notify(msg, urgent=True)
