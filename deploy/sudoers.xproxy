@@ -7,8 +7,12 @@ Cmnd_Alias XPROXY_CMDS = \
     /usr/bin/systemctl restart xray, \
     /bin/systemctl reset-failed xray, \
     /usr/bin/systemctl reset-failed xray, \
-    /usr/bin/tee /usr/local/etc/xray/config.json, \
-    /bin/tee /usr/local/etc/xray/config.json
+    /usr/bin/tee /usr/local/etc/xray/.config.json.xproxy.*.tmp, \
+    /bin/tee /usr/local/etc/xray/.config.json.xproxy.*.tmp, \
+    /bin/chmod 0644 /usr/local/etc/xray/.config.json.xproxy.*.tmp, \
+    /usr/bin/chmod 0644 /usr/local/etc/xray/.config.json.xproxy.*.tmp, \
+    /bin/mv -f /usr/local/etc/xray/.config.json.xproxy.*.tmp /usr/local/etc/xray/config.json, \
+    /usr/bin/mv -f /usr/local/etc/xray/.config.json.xproxy.*.tmp /usr/local/etc/xray/config.json
 
 __USER__ ALL=(root) NOPASSWD: XPROXY_CMDS
 Defaults!XPROXY_CMDS !requiretty

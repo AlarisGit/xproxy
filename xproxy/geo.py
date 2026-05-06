@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,8 @@ from .settings import (
     GEO_DIR,
     GEO_REFRESH,
     GEO_RETRY_SCHEDULE,
+    HTTP_HOST,
+    HTTP_PORT,
     STATE_DIR,
     USER_AGENT,
 )
@@ -50,6 +53,12 @@ _FILES: tuple[tuple[str, str, str], ...] = (
 )
 _DOWNLOAD_TIMEOUT = 60
 _GEO_STATE_FILE: Path = STATE_DIR / "geo_state.json"
+
+
+@dataclass(frozen=True)
+class _DownloadRoute:
+    name: str
+    proxies: dict[str, str] | None = None
 
 
 # ---------- public types ----------
@@ -68,7 +77,12 @@ class GeoResult:
 
 # ---------- public API ----------
 
-def ensure_geo_assets(force: bool = False) -> GeoResult:
+def ensure_geo_assets(
+    force: bool = False,
+    *,
+    validation_server=None,
+    platform_info=None,
+) -> GeoResult:
     """Убедиться, что geosite.dat / geoip.dat доступны и свежие.
 
     - Если файла нет — скачиваем безусловно (приоритет).
@@ -86,6 +100,8 @@ def ensure_geo_assets(force: bool = False) -> GeoResult:
     # Минимальный бэкофф среди файлов, которые сейчас не нужно трогать
     # или которые только что успешно обновились. Дефолт — GEO_REFRESH.
     next_delays: list[float] = []
+
+    download_plan: list[tuple[str, str, Path, dict]] = []
 
     for name, url_key, _category in _FILES:
         target = GEO_DIR / name
@@ -145,28 +161,38 @@ def ensure_geo_assets(force: bool = False) -> GeoResult:
                           name, remaining, file_state["failures"])
                 continue
 
-        # Время делать попытку.
-        file_state["last_attempt"] = now
-        try:
-            _download(url, target)
-        except Exception as exc:  # noqa: BLE001
-            file_state["failures"] = int(file_state["failures"]) + 1
-            result.errors[name] = str(exc)
-            log.warning("download %s failed (attempt %d): %s",
-                        name, file_state["failures"], exc)
-            if exists:
-                result.paths[name] = target  # старая копия остаётся в игре
-            next_delays.append(_backoff_seconds(file_state["failures"]))
-            continue
+        download_plan.append((name, url, target, file_state))
 
-        # Успех: atomic replace уже произошёл внутри _download().
-        size = target.stat().st_size
-        log.info("downloaded %s → %s (%d bytes)", name, target, size)
-        file_state["last_success"] = now
-        file_state["failures"] = 0
-        result.paths[name] = target
-        result.freshly_downloaded.add(name)
-        next_delays.append(GEO_REFRESH)
+    if download_plan:
+        downloaded = _stage_and_validate_geo(
+            download_plan,
+            validation_server=validation_server,
+            platform_info=platform_info,
+            errors=result.errors,
+        )
+        if downloaded:
+            for name, _url, target, file_state in download_plan:
+                file_state["last_attempt"] = now
+                if name not in downloaded:
+                    file_state["failures"] = int(file_state["failures"]) + 1
+                    if target.exists():
+                        result.paths[name] = target
+                    next_delays.append(_backoff_seconds(file_state["failures"]))
+                    continue
+                size = target.stat().st_size
+                log.info("downloaded %s → %s (%d bytes)", name, target, size)
+                file_state["last_success"] = now
+                file_state["failures"] = 0
+                result.paths[name] = target
+                result.freshly_downloaded.add(name)
+                next_delays.append(GEO_REFRESH)
+        else:
+            for name, _url, target, file_state in download_plan:
+                file_state["last_attempt"] = now
+                file_state["failures"] = int(file_state["failures"]) + 1
+                if target.exists():
+                    result.paths[name] = target
+                next_delays.append(_backoff_seconds(file_state["failures"]))
 
     # Пишем state только если он реально изменился — это типичный случай,
     # когда все файлы свежие/в бэкоффе и в тике ничего не менялось.
@@ -180,7 +206,7 @@ def ensure_geo_assets(force: bool = False) -> GeoResult:
     return result
 
 
-def load_geo_categories() -> dict[str, set[str] | None]:
+def load_geo_categories(asset_dir: Path | None = None) -> dict[str, set[str] | None]:
     """Вернуть `{"geosite": {...} | None, "geoip": {...} | None}`.
 
     - `set[str]` — файл существует и успешно разобран (может быть пустым
@@ -193,8 +219,9 @@ def load_geo_categories() -> dict[str, set[str] | None]:
       `None` означает «не знаем» — правила не трогаем.
     """
     out: dict[str, set[str] | None] = {}
+    root = asset_dir or GEO_DIR
     for name, _url_key, category in _FILES:
-        path = GEO_DIR / name
+        path = root / name
         if not path.exists():
             out[category] = None
             continue
@@ -273,10 +300,149 @@ def _file_parses(path: Path) -> bool:
     return bool(entries)
 
 
+def _stage_and_validate_geo(
+    download_plan: list[tuple[str, str, Path, dict]],
+    *,
+    validation_server,
+    platform_info,
+    errors: dict[str, str],
+) -> set[str]:
+    """Download planned geo files into staging and publish only after checks."""
+    planned_names = {name for name, _url, _target, _state in download_plan}
+    staging_path = Path(tempfile.mkdtemp(dir=str(GEO_DIR), prefix=".geo-staging."))
+    try:
+        # Stage current live files for the kinds that are not being refreshed.
+        # The staged directory must be a complete XRAY_LOCATION_ASSET candidate,
+        # otherwise xray -test would validate a state that can never become live.
+        for name, _url_key, _category in _FILES:
+            if name in planned_names:
+                continue
+            live = GEO_DIR / name
+            if live.exists():
+                shutil.copy2(live, staging_path / name)
+                os.chmod(staging_path / name, 0o644)
+
+        downloaded: set[str] = set()
+        for name, url, _target, _state in download_plan:
+            try:
+                _download(url, staging_path / name)
+            except Exception as exc:  # noqa: BLE001
+                errors[name] = str(exc)
+                log.warning("download %s into staging failed: %s", name, exc)
+                return set()
+            downloaded.add(name)
+
+        categories = load_geo_categories(staging_path)
+        from .routing import validate_geo_categories_for_routing
+        missing = validate_geo_categories_for_routing(categories)
+        if missing:
+            summary = ", ".join(f"{group}:{entry}" for group, entry in missing[:10])
+            tail = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+            errors["geo-set"] = (
+                "staged geo assets do not cover routing references: "
+                f"{summary}{tail}"
+            )
+            log.warning("%s", errors["geo-set"])
+            return set()
+
+        if validation_server is not None:
+            from .xray_config import build_xray_config_text
+            from .xray_control import validate_config_text
+
+            cfg_text = build_xray_config_text(
+                validation_server,
+                categories=categories,
+            )
+            ok, output = validate_config_text(
+                cfg_text,
+                platform_info,
+                asset_dir=staging_path,
+            )
+            if not ok:
+                last = output.strip().splitlines()[-1] if output.strip() else "unknown error"
+                errors["geo-set"] = f"xray -test failed with staged geo assets: {last}"
+                log.warning("%s", errors["geo-set"])
+                return set()
+        else:
+            errors["geo-set"] = (
+                "staged geo assets passed category validation, but no server "
+                "is available for xray -test"
+            )
+            log.warning("%s", errors["geo-set"])
+            return set()
+
+        backups: dict[Path, Path | None] = {}
+        for name, _url, target, _state in download_plan:
+            if target.exists():
+                backup = staging_path / f"{name}.live-backup"
+                shutil.copy2(target, backup)
+                backups[target] = backup
+            else:
+                backups[target] = None
+
+        replaced: list[Path] = []
+        try:
+            for name, _url, target, _state in download_plan:
+                staged = staging_path / name
+                os.chmod(staged, 0o644)
+                os.replace(staged, target)
+                replaced.append(target)
+        except OSError as exc:
+            log.error("geo publish failed after staging validation: %s", exc)
+            for target in reversed(replaced):
+                backup = backups.get(target)
+                try:
+                    if backup is not None and backup.exists():
+                        os.replace(backup, target)
+                    else:
+                        target.unlink(missing_ok=True)
+                except OSError as rollback_exc:
+                    # A partial rollback is possible only after an FS/I/O
+                    # failure. Later live-config writes are still gated by
+                    # geo category validation and xray -test, so mixed live
+                    # geo files must not be blindly published into config.
+                    log.error("geo rollback failed for %s: %s", target, rollback_exc)
+            errors["geo-set"] = f"failed to publish staged geo assets: {exc}"
+            return set()
+        return downloaded
+    finally:
+        shutil.rmtree(staging_path, ignore_errors=True)
+
+
 # ---------- download ----------
 
 def _download(url: str, target: Path) -> None:
-    """Скачать url в target.part, проверить полноту и сделать atomic rename."""
+    """Скачать url, проверить полноту и сделать atomic rename.
+
+    Сначала пробуем прямой доступ. Если CDN GitHub/release-assets недоступен
+    напрямую, повторяем через локальный HTTP inbound xray. Env-proxy всё равно
+    игнорируются: маршрут должен быть явным и предсказуемым.
+    """
+    failures: list[str] = []
+    for route in _download_routes():
+        try:
+            _download_via_route(url, target, route)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{route.name}: {exc}")
+            log.warning("download via %s failed: %s", route.name, exc)
+            continue
+        if failures:
+            log.info("downloaded %s via %s after fallback (%s)",
+                     target.name, route.name, "; ".join(failures))
+        return
+    raise IOError("; ".join(failures) or "all download routes failed")
+
+
+def _download_routes() -> tuple[_DownloadRoute, ...]:
+    proxy_url = f"http://{HTTP_HOST}:{HTTP_PORT}"
+    return (
+        _DownloadRoute("direct"),
+        _DownloadRoute("xray-http", {"http": proxy_url, "https": proxy_url}),
+    )
+
+
+def _download_via_route(url: str, target: Path, route: _DownloadRoute) -> None:
+    """Скачать url через конкретный маршрут в target.part и опубликовать."""
     # Отдельный tmp-файл в той же директории — критично для os.replace()
     # (atomic rename работает только в рамках одной FS).
     fd, tmp_path = tempfile.mkstemp(
@@ -292,7 +458,7 @@ def _download(url: str, target: Path) -> None:
     downloaded = 0
     expected: int | None = None
     try:
-        # trust_env=False: не давать HTTP_PROXY из шелла завести нас через xray.
+        # trust_env=False: не давать HTTP_PROXY из шелла менять маршрут.
         # Context manager закрывает connection pool по выходу.
         with requests.Session() as session:
             session.trust_env = False
@@ -302,6 +468,7 @@ def _download(url: str, target: Path) -> None:
                 timeout=_DOWNLOAD_TIMEOUT,
                 stream=True,
                 allow_redirects=True,
+                proxies=route.proxies,
             ) as resp:
                 resp.raise_for_status()
                 cl = resp.headers.get("Content-Length")

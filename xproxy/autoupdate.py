@@ -35,8 +35,14 @@ log = get_logger("xproxy.autoupdate")
 
 _RESTART_HISTORY: Path = STATE_DIR / "restart_history.json"
 _REQUIREMENTS: Path = PROJECT_ROOT / "requirements.txt"
+_MANUAL_DEPLOY_FILES: tuple[Path, ...] = (
+    PROJECT_ROOT / "deploy" / "sudoers.xproxy",
+    PROJECT_ROOT / "deploy" / "xproxy.service",
+    PROJECT_ROOT / "deploy" / "com.xproxy.daemon.plist",
+)
 _ENV_MARKER = "XPROXY_UPDATED_AT"   # ставится перед exec, видим в новом процессе
 _VALIDATE_TIMEOUT = 25
+_PIP_TIMEOUT = 300
 
 
 # ---------- git helpers ----------
@@ -131,6 +137,7 @@ class UpdateResult:
     old_head: str = ""
     new_head: str = ""
     requirements_changed: bool = False
+    manual_deploy_changed: bool = False
     reason: str = ""
     error: str = ""   # детали ошибки git (если reason in FAILURE_REASONS)
 
@@ -166,6 +173,7 @@ def check_and_pull() -> UpdateResult:
 
     old_head = _head()
     old_req_hash = _file_hash(_REQUIREMENTS)
+    old_deploy_hashes = _file_hashes(_MANUAL_DEPLOY_FILES)
 
     try:
         _git("pull", "--ff-only", "--quiet", timeout=60)
@@ -179,14 +187,20 @@ def check_and_pull() -> UpdateResult:
 
     new_req_hash = _file_hash(_REQUIREMENTS)
     req_changed = (old_req_hash != new_req_hash)
+    new_deploy_hashes = _file_hashes(_MANUAL_DEPLOY_FILES)
+    deploy_changed = (old_deploy_hashes != new_deploy_hashes)
 
-    log.info("git pull: %s → %s (%d commits, requirements_changed=%s)",
-             old_head[:7], new_head[:7], behind, req_changed)
+    log.info(
+        "git pull: %s → %s (%d commits, requirements_changed=%s, "
+        "manual_deploy_changed=%s)",
+        old_head[:7], new_head[:7], behind, req_changed, deploy_changed,
+    )
     return UpdateResult(
         updated=True,
         old_head=old_head,
         new_head=new_head,
         requirements_changed=req_changed,
+        manual_deploy_changed=deploy_changed,
         reason="ok",
     )
 
@@ -215,6 +229,24 @@ def validate_new_code() -> tuple[bool, str]:
         return True, ""
     err = (proc.stderr or proc.stdout or b"").decode(errors="replace").strip()
     return False, err
+
+
+def install_requirements() -> tuple[bool, str]:
+    """Install requirements with the same Python executable that runs xproxy."""
+    if not _REQUIREMENTS.exists():
+        return True, ""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
+            capture_output=True,
+            cwd=str(PROJECT_ROOT),
+            timeout=_PIP_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "pip install timed out"
+    output = (proc.stderr or b"").decode(errors="replace") + \
+             (proc.stdout or b"").decode(errors="replace")
+    return proc.returncode == 0, output.strip()
 
 
 def restart_self() -> None:
@@ -278,3 +310,7 @@ def _file_hash(path: Path) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _file_hashes(paths: tuple[Path, ...]) -> dict[str, str]:
+    return {str(path.relative_to(PROJECT_ROOT)): _file_hash(path) for path in paths}

@@ -43,13 +43,16 @@ def _load_direct_extras() -> list[str]:
     return entries
 
 
-def build_xray_sections() -> dict:
+def build_xray_sections(
+    categories: dict[str, set[str] | None] | None = None,
+) -> dict:
     cfg = load_routing()
     direct_extras = _load_direct_extras()
     # Загружаем доступные категории из .dat-файлов. Ленивый импорт,
     # чтобы избежать циклической зависимости routing ↔ geo.
     from .geo import load_geo_categories, required_geo_kinds
-    categories = load_geo_categories()
+    if categories is None:
+        categories = load_geo_categories()
 
     removed: list[tuple[str, str]] = []
     routing, removed_r = _build_routing(cfg, direct_extras, categories)
@@ -94,6 +97,22 @@ def build_xray_sections() -> dict:
         "geo_readable": geo_readable,
         "unreadable_needed": sorted(unreadable_needed),
     }
+
+
+def validate_geo_categories_for_routing(
+    categories: dict[str, set[str] | None],
+) -> list[tuple[str, str]]:
+    """Strict-check geo categories against the config xproxy would generate.
+
+    Unlike normal runtime building, this is a publish gate for new geo assets:
+    if routing/DNS would need to drop a `geosite:*`/`geoip:*` entry, or if a
+    required asset kind is unreadable, the staged geo set must not replace live.
+    """
+    sections = build_xray_sections(categories=categories)
+    missing = list(sections.get("removed_geo") or [])
+    for kind in sections.get("unreadable_needed") or []:
+        missing.append(("geo-assets", f"{kind}:<unreadable>"))
+    return missing
 
 
 # ---------- routing ----------

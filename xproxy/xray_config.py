@@ -17,10 +17,14 @@ def load_base_template() -> dict:
     return json.loads(CONFIG_TMPL.read_text(encoding="utf-8"))
 
 
-def build_xray_config(server: Server) -> dict:
+def build_xray_config(
+    server: Server,
+    *,
+    categories: dict[str, set[str] | None] | None = None,
+) -> dict:
     """Собрать полный xray config.json под выбранный сервер."""
     base = deepcopy(load_base_template())
-    sections = build_xray_sections()
+    sections = build_xray_sections(categories=categories)
 
     # Sniffing (если есть fakedns — destOverride должен включать 'fakedns').
     sniffing = {
@@ -51,8 +55,16 @@ def build_xray_config(server: Server) -> dict:
     return base
 
 
-def build_xray_config_text(server: Server) -> str:
-    return json.dumps(build_xray_config(server), ensure_ascii=False, indent=2)
+def build_xray_config_text(
+    server: Server,
+    *,
+    categories: dict[str, set[str] | None] | None = None,
+) -> str:
+    return json.dumps(
+        build_xray_config(server, categories=categories),
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 # ---------- internals ----------

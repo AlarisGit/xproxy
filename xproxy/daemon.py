@@ -9,6 +9,7 @@ from typing import Optional
 from .autoupdate import (
     FAILURE_REASONS,
     check_and_pull,
+    install_requirements,
     post_restart_banner,
     restart_self,
     rollback_to,
@@ -38,7 +39,7 @@ from .settings import (
 )
 from .state import DaemonState, load_active
 from .subscription import SubscriptionError, fetch_subscription_text
-from .xray_control import ConfigUnchanged, apply_server, is_running
+from .xray_control import ConfigUnchanged, XrayStartError, apply_server, is_running
 
 log = get_logger("xproxy.daemon")
 
@@ -81,6 +82,11 @@ class Daemon:
         # чтобы не спамить уведомлениями — сбрасывается при первой успешной
         # проверке geo-assets.
         self._stuck_notified: bool = False
+        # Отдельный флаг для аварии "xray не стартует после записи конфига".
+        # Такая ошибка обычно общая для всех кандидатов (env, geo, launchd,
+        # права на лог/порт), поэтому нельзя перебирать серверы как будто
+        # проблема в конкретном outbound.
+        self._xray_start_failure_notified: bool = False
         # Минутный offset для heartbeat: HEARTBEAT_HOUR + 0..HEARTBEAT_JITTER_MIN мин,
         # фиксируется на весь процесс (чтобы не дрейфовать в течение дня).
         self._heartbeat_minute_offset = random.randint(0, max(0, HEARTBEAT_JITTER_MIN))
@@ -339,18 +345,51 @@ class Daemon:
 
         if result.requirements_changed:
             log.warning(
-                "autoupdate pulled new code BUT requirements.txt changed "
-                "(%s → %s). NOT restarting automatically — please run "
-                "`pip install -r requirements.txt` and restart the service.",
+                "autoupdate pulled new code and requirements.txt changed "
+                "(%s → %s). Installing dependencies before validation.",
                 result.old_head[:7], result.new_head[:7],
             )
             notify(
                 f"⚠️ autoupdate pulled {result.old_head[:7]} → "
-                f"{result.new_head[:7]}, but requirements.txt changed. "
-                f"Manual `pip install -r requirements.txt` and restart required.",
+                f"{result.new_head[:7]} with requirements.txt changes; "
+                f"installing dependencies before restart.",
                 urgent=True,
             )
-            return
+            ok, err = install_requirements()
+            if not ok:
+                last = err.splitlines()[-1] if err else "unknown error"
+                log.error("autoupdate: requirements install failed for new code "
+                          "%s, staying on %s. Error: %s",
+                          result.new_head[:7], result.old_head[:7], last)
+                rolled_back = rollback_to(result.old_head)
+                if rolled_back:
+                    notify(
+                        f"🔴 autoupdate: requirements install failed for "
+                        f"{result.new_head[:7]}, rolled back to "
+                        f"{result.old_head[:7]}: {last}",
+                        urgent=True,
+                    )
+                else:
+                    notify(
+                        f"🔴 autoupdate: requirements install failed for "
+                        f"{result.new_head[:7]} and rollback FAILED: {last}",
+                        urgent=True,
+                    )
+                return
+
+        if result.manual_deploy_changed:
+            log.warning(
+                "autoupdate pulled new code and deploy service/sudoers files "
+                "changed (%s → %s). Continuing with validated self-restart; "
+                "runtime code remains responsible for backward compatibility.",
+                result.old_head[:7], result.new_head[:7],
+            )
+            notify(
+                f"⚠️ autoupdate pulled {result.old_head[:7]} → "
+                f"{result.new_head[:7]} with deploy file changes; continuing "
+                f"self-update after validation.",
+                urgent=True,
+            )
 
         ok, err = validate_new_code()
         if not ok:
@@ -387,7 +426,14 @@ class Daemon:
         # Замена файла только атомарна и только после полного скачивания —
         # при обрыве соединения остаётся работать старая копия.
         try:
-            result = ensure_geo_assets(force=force)
+            validation_server = self.state.active
+            if validation_server is None and self.state.ranked:
+                validation_server = self.state.ranked[0]
+            result = ensure_geo_assets(
+                force=force,
+                validation_server=validation_server,
+                platform_info=self.platform,
+            )
         except Exception:  # noqa: BLE001
             log.exception("geo refresh failed")
             # Жёсткое падение — перепланируем через самый короткий бэкофф,
@@ -562,12 +608,13 @@ class Daemon:
             if self.state.consecutive_proxy_failures:
                 log.info("proxy recovered (active: %s)", _fmt(self.state.active))
             self.state.note_proxy_ok()
-            # Если активный сервер неизвестен — прокси работает, но мы не управляем
-            # выбором сервера (например, xray был сконфигурирован вручную до xproxy).
-            # Ротируем, чтобы xproxy взял управление на себя.
+            # Если активный сервер неизвестен, но сам xray proxy работает,
+            # не трогаем live-config. Потеря state/active.json или ручной
+            # конфиг не являются внешним условием, которое оправдывает
+            # перезапись работающего xray.
             if self.state.active is None:
-                log.warning("proxy alive but active server unknown — rotating to take control")
-                self._rotate_until_working(reason="active-unknown")
+                log.warning("proxy alive but active server unknown — preserving "
+                            "current xray config")
             return
 
         fails = self.state.note_proxy_fail()
@@ -637,6 +684,21 @@ class Daemon:
                      candidate.country, candidate.host, candidate.port)
             try:
                 apply_server(candidate, dry_run=self.dry_run, info=self.platform)
+            except XrayStartError as exc:
+                log.error("rotation aborted: xray failed to start after applying "
+                          "%s (%s:%d): %s",
+                          candidate.country, candidate.host, candidate.port, exc)
+                if not self._xray_start_failure_notified:
+                    notify(
+                        f"🔴 xproxy stopped rotation: xray did not start after "
+                        f"applying {candidate.country} "
+                        f"({candidate.host}:{candidate.port}). "
+                        f"Reason: {exc}",
+                        urgent=True,
+                        blocking=True,
+                    )
+                    self._xray_start_failure_notified = True
+                return
             except Exception as exc:  # noqa: BLE001
                 log.warning("apply_server failed: %s", exc)
                 self.state.penalize(candidate)
@@ -659,6 +721,7 @@ class Daemon:
                     f"{candidate.country} ({candidate.host}:{candidate.port}) "
                     f"reason={reason}"
                 )
+                self._xray_start_failure_notified = False
                 return
             log.info("candidate %s (%s:%d) did not pass proxy probe after restart",
                      candidate.country, candidate.host, candidate.port)

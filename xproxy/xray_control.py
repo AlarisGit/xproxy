@@ -20,6 +20,7 @@ from .logger import get_logger
 from .platform_utils import (
     PlatformInfo,
     detect_platform,
+    detect_xray_asset_env,
     restart_xray as _platform_restart,
     write_xray_config,
     xray_is_running,
@@ -38,6 +39,10 @@ class XrayConfigError(RuntimeError):
     """Сгенерированный конфиг не прошёл xray -test."""
 
 
+class XrayStartError(RuntimeError):
+    """xray не поднял локальный listener после записи и рестарта."""
+
+
 class ConfigUnchanged(RuntimeError):
     """Сгенерированный конфиг идентичен текущему — запись и рестарт не нужны."""
 
@@ -52,7 +57,22 @@ def apply_server(server: Server, *, dry_run: bool = False,
     info = info or detect_platform()
     cfg_text = build_xray_config_text(server)
 
-    # 0. Diff: если конфиг не изменился — не трогаем xray.
+    # 1. Валидация: xray -test на временном файле. Сначала проверяем конфиг
+    # на asset-каталоге xproxy, затем повторяем тест в окружении продового
+    # xray-сервиса. Это ловит главный опасный класс ошибок: xproxy видит
+    # свежий geosite.dat, а xray.service стартует без XRAY_LOCATION_ASSET и
+    # падает на отсутствующей geosite:/geoip: категории.
+    ok, err = validate_config_for_service(cfg_text, info)
+    if not ok:
+        short = err.strip().splitlines()[-1] if err.strip() else "unknown error"
+        raise XrayConfigError(
+            f"xray -test failed for {server.host}:{server.port}: {short}"
+        )
+
+    # 2. Diff: если конфиг не изменился — не трогаем xray.
+    # Diff намеренно после xray -test: уже опубликованный конфиг мог стать
+    # невалидным для текущего service-env, и ConfigUnchanged не должен это
+    # маскировать.
     if not dry_run and _config_matches_current(cfg_text, info):
         log.info("config unchanged, skip write+restart (%s:%d)",
                  server.host, server.port)
@@ -60,20 +80,12 @@ def apply_server(server: Server, *, dry_run: bool = False,
             f"config for {server.host}:{server.port} is identical to current"
         )
 
-    # 1. Валидация: xray -test на временном файле.
-    ok, err = validate_config_text(cfg_text, info)
-    if not ok:
-        short = err.strip().splitlines()[-1] if err.strip() else "unknown error"
-        raise XrayConfigError(
-            f"xray -test failed for {server.host}:{server.port}: {short}"
-        )
-
     if dry_run:
         log.info("[dry-run] config valid; would write %d bytes to %s and restart xray",
                  len(cfg_text), info.xray_config)
         return
 
-    # 2. Бэкап текущего конфига (best-effort).
+    # 3. Бэкап текущего конфига (best-effort).
     try:
         _backup_current_config(info)
     except Exception as exc:  # noqa: BLE001
@@ -89,14 +101,73 @@ def apply_server(server: Server, *, dry_run: bool = False,
     if wait_for_proxy_port():
         log.info("xray listener ready on %s:%d", SOCKS_HOST, SOCKS_PORT)
     else:
-        log.warning("xray listener on %s:%d did not come up in %ds",
-                    SOCKS_HOST, SOCKS_PORT, BOOT_GRACE)
+        diag = _diagnose_start_failure(cfg_text, info)
+        msg = (
+            f"xray listener on {SOCKS_HOST}:{SOCKS_PORT} did not come up "
+            f"in {BOOT_GRACE}s; {diag}"
+        )
+        log.error(msg)
+        raise XrayStartError(msg)
 
 
-def validate_config_text(cfg_text: str,
-                         info: PlatformInfo | None = None) -> tuple[bool, str]:
+def validate_config_text(
+    cfg_text: str,
+    info: PlatformInfo | None = None,
+    *,
+    asset_dir: Path | None = None,
+) -> tuple[bool, str]:
     """Прогнать `xray -test` на произвольной JSON-строке. Возвращает (ok, stderr+stdout)."""
+    env = os.environ.copy()
+    env["XRAY_LOCATION_ASSET"] = str(asset_dir or GEO_DIR)
+    return _run_xray_test(cfg_text, env=env)
+
+
+def validate_config_for_service(
+    cfg_text: str,
+    info: PlatformInfo | None = None,
+    *,
+    asset_dir: Path | None = None,
+) -> tuple[bool, str]:
+    """Validate config with xproxy assets and with the production xray env."""
     info = info or detect_platform()
+    managed_asset_dir = asset_dir or GEO_DIR
+
+    managed_env = os.environ.copy()
+    managed_env["XRAY_LOCATION_ASSET"] = str(managed_asset_dir)
+    ok, output = _run_xray_test(cfg_text, env=managed_env)
+    if not ok:
+        return False, _with_context("xproxy asset validation failed", output)
+
+    service_asset, source = detect_xray_asset_env(info)
+    if _same_asset_path(service_asset, managed_asset_dir):
+        return True, output
+
+    service_env = os.environ.copy()
+    if service_asset:
+        service_env["XRAY_LOCATION_ASSET"] = service_asset
+        asset_label = service_asset
+    else:
+        service_env.pop("XRAY_LOCATION_ASSET", None)
+        asset_label = "<unset>"
+
+    ok, service_output = _run_xray_test(cfg_text, env=service_env)
+    if ok:
+        if service_asset != str(managed_asset_dir):
+            log.warning(
+                "xray service XRAY_LOCATION_ASSET differs from xproxy GEO_DIR "
+                "(service=%s via %s, xproxy=%s); config still passed service test",
+                asset_label, source, managed_asset_dir,
+            )
+        return True, service_output
+
+    return False, _with_context(
+        "production xray validation failed "
+        f"(XRAY_LOCATION_ASSET={asset_label}, source={source})",
+        service_output,
+    )
+
+
+def _run_xray_test(cfg_text: str, *, env: dict[str, str]) -> tuple[bool, str]:
     xray_bin = shutil.which("xray")
     if xray_bin is None:
         return False, "xray binary not found in PATH"
@@ -114,10 +185,6 @@ def validate_config_text(cfg_text: str,
         fh.write(test_text)
         tmp_path = fh.name
     try:
-        env = os.environ.copy()
-        # Тест читает те же geo-файлы, что будет использовать боевой процесс
-        # (скачанные нами в GEO_DIR; xray в системе тоже смотрит туда через env).
-        env["XRAY_LOCATION_ASSET"] = str(GEO_DIR)
         proc = subprocess.run(
             [xray_bin, "-test", "-c", tmp_path],
             capture_output=True,
@@ -135,6 +202,76 @@ def validate_config_text(cfg_text: str,
     output = (proc.stderr or b"").decode(errors="replace") + \
              (proc.stdout or b"").decode(errors="replace")
     return proc.returncode == 0, output
+
+
+def _with_context(prefix: str, output: str) -> str:
+    text = output.strip()
+    if not text:
+        return prefix
+    return f"{prefix}: {text}"
+
+
+def _same_asset_path(service_asset: str | None, managed_asset_dir: Path) -> bool:
+    """True if service and managed asset dirs refer to the same filesystem path."""
+    if not service_asset:
+        return False
+    try:
+        service_path = Path(service_asset).expanduser().resolve(strict=False)
+        managed_path = Path(managed_asset_dir).expanduser().resolve(strict=False)
+    except OSError:
+        return service_asset.rstrip("/") == str(managed_asset_dir).rstrip("/")
+    return service_path == managed_path
+
+
+def _diagnose_start_failure(cfg_text: str, info: PlatformInfo) -> str:
+    """Collect concise diagnostics after xray restart left the listener down."""
+    parts: list[str] = []
+    parts.append(f"xray_running={xray_is_running()}")
+
+    service_asset, source = detect_xray_asset_env(info)
+    parts.append(f"service_XRAY_LOCATION_ASSET={service_asset or '<unset>'} ({source})")
+
+    ok, output = validate_config_for_service(cfg_text, info)
+    if ok:
+        parts.append("prod xray -test still passes")
+    else:
+        last = output.strip().splitlines()[-1] if output.strip() else "unknown error"
+        parts.append(f"prod xray -test now fails: {last}")
+
+    log_tail = _tail_configured_error_log(cfg_text)
+    if log_tail:
+        parts.append(f"recent xray error log: {log_tail}")
+    return "; ".join(parts)
+
+
+def _tail_configured_error_log(cfg_text: str, max_bytes: int = 8192) -> str:
+    try:
+        cfg = json.loads(cfg_text)
+    except (ValueError, TypeError):
+        return ""
+    log_section = cfg.get("log")
+    if not isinstance(log_section, dict):
+        return ""
+    path_s = log_section.get("error")
+    if not isinstance(path_s, str) or not path_s or path_s == "none":
+        return ""
+    path = Path(path_s)
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+            data = fh.read()
+    except OSError:
+        return ""
+    lines = [line.strip() for line in data.decode(errors="replace").splitlines()
+             if line.strip()]
+    relevant = [
+        line for line in lines
+        if any(kw in line.lower() for kw in ("error", "failed", "warning"))
+    ]
+    chosen = relevant[-3:] if relevant else lines[-3:]
+    return " | ".join(chosen)
 
 
 def _neutralize_log_paths(cfg_text: str) -> str:
@@ -170,7 +307,7 @@ def restore_backup(info: PlatformInfo | None = None) -> bool:
         log.warning("no backup at %s", BACKUP_PATH)
         return False
     text = BACKUP_PATH.read_text(encoding="utf-8")
-    ok, err = validate_config_text(text, info)
+    ok, err = validate_config_for_service(text, info)
     if not ok:
         log.error("backup at %s is not valid (%s) — refusing to restore",
                   BACKUP_PATH, err.strip().splitlines()[-1:])
