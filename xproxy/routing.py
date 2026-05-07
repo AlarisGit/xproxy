@@ -12,7 +12,11 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from .logger import get_logger
@@ -21,33 +25,95 @@ from .settings import DIRECT_LIST, ROUTING_JSON
 log = get_logger("xproxy.routing")
 
 
+_IPV4_CANDIDATE_RE = re.compile(r"^[0-9.]+$")
+
+
+@dataclass
+class DirectExtras:
+    ips: list[str] = field(default_factory=list)
+    sites: list[str] = field(default_factory=list)
+
+
 def load_routing() -> dict:
     return json.loads(ROUTING_JSON.read_text(encoding="utf-8"))
 
 
-def _load_direct_extras() -> list[str]:
-    """Прочитать conf/direct.lst — дополнительные домены для DirectSites.
+def load_direct_extras(path: Path = DIRECT_LIST) -> DirectExtras:
+    """Прочитать direct.lst и разделить IP/CIDR и доменные маршруты.
 
     Пустые строки и строки, начинающиеся с #, игнорируются.
     Файл может отсутствовать — возвращается пустой список.
     """
-    if not DIRECT_LIST.exists():
-        return []
-    entries: list[str] = []
-    for line in DIRECT_LIST.read_text(encoding="utf-8").splitlines():
+    if not path.exists():
+        return DirectExtras()
+    extras = DirectExtras()
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            entries.append(stripped)
-    if entries:
-        log.debug("direct.lst: %d extra direct entries", len(entries))
-    return entries
+        if not stripped or stripped.startswith("#"):
+            continue
+        kind, value = _classify_direct_entry(stripped, lineno=lineno)
+        if kind == "ip":
+            extras.ips.append(value)
+        else:
+            extras.sites.append(value)
+    if extras.ips or extras.sites:
+        log.debug("direct.lst: %d extra IP entries, %d extra domain entries",
+                  len(extras.ips), len(extras.sites))
+    return extras
+
+
+def merge_routing_with_direct_extras(
+    cfg: dict,
+    extras: DirectExtras,
+) -> dict:
+    """Return routing config with direct.lst entries merged and deduplicated."""
+    merged = dict(cfg)
+    merged["DirectIp"] = _merge_unique(cfg.get("DirectIp") or [], extras.ips)
+    merged["DirectSites"] = _merge_unique(
+        cfg.get("DirectSites") or [],
+        extras.sites,
+    )
+    return merged
+
+
+def _merge_unique(base: list, extra: list[str]) -> list:
+    out: list = []
+    seen: set[str] = set()
+    for item in [*base, *extra]:
+        if not isinstance(item, str):
+            out.append(item)
+            continue
+        key = item.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _classify_direct_entry(entry: str, *, lineno: int) -> tuple[str, str]:
+    if "/" in entry:
+        return "ip", _validate_ip_network(entry, lineno=lineno)
+    try:
+        return "ip", str(ipaddress.ip_address(entry))
+    except ValueError:
+        if ":" in entry or _IPV4_CANDIDATE_RE.fullmatch(entry):
+            raise ValueError(f"direct.lst:{lineno}: invalid IP address: {entry}")
+        return "site", entry
+
+
+def _validate_ip_network(entry: str, *, lineno: int) -> str:
+    try:
+        return str(ipaddress.ip_network(entry, strict=False))
+    except ValueError as exc:
+        raise ValueError(f"direct.lst:{lineno}: invalid IP/CIDR: {entry}") from exc
 
 
 def build_xray_sections(
     categories: dict[str, set[str] | None] | None = None,
 ) -> dict:
     cfg = load_routing()
-    direct_extras = _load_direct_extras()
+    direct_extras = load_direct_extras()
     # Загружаем доступные категории из .dat-файлов. Ленивый импорт,
     # чтобы избежать циклической зависимости routing ↔ geo.
     from .geo import load_geo_categories, required_geo_kinds
@@ -119,7 +185,7 @@ def validate_geo_categories_for_routing(
 
 def _build_routing(
     cfg: dict,
-    direct_extras: list[str] | None,
+    direct_extras: DirectExtras | None,
     categories: dict[str, set[str] | None],
 ) -> tuple[dict, list[tuple[str, str]]]:
     from .geo import strip_missing_geo
@@ -135,13 +201,15 @@ def _build_routing(
     if not order:
         order = ["block", "direct", "proxy"]
 
+    direct_ips = list(cfg.get("DirectIp") or [])
     direct_sites = list(cfg.get("DirectSites") or [])
     if direct_extras:
-        direct_sites.extend(direct_extras)
+        direct_ips = _merge_unique(direct_ips, direct_extras.ips)
+        direct_sites = _merge_unique(direct_sites, direct_extras.sites)
 
     groups = {
         "block": (cfg.get("BlockIp"), cfg.get("BlockSites")),
-        "direct": (cfg.get("DirectIp"), direct_sites or None),
+        "direct": (direct_ips or None, direct_sites or None),
         "proxy": (cfg.get("ProxyIp"), cfg.get("ProxySites")),
     }
 
@@ -192,7 +260,7 @@ def _dns_address(cfg: dict, prefix: str) -> Optional[str]:
 
 def _build_dns(
     cfg: dict,
-    direct_extras: list[str] | None,
+    direct_extras: DirectExtras | None,
     categories: dict[str, set[str] | None],
 ) -> tuple[dict, list[tuple[str, str]]]:
     from .geo import strip_missing_geo
@@ -207,7 +275,7 @@ def _build_dns(
     ru_domains: list[str] = []
     ru_domains.extend(cfg.get("DirectSites") or [])
     if direct_extras:
-        ru_domains.extend(direct_extras)
+        ru_domains = _merge_unique(ru_domains, direct_extras.sites)
     if not any(isinstance(d, str) and d.startswith("geosite:") and "ru" in d
                for d in ru_domains):
         ru_domains.append("geosite:category-ru")

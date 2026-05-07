@@ -305,6 +305,16 @@ Custom `geosite.dat`/`geoip.dat` (с расширенным набором ru-к
 
 После успешного рестарта демон пишет `process started after autoupdate restart (...)` в лог, так что в истории видно, когда именно он обновился.
 
+## Happ routing link
+
+Чтобы передать мобильному приложению VPN обновлённую маршрутизацию, можно собрать ссылку из базового `conf/routing.json` и дополнительных записей `conf/direct.lst`:
+
+```bash
+python main.py --routing-link
+```
+
+Инструмент разделяет строки `direct.lst` на IP/CIDR и домены: IP-сети добавляются в `DirectIp`, домены — в `DirectSites`. IP-адреса валидируются через стандартный парсер Python, дубли с базовым `routing.json` не добавляются. Итоговый JSON сериализуется компактно, кодируется в base64 и печатается как `happ://routing/onadd/<base64>`.
+
 ## Логика healthcheck
 
 Каждые `HEALTH_INTERVAL` (15 с) демон проверяет, проходит ли трафик через xray.

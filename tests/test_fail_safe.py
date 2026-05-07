@@ -37,6 +37,77 @@ class FailSafeTests(unittest.TestCase):
 
         self.assertIn(("direct", "geosite:category-medicine-ru"), missing)
 
+    def test_direct_list_entries_split_into_ip_and_domain_routes(self) -> None:
+        from xproxy.routing import load_direct_extras
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            path = Path(tmp_s) / "direct.lst"
+            path.write_text(
+                "\n".join([
+                    "example.com",
+                    "80.67.40.0/22",
+                    "2001:db8::1",
+                    "example.com",
+                    "# comment",
+                ]),
+                encoding="utf-8",
+            )
+
+            extras = load_direct_extras(path)
+
+        self.assertEqual(extras.ips, ["80.67.40.0/22", "2001:db8::1"])
+        self.assertEqual(extras.sites, ["example.com", "example.com"])
+
+    def test_routing_onadd_link_merges_direct_list_without_duplicates(self) -> None:
+        import base64
+        import json
+        from xproxy.routing_link import (
+            HAPP_ROUTING_ONADD_PREFIX,
+            build_routing_onadd_link,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            routing_path = tmp / "routing.json"
+            direct_path = tmp / "direct.lst"
+            routing_path.write_text(
+                json.dumps({
+                    "Name": "test",
+                    "DirectIp": ["10.0.0.0/8"],
+                    "DirectSites": ["example.com"],
+                }),
+                encoding="utf-8",
+            )
+            direct_path.write_text(
+                "\n".join([
+                    "example.com",
+                    "new.example",
+                    "10.0.0.0/8",
+                    "192.0.2.0/24",
+                ]),
+                encoding="utf-8",
+            )
+
+            link = build_routing_onadd_link(routing_path, direct_path)
+
+        self.assertTrue(link.startswith(HAPP_ROUTING_ONADD_PREFIX))
+        encoded = link.removeprefix(HAPP_ROUTING_ONADD_PREFIX)
+        payload = base64.b64decode(encoded).decode("utf-8")
+        self.assertNotIn("\n", payload)
+        merged = json.loads(payload)
+        self.assertEqual(merged["DirectIp"], ["10.0.0.0/8", "192.0.2.0/24"])
+        self.assertEqual(merged["DirectSites"], ["example.com", "new.example"])
+
+    def test_direct_list_rejects_invalid_ip_entries(self) -> None:
+        from xproxy.routing import load_direct_extras
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            path = Path(tmp_s) / "direct.lst"
+            path.write_text("999.999.999.999\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "invalid IP address"):
+                load_direct_extras(path)
+
     def test_staged_geo_publish_is_blocked_on_missing_category(self) -> None:
         from xproxy import geo
 
