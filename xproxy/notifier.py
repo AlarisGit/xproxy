@@ -28,7 +28,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -58,6 +58,11 @@ _lock = threading.Lock()
 # Кэш идентификатора хоста: (expires_at, "hostname/1.2.3.4").
 _identity_cache: tuple[float, str] = (0.0, "")
 _identity_lock = threading.Lock()
+
+# Провайдер статуса: вызывается при каждой отправке сообщения.
+# Кэширование медленных hardware-метрик — внутри провайдера (hardware_status).
+# None — не добавлять статус к сообщениям.
+_status_provider: Optional[Callable[[], Optional[str]]] = None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -217,6 +222,9 @@ class _NotificationQueue:
             # в prefix'е, который ранее терялся при placeholder.
             prefix = _identity()
             full = f"{_format_ts(item.event_time)} {prefix}: {item.text}"
+            suffix = _get_status_suffix()
+            if suffix:
+                full += f"\n{suffix}"
             if len(full) > _MAX_LEN:
                 full = full[:_MAX_LEN - 3] + "..."
 
@@ -352,6 +360,9 @@ def notify(text: str, *, urgent: bool = False, blocking: bool = False) -> None:
         # В blocking-режиме резолвим identity синхронно (процесс сейчас выйдёт)
         prefix = _identity()
         full = f"{_format_ts(now)} {prefix}: {text}"
+        suffix = _get_status_suffix()
+        if suffix:
+            full += f"\n{suffix}"
         if len(full) > _MAX_LEN:
             full = full[:_MAX_LEN - 3] + "..."
         ok = _send_sync(token, chat_id, full)
@@ -381,6 +392,30 @@ def refresh_identity() -> None:
     global _identity_cache
     with _identity_lock:
         _identity_cache = (0.0, "")
+
+
+def set_status_provider(provider: Optional[Callable[[], Optional[str]]]) -> None:
+    """Установить провайдер статуса (вызывается при каждой отправке).
+
+    Провайдер должен вернуть строку статуса или None.
+    Медленные метрики кэшируются внутри провайдера.
+    """
+    global _status_provider
+    _status_provider = provider
+
+
+def _get_status_suffix() -> Optional[str]:
+    """Получить суффикс статуса. Вызывает провайдер при каждой отправке.
+
+    Провайдер отвечает за собственное кэширование медленных частей.
+    """
+    if _status_provider is None:
+        return None
+    try:
+        return _status_provider()
+    except Exception:  # noqa: BLE001
+        log.debug("status provider failed, skipping status suffix")
+        return None
 
 
 # ──────────────────────────────────────────────────────────────

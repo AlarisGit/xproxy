@@ -20,7 +20,7 @@ from .geo import ensure_geo_assets
 from .routing import build_xray_sections
 from .healthcheck import internet_alive, proxy_alive, public_ips
 from .logger import get_logger
-from .notifier import drain_queue, is_configured as tg_configured, notify, start_queue
+from .notifier import drain_queue, is_configured as tg_configured, notify, set_status_provider, start_queue
 from .platform_utils import PlatformInfo, detect_platform
 from .servers import Server, filter_and_sort, load_country_ranks, parse_subscription, tcp_probe
 from .settings import (
@@ -128,6 +128,7 @@ class Daemon:
                  self.dry_run, self.platform.name, _fmt(self.state.active))
         if tg_configured():
             log.info("telegram notifications enabled")
+        set_status_provider(self._build_status_suffix)
         start_queue()
         notify(f"🟢 xproxy started (active: {_fmt(self.state.active)})")
         # Startup jitter: рандомная пауза перед первым обращением к внешним
@@ -195,6 +196,7 @@ class Daemon:
         # В one-shot режиме sender-тред нужен для отправки уведомлений
         # из refresh_subscription / refresh_geo / tick_health.
         # Без него notify() только ставит в очередь, и всё теряется на выходе.
+        set_status_provider(self._build_status_suffix)
         start_queue()
         try:
             self.refresh_subscription(force=True)
@@ -205,6 +207,31 @@ class Daemon:
             drain_queue()
 
     # ---------- periodic tasks ----------
+    def _build_status_suffix(self) -> Optional[str]:
+        """Построить строку статуса для добавления к сообщению.
+
+        Вызывается notifier'ом при каждой отправке (в sender-треде).
+        Daemon-состояние всегда свежее, hardware-метрики — через
+        hardware_status() с 5-минутным кэшем. HTTP-пробы не делаются:
+        proxy_ok берётся из daemon-состояния, public_ip не нужен
+        (include_identity=False).
+        """
+        if self.dry_run:
+            return None
+        active_country = self.state.active.country if self.state.active else "-"
+        proxy_ok = self.state.consecutive_proxy_failures < FAIL_THRESHOLD
+        uptime = _format_uptime(time.time() - self.state.start_time)
+
+        from .sysinfo import system_report
+        return system_report(
+            public_ip=None,
+            active_server=active_country,
+            proxy_ok=proxy_ok,
+            uptime=uptime,
+            rotations_today=self.state.rotations_today,
+            include_identity=False,
+        )
+
     def tick(self) -> None:
         now = time.time()
         # Проверка доступности интернет-канала — один раз за tick.
@@ -234,17 +261,13 @@ class Daemon:
     def tick_heartbeat(self) -> None:
         """Один раз в сутки (локальное время >= HEARTBEAT_HOUR) посылаем статус.
 
-        Без уведомлений в dry-run. Если heartbeat пропал — значит инстанс
-        умер или потерял и прокси, и direct-канал одновременно.
+        Статус системы добавляется автоматически через notifier (суффикс
+        обновляется в _refresh_status_suffix каждый tick).
         """
         if self.dry_run:
             return
         now_struct = time.localtime()
         today = time.strftime("%Y-%m-%d", now_struct)
-        # Триггер: локальное время >= HEARTBEAT_HOUR:MM, где MM — случайное
-        # число минут, зафиксированное при старте (см. __init__). Это
-        # размазывает суточные heartbeat'ы от разных хостов по окну в час,
-        # вместо того чтобы все били в Telegram ровно в HH:00.
         if now_struct.tm_hour < HEARTBEAT_HOUR:
             return
         if now_struct.tm_hour == HEARTBEAT_HOUR and \
@@ -253,25 +276,8 @@ class Daemon:
         if self.state.last_heartbeat_date == today:
             return
 
-        uptime = _format_uptime(time.time() - self.state.start_time)
-        proxy_status = "ok" if proxy_alive() else "DOWN"
-
-        # Системные метрики
-        try:
-            from .sysinfo import system_report
-            sys = system_report()
-        except Exception:  # noqa: BLE001
-            log.debug("sysinfo collection failed, skipping system metrics")
-            sys = None
-
-        msg = (f"💚 daily heartbeat: active={_fmt(self.state.active)}, "
-               f"proxy={proxy_status}, uptime={uptime}, "
-               f"rotations_today={self.state.rotations_today}")
-        if sys:
-            msg += f"\n⚙️ {sys}"
-        log.info("heartbeat: %s", msg)
-        # urgent=True — throttle не должен мешать; без blocking, чтоб не замедлять tick.
-        notify(msg, urgent=True)
+        log.info("daily heartbeat triggered")
+        notify("💚 daily heartbeat", urgent=True)
         self.state.last_heartbeat_date = today
 
     def refresh_subscription(self, force: bool = False) -> None:
