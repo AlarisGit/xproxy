@@ -20,7 +20,7 @@ from .geo import ensure_geo_assets
 from .routing import build_xray_sections
 from .healthcheck import internet_alive, proxy_alive, public_ips
 from .logger import get_logger
-from .notifier import is_configured as tg_configured, notify
+from .notifier import drain_queue, is_configured as tg_configured, notify, start_queue
 from .platform_utils import PlatformInfo, detect_platform
 from .servers import Server, filter_and_sort, load_country_ranks, parse_subscription, tcp_probe
 from .settings import (
@@ -128,6 +128,7 @@ class Daemon:
                  self.dry_run, self.platform.name, _fmt(self.state.active))
         if tg_configured():
             log.info("telegram notifications enabled")
+        start_queue()
         notify(f"🟢 xproxy started (active: {_fmt(self.state.active)})")
         # Startup jitter: рандомная пауза перед первым обращением к внешним
         # ресурсам, чтобы несколько хостов, перезапущенных одновременно
@@ -176,20 +177,32 @@ class Daemon:
                 log.exception("tick failed")
 
         log.info("daemon stopped")
-        # blocking=True: основной тред сейчас уйдёт на return, daemon-треды будут
-        # убиты процессом — поэтому синхронно дожидаемся отправки.
+        # Оповестить о остановке и дождаться отправки всех отложенных
+        # уведомлений (включая это). drain_queue() внутри сделает
+        # финальную попытку отправить всё из очереди, а что не ушло —
+        # сохранит на диск для следующего запуска.
         sig_name = _signal_name(self._stop_signal) if self._stop_signal else "manual"
         try:
             notify(f"🛑 xproxy stopped (signal {sig_name}, last active: {_fmt(self.state.active)})",
                    urgent=True, blocking=True)
         except Exception:  # noqa: BLE001
             log.exception("shutdown notify failed")
+        # Drain: фоновый sender-тред получает stopping-флаг,
+        # делает финальные попытки, несённое — на диск.
+        drain_queue()
 
     def run_once(self) -> None:
-        self.refresh_subscription(force=True)
-        self.refresh_geo(force=False)
-        self._rebuild_config_if_active()
-        self.tick_health()
+        # В one-shot режиме sender-тред нужен для отправки уведомлений
+        # из refresh_subscription / refresh_geo / tick_health.
+        # Без него notify() только ставит в очередь, и всё теряется на выходе.
+        start_queue()
+        try:
+            self.refresh_subscription(force=True)
+            self.refresh_geo(force=False)
+            self._rebuild_config_if_active()
+            self.tick_health()
+        finally:
+            drain_queue()
 
     # ---------- periodic tasks ----------
     def tick(self) -> None:
