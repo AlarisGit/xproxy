@@ -218,6 +218,30 @@ class FailSafeTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(seen["asset"], tmp_s)
 
+    def test_validate_config_for_service_skips_service_test_when_asset_unknown(self) -> None:
+        """When XRAY_LOCATION_ASSET is undetectable, skip service env test.
+
+        Testing without the variable makes xray fall back to its built-in
+        geosite.dat, which may lack custom categories — the test would fail
+        even though the config is valid with xproxy's managed assets.
+        """
+        from xproxy import xray_control
+
+        calls = []
+
+        def fake_run(_text: str, *, env: dict[str, str]):
+            calls.append(env.get("XRAY_LOCATION_ASSET"))
+            return True, "ok"
+
+        with mock.patch.object(xray_control, "_run_xray_test", side_effect=fake_run), \
+                mock.patch.object(xray_control, "detect_xray_asset_env",
+                                  return_value=(None, "test service env")):
+            ok, out = xray_control.validate_config_for_service("{}")
+
+        self.assertTrue(ok)
+        # Only managed test runs; service test is skipped.
+        self.assertEqual(len(calls), 1)
+
     def test_validate_config_for_service_fails_on_prod_env_mismatch(self) -> None:
         from xproxy import xray_control
 
@@ -231,7 +255,7 @@ class FailSafeTests(unittest.TestCase):
 
         with mock.patch.object(xray_control, "_run_xray_test", side_effect=fake_run), \
                 mock.patch.object(xray_control, "detect_xray_asset_env",
-                                  return_value=(None, "test service env")):
+                                  return_value=("/different/asset/dir", "test service env")):
             ok, out = xray_control.validate_config_for_service("{}")
 
         self.assertFalse(ok)

@@ -154,8 +154,20 @@ def validate_config_for_service(
         service_env["XRAY_LOCATION_ASSET"] = service_asset
         asset_label = service_asset
     else:
-        service_env.pop("XRAY_LOCATION_ASSET", None)
-        asset_label = "<unset>"
+        # Не можем определить XRAY_LOCATION_ASSET xray-сервиса. Тест без
+        # переменной бессмысленнен: xray подхватит встроенный geosite.dat
+        # (обычно из homebrew), где нет кастомных категорий, и тест упадёт
+        # даже при валидном конфиге. Вместо этого верим managed-тесту и
+        # предупреждаем: конфиг валиден с managed-ассетами, но xray-сервис
+        # может не увидеть их, если env не настроен.
+        log.warning(
+            "cannot detect xray service XRAY_LOCATION_ASSET (%s) — "
+            "skipping service env test; config validated with xproxy "
+            "assets only; run `launchctl setenv XRAY_LOCATION_ASSET %s` "
+            "on macOS or set xray.service override on Linux",
+            source, managed_asset_dir,
+        )
+        return True, output
 
     ok, service_output = _run_xray_test(cfg_text, env=service_env)
     if ok:

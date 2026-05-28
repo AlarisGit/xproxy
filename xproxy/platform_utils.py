@@ -96,6 +96,7 @@ def write_xray_config(content: str, info: PlatformInfo | None = None) -> None:
 
 
 def restart_xray(info: PlatformInfo | None = None) -> None:
+    from .settings import GEO_DIR
     info = info or detect_platform()
     # На Linux/systemd сбрасываем накопленный start-limit state перед рестартом.
     # Во время агрессивных ротаций (xproxy быстро пробует несколько серверов подряд)
@@ -107,6 +108,12 @@ def restart_xray(info: PlatformInfo | None = None) -> None:
             ["sudo", "-n", "systemctl", "reset-failed", "xray"],
             capture_output=True,
         )
+    if info.name == "macos":
+        # Убедиться, что xray-сервис увидит geo-файлы xproxy. Без этого
+        # brew services restart xray стартует xray с дефолтным geosite.dat
+        # из homebrew, где нет кастомных категорий (category-medicine-ru
+        # и т.п.) — xray падает при парсинге конфига, написанного xproxy.
+        _ensure_launchd_asset_env(GEO_DIR)
     proc = subprocess.run(info.restart_cmd, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(
@@ -198,6 +205,7 @@ def _detect_launchd_plist_asset_env() -> tuple[str | None, str]:
     candidates = [
         Path.home() / "Library/LaunchAgents/homebrew.mxcl.xray.plist",
         Path("/Library/LaunchDaemons/homebrew.mxcl.xray.plist"),
+        Path.home() / "Library/LaunchAgents/com.xproxy.daemon.plist",
     ]
     for path in candidates:
         if not path.exists():
@@ -264,6 +272,29 @@ def _can_mkdir(path: Path) -> bool:
         return os.access(path.parent, os.W_OK) or path.exists()
     except OSError:
         return False
+
+
+def _ensure_launchd_asset_env(geo_dir: Path) -> None:
+    """Установить launchctl setenv XRAY_LOCATION_ASSET перед рестартом xray.
+
+    На macOS brew services запускает xray через launchd. Без явной
+    переменной xray использует встроенный geosite.dat из homebrew, где
+    нет кастомных категорий (category-medicine-ru и т.п.). launchctl setenv
+    выставляет переменную в глобальном домене — все launchd-сервисы
+    пользователя увидят её при следующем старте.
+
+    Вызываем безусловно: detect_xray_asset_env() может вернуть путь из
+    xproxy-плагина (env для процесса xproxy), а не из launchctl-домена
+    (env для xray-сервиса) — проверка была бы ненадёжной. Команда
+    идемпотентна, поэтому безопасна при каждом вызове.
+    """
+    try:
+        subprocess.run(
+            ["launchctl", "setenv", "XRAY_LOCATION_ASSET", str(geo_dir)],
+            capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def _atomic_write_direct(target: Path, content: str) -> None:
