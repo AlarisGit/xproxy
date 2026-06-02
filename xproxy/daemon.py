@@ -18,11 +18,11 @@ from .autoupdate import (
 )
 from .geo import ensure_geo_assets
 from .routing import build_xray_sections
-from .healthcheck import internet_alive, proxy_alive, public_ips
+from .healthcheck import internet_alive, proxy_alive, target_alive, public_ips
 from .logger import get_logger
 from .notifier import drain_queue, is_configured as tg_configured, notify, set_status_provider, start_queue
 from .platform_utils import PlatformInfo, detect_platform
-from .servers import Server, filter_and_sort, load_country_ranks, parse_subscription, tcp_probe
+from .servers import Server, expand_servers, filter_and_sort, load_country_ranks, parse_subscription, tcp_probe
 from .settings import (
     FAIL_THRESHOLD,
     GEO_REFRESH,
@@ -94,11 +94,22 @@ class Daemon:
                   self._subscr_period, self._geo_period, self._git_period,
                   self._heartbeat_minute_offset)
         # Восстановить активный сервер, если был сохранён.
+        # Если сервер не имеет resolved_ip (старый формат или hostname),
+        # резолвим hostname в IP при запуске.
         prev = load_active()
         if prev is not None:
+            if prev.resolved_ip is None:
+                from .dns_resolver import resolve_host
+                ips = resolve_host(prev.host)
+                if ips:
+                    prev.resolved_ip = ips[0]
+                    log.info("resolved active server %s → %s",
+                             prev.host, prev.resolved_ip)
+                else:
+                    log.warning("DNS resolve failed for active server %s, "
+                                "using hostname as-is", prev.host)
             self.state.active = prev
-            log.info("restored active server: %s:%d (%s)",
-                     prev.host, prev.port, prev.country)
+            log.info("restored active server: %s", _fmt(prev))
         # Инициализировать время последнего live-фетча подписки из mtime кэша.
         # Если сервер был выключен >24ч и кэш устарел — staleness обнаружится
         # сразу при первой же попытке refresh_subscription().
@@ -321,7 +332,8 @@ class Daemon:
             self.state.last_live_fetch = now
             self.state._stale_notified = False
         servers = parse_subscription(body)
-        ranked = filter_and_sort(servers, self._country_ranks)
+        expanded = expand_servers(servers)
+        ranked = filter_and_sort(expanded, self._country_ranks)
         if not ranked:
             log.warning("subscription returned 0 allowed servers")
             return
@@ -623,31 +635,55 @@ class Daemon:
             log.info("no direct internet — skipping proxy health check")
             return
 
-        if proxy_alive():
-            if self.state.consecutive_proxy_failures:
-                log.info("proxy recovered (active: %s)", _fmt(self.state.active))
-            self.state.note_proxy_ok()
-            # Если активный сервер неизвестен, но сам xray proxy работает,
-            # не трогаем live-config. Потеря state/active.json или ручной
-            # конфиг не являются внешним условием, которое оправдывает
-            # перезапись работающего xray.
-            if self.state.active is None:
-                log.warning("proxy alive but active server unknown — preserving "
-                            "current xray config")
+        if not proxy_alive():
+            # --- Прокси совсем не работает (даже IP-чекеры не проходят) ---
+            fails = self.state.note_proxy_fail()
+            log.warning("proxy probe failed (%d/%d)", fails, FAIL_THRESHOLD)
+            if fails < FAIL_THRESHOLD:
+                return
+
+            # Анти-флаппинг: не ротируем чаще ROTATION_COOLDOWN.
+            since_rot = time.time() - self.state.last_rotation
+            if since_rot < ROTATION_COOLDOWN:
+                log.info("rotation cooldown (%.1fs left), skip",
+                         ROTATION_COOLDOWN - since_rot)
+                return
+
+            self._rotate_until_working(reason="proxy-failing")
             return
 
-        fails = self.state.note_proxy_fail()
-        log.warning("proxy probe failed (%d/%d)", fails, FAIL_THRESHOLD)
-        if fails < FAIL_THRESHOLD:
+        # Прокси работает (IP-чекеры прошли). Проверяем целевые ресурсы.
+        target_ok, target_detail = target_alive()
+        if not target_ok:
+            # Целевой ресурс недоступен через этот прокси.
+            # Считаем proxy fail — сервер блокирует нужные ресурсы.
+            fails = self.state.note_proxy_fail()
+            log.warning("target check failed: %s unreachable via %s "
+                        "(proxy failures: %d/%d)",
+                        target_detail, _fmt(self.state.active),
+                        fails, FAIL_THRESHOLD)
+            if fails < FAIL_THRESHOLD:
+                return
+
+            since_rot = time.time() - self.state.last_rotation
+            if since_rot < ROTATION_COOLDOWN:
+                log.info("rotation cooldown (%.1fs left), skip",
+                         ROTATION_COOLDOWN - since_rot)
+                return
+
+            self._rotate_until_working(reason="target-blocked")
             return
 
-        # Анти-флаппинг: не ротируем чаще ROTATION_COOLDOWN.
-        since_rot = time.time() - self.state.last_rotation
-        if since_rot < ROTATION_COOLDOWN:
-            log.info("rotation cooldown (%.1fs left), skip", ROTATION_COOLDOWN - since_rot)
-            return
-
-        self._rotate_until_working(reason="proxy-failing")
+        if self.state.consecutive_proxy_failures:
+            log.info("proxy recovered (active: %s)", _fmt(self.state.active))
+        self.state.note_proxy_ok()
+        # Если активный сервер неизвестен, но сам xray proxy работает,
+        # не трогаем live-config. Потеря state/active.json или ручной
+        # конфиг не являются внешним условием, которое оправдывает
+        # перезапись работающего xray.
+        if self.state.active is None:
+            log.warning("proxy alive but active server unknown — preserving "
+                        "current xray config")
 
     def _rotate_until_working(self, reason: str) -> None:
         if not self.state.ranked:
@@ -685,7 +721,7 @@ class Daemon:
         # Если текущий активный перестал работать — штрафуем его сразу, чтобы
         # альтернативы были выше в очереди. set_active() снимет штраф, если он
         # снова окажется активным (например, все остальные тоже упали).
-        if self.state.active is not None and reason == "proxy-failing":
+        if self.state.active is not None and reason in ("proxy-failing", "target-blocked"):
             self.state.penalize(self.state.active)
 
         tried = 0
@@ -693,25 +729,21 @@ class Daemon:
             if candidate is self.state.active:
                 continue
             tried += 1
-            if not tcp_probe(candidate.host, candidate.port):
-                log.info("skip %s:%d (%s) — tcp probe failed",
-                         candidate.host, candidate.port, candidate.country)
+            if not tcp_probe(candidate.address, candidate.port):
+                log.info("skip %s — tcp probe failed", _fmt(candidate))
                 self.state.penalize(candidate)
                 continue
 
-            log.info("try candidate → %s (%s:%d)",
-                     candidate.country, candidate.host, candidate.port)
+            log.info("try candidate → %s", _fmt(candidate))
             try:
                 apply_server(candidate, dry_run=self.dry_run, info=self.platform)
             except XrayStartError as exc:
                 log.error("rotation aborted: xray failed to start after applying "
-                          "%s (%s:%d): %s",
-                          candidate.country, candidate.host, candidate.port, exc)
+                          "%s: %s", _fmt(candidate), exc)
                 if not self._xray_start_failure_notified:
                     notify(
                         f"🔴 xproxy stopped rotation: xray did not start after "
-                        f"applying {candidate.country} "
-                        f"({candidate.host}:{candidate.port}). "
+                        f"applying {_fmt(candidate)}. "
                         f"Reason: {exc}",
                         urgent=True,
                         blocking=True,
@@ -724,26 +756,30 @@ class Daemon:
                 continue
 
             if self.dry_run:
-                log.info("[dry-run] would switch to %s (%s:%d)",
-                         candidate.country, candidate.host, candidate.port)
+                log.info("[dry-run] would switch to %s", _fmt(candidate))
                 self.state.set_active(candidate)
                 return
 
             if proxy_alive():
+                # IP-чекеры прошли. Проверяем целевые ресурсы.
+                tgt_ok, tgt_detail = target_alive()
+                if not tgt_ok:
+                    log.info("candidate %s passes proxy probe but blocks %s",
+                             _fmt(candidate), tgt_detail)
+                    self.state.penalize(candidate)
+                    continue
+
                 prev_country = self.state.active.country if self.state.active else None
                 self.state.set_active(candidate)
-                log.info("switched %s → %s (%s:%d)",
-                         prev_country or "-", candidate.country,
-                         candidate.host, candidate.port)
+                log.info("switched %s → %s", prev_country or "-", _fmt(candidate))
                 notify(
                     f"🔄 switched {prev_country or '-'} → "
-                    f"{candidate.country} ({candidate.host}:{candidate.port}) "
-                    f"reason={reason}"
+                    f"{_fmt(candidate)} reason={reason}"
                 )
                 self._xray_start_failure_notified = False
                 return
-            log.info("candidate %s (%s:%d) did not pass proxy probe after restart",
-                     candidate.country, candidate.host, candidate.port)
+            log.info("candidate %s did not pass proxy probe after restart",
+                     _fmt(candidate))
             self.state.penalize(candidate)
 
         # Никто не прошёл. Это важное событие — используем blocking-отправку,
@@ -764,10 +800,14 @@ class Daemon:
 
 
 def _fmt(server: Optional[Server]) -> str:
-    """Человекочитаемое имя сервера для логов: 'Германия (cdn3-70...:8443)' или '-'."""
+    """Человекочитаемое имя сервера для логов.
+
+    Для резолвленных: 'Германия (cdn9-33.vk-cdnvideo.com:8443 / 82.202.156.248)'
+    Для обычных: 'Германия (cdn9-33.vk-cdnvideo.com:8443)'
+    """
     if server is None:
         return "-"
-    return f"{server.country} ({server.host}:{server.port})"
+    return f"{server.country} ({server.display_name})"
 
 
 def _format_uptime(seconds: float) -> str:

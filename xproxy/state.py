@@ -18,7 +18,9 @@ ServerKey = Tuple[str, int]
 
 
 def _key(server: Server) -> ServerKey:
-    return (server.host, server.port)
+    # Ключ строится по адресу подключения (resolved_ip или host).
+    # Это позволяет штрафовать конкретный IP без исключения всего hostname.
+    return server.key()
 
 
 @dataclass

@@ -18,6 +18,8 @@ from .settings import (
     IP_CHECK_URLS,
     SOCKS_HOST,
     SOCKS_PORT,
+    TARGET_CHECK_TIMEOUT,
+    TARGET_CHECK_URLS,
     USER_AGENT,
 )
 
@@ -114,3 +116,42 @@ def direct_public_ip() -> Optional[str]:
         if counts[body] >= 2:
             return body
     return results[0] if results else None
+
+
+def _target_probe(session: requests.Session, url: str) -> Optional[str]:
+    """Проба целевого ресурса через прокси.
+
+    В отличие от _probe(), считает успехом ЛЮБОЙ HTTP-ответ (включая 401, 403),
+    потому что это означает: DNS → TLS handshake → сервер ответил.
+    Таймаут и сетевые ошибки — провал.
+    Возвращает краткое описание результата или None при провале.
+    """
+    try:
+        resp = session.get(url, timeout=TARGET_CHECK_TIMEOUT)
+    except requests.RequestException as exc:
+        log.debug("target probe %s fail: %s", url, exc)
+        return None
+    # Любой HTTP-ответ (даже 401) = целевой ресурс доступен
+    log.debug("target probe %s → %s", url, resp.status_code)
+    return f"{resp.status_code}"
+
+
+def target_alive() -> tuple[bool, str]:
+    """Проверка доступности целевых ресурсов через прокси.
+
+    Возвращает (ok, detail):
+      ok=True  — все целевые ресурсы доступны
+      ok=False — хотя бы один ресурс недоступен, detail = какой именно
+
+    Если TARGET_CHECK_URLS пуст — пропускаем проверку, возвращаем (True, "").
+    """
+    if not TARGET_CHECK_URLS:
+        return True, ""
+
+    proxies = _socks_proxies()
+    session = _make_session(proxies)
+    for url in TARGET_CHECK_URLS:
+        result = _target_probe(session, url)
+        if result is None:
+            return False, url
+    return True, ""

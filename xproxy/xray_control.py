@@ -31,6 +31,13 @@ from .xray_config import build_xray_config_text
 
 log = get_logger("xproxy.xray_control")
 
+
+def _fmt_server(server: Server) -> str:
+    """Короткое имя сервера для логов xray_control: 'host:port (ip)' или 'host:port'."""
+    if server.resolved_ip and server.resolved_ip != server.host:
+        return f"{server.host}:{server.port} ({server.resolved_ip})"
+    return f"{server.host}:{server.port}"
+
 BACKUP_PATH: Path = STATE_DIR / "xray_config.backup.json"
 _TEST_TIMEOUT = 20
 
@@ -66,7 +73,7 @@ def apply_server(server: Server, *, dry_run: bool = False,
     if not ok:
         short = err.strip().splitlines()[-1] if err.strip() else "unknown error"
         raise XrayConfigError(
-            f"xray -test failed for {server.host}:{server.port}: {short}"
+            f"xray -test failed for {_fmt_server(server)}: {short}"
         )
 
     # 2. Diff: если конфиг не изменился — не трогаем xray.
@@ -74,10 +81,10 @@ def apply_server(server: Server, *, dry_run: bool = False,
     # невалидным для текущего service-env, и ConfigUnchanged не должен это
     # маскировать.
     if not dry_run and _config_matches_current(cfg_text, info):
-        log.info("config unchanged, skip write+restart (%s:%d)",
-                 server.host, server.port)
+        log.info("config unchanged, skip write+restart (%s)",
+                 _fmt_server(server))
         raise ConfigUnchanged(
-            f"config for {server.host}:{server.port} is identical to current"
+            f"config for {_fmt_server(server)} is identical to current"
         )
 
     if dry_run:
@@ -91,8 +98,8 @@ def apply_server(server: Server, *, dry_run: bool = False,
     except Exception as exc:  # noqa: BLE001
         log.warning("config backup skipped: %s", exc)
 
-    log.info("write xray config → %s (%s:%d, %s)",
-             info.xray_config, server.host, server.port, server.country)
+    log.info("write xray config → %s (%s, %s)",
+             info.xray_config, _fmt_server(server), server.country)
     write_xray_config(cfg_text, info)
 
     log.info("restart xray: %s", " ".join(info.restart_cmd))

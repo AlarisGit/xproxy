@@ -69,6 +69,23 @@ def build_xray_config_text(
 
 # ---------- internals ----------
 
+def _effective_server_name(server: Server) -> str:
+    """Определить serverName для TLS/Reality.
+
+    Приоритет: явно заданный SNI в параметрах URI → host из URI.
+    Если host резолвирован в IP, serverName ОБЯЗАН быть оригинальным
+    hostname (т.к. IP-адрес не подходит для SNI/CN).
+    Если host и так hostname — используем его напрямую.
+    """
+    p = server.params
+    explicit_sni = p.get("sni") or p.get("host")
+    if explicit_sni:
+        return explicit_sni
+    # Если host был резолвирован, оригинальный hostname — в server.host.
+    # Если host не резолвирован, server.host уже hostname.
+    return server.host
+
+
 def _build_proxy_outbound(server: Server) -> dict:
     p = server.params
     network = (p.get("type") or "tcp").lower()
@@ -79,10 +96,12 @@ def _build_proxy_outbound(server: Server) -> dict:
         "security": security,
     }
 
+    sni = _effective_server_name(server)
+
     if security == "tls":
         alpn = [a for a in (p.get("alpn") or "").split(",") if a]
         tls: dict[str, Any] = {
-            "serverName": p.get("sni") or p.get("host") or server.host,
+            "serverName": sni,
             "allowInsecure": p.get("allowInsecure") in ("1", "true"),
         }
         if alpn:
@@ -92,7 +111,7 @@ def _build_proxy_outbound(server: Server) -> dict:
         stream["tlsSettings"] = tls
     elif security == "reality":
         stream["realitySettings"] = {
-            "serverName": p.get("sni") or server.host,
+            "serverName": sni,
             "fingerprint": p.get("fp", "chrome"),
             "publicKey": p.get("pbk", ""),
             "shortId": p.get("sid", ""),
@@ -125,13 +144,15 @@ def _build_proxy_outbound(server: Server) -> dict:
     if flow:
         user["flow"] = flow
 
+    # address: конкретный IP (если сервер резолвирован) или hostname.
+    # serverName в TLS/Reality: всегда оригинальный hostname (для SNI).
     return {
         "tag": "proxy",
         "protocol": "vless",
         "settings": {
             "vnext": [
                 {
-                    "address": server.host,
+                    "address": server.address,
                     "port": server.port,
                     "users": [user],
                 }
