@@ -82,8 +82,9 @@ python main.py --daemon           # постоянный цикл
 - **Остановка** — `🛑 xproxy stopped (signal SIGTERM, last active: ...)`
 - **Ротация** — `🔄 switched Германия → Австрия (host:port) reason=proxy-failing`
 - **State-machine active/standby**:
-  - `🟢 standby READY: ... — ready_ttl=Ns usable_ttl=Ns slot=...` — слот стал готовым после пустого/невалидного состояния или фактически заменил прежнее содержимое;
-  - плановый цикл `READY → PRE_STALE → READY` для того же standby-конфига не отправляет Telegram-уведомление;
+  - `🟢 standby READY: ... — ready_ttl=Ns usable_ttl=Ns slot=...` — standby slot перешёл из `EMPTY` в готовый endpoint или выбран другой standby endpoint;
+  - `🟠 standby EMPTY: ... reason=...` — standby slot потерял ранее готовый endpoint, готового резервного сервера сейчас нет;
+  - плановый цикл `READY → PRE_STALE → READY` или пересборка того же standby endpoint не отправляет Telegram-уведомление;
   - `🔴 standby FAILED: ... reason=...` — promotion не прошла проверку или подбор кандидата падает, пока active уже ждёт standby;
   - `🟠 active WAITING_FOR_STANDBY: ... reason=...` — боевой сервер признан проблемным, готового резерва пока нет;
   - `🔄 active PROMOTING: ... — next=...` и `🔄 standby PROMOTING: ...` — начинается быстрая promotion;
@@ -548,10 +549,10 @@ Standby Worker подготавливает кандидата по конвей
 доступны через конкретный сервер. Постоянно держать вторую копию xray не нужно:
 достаточно периодически запускать её на время проверки и обновлять TTL standby.
 
-Публикация нового standby сравнивает содержимое слота по `(server.key(),
-fingerprint)`. Если worker перепроверил тот же конфиг в цикле
-`READY → PRE_STALE → READY`, Telegram-уведомление не отправляется. Если slot был
-`EMPTY`/`STALE` или содержимое изменилось, отправляется `standby READY`.
+Публикация нового standby уведомляет только при изменении состояния standby
+slot: `EMPTY → endpoint`, `endpoint → EMPTY` или `endpoint A → endpoint B`.
+Если worker перепроверил или пересобрал тот же endpoint в цикле
+`READY → PRE_STALE → READY`, Telegram-уведомление не отправляется.
 
 ### Быстрый контур Active Guard
 
@@ -636,9 +637,10 @@ promotion продолжает работу и подбирает следующ
 нового wakeup-события.
 
 Telegram-уведомления standby намеренно отправляются только при полезном
-изменении содержимого slot: новый usable standby после `EMPTY`/`STALE` или
-замена сервера/fingerprint. Внутренние события Standby Worker (`PREPARING`,
-`VALIDATING`, плановый refresh того же slot) остаются в логах.
+изменении server slot: появился standby endpoint, текущий endpoint был потерян
+или выбран другой endpoint. Внутренние события Standby Worker (`PREPARING`,
+`VALIDATING`, плановый refresh или пересборка того же endpoint) остаются в
+логах.
 
 ### Инварианты
 

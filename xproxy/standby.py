@@ -144,7 +144,7 @@ def standby_fingerprint(
     info = info or detect_platform()
     service_asset, source = detect_xray_asset_env(info)
     payload: dict[str, Any] = {
-        "server": server.to_dict(),
+        "server": _server_config_fingerprint(server),
         "service_asset": service_asset,
         "service_asset_source": source,
         "files": {
@@ -157,6 +157,18 @@ def standby_fingerprint(
     }
     text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _server_config_fingerprint(server: Server) -> dict[str, Any]:
+    """Return only Server fields that affect generated xray config."""
+    return {
+        "protocol": server.protocol,
+        "uuid": server.uuid,
+        "host": server.host,
+        "port": server.port,
+        "params": server.params,
+        "resolved_ip": server.resolved_ip,
+    }
 
 
 def validate_standby_end_to_end(

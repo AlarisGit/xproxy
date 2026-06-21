@@ -127,6 +127,7 @@ class Daemon:
         self._notify_state_lock = threading.RLock()
         self._last_active_state_notify: Optional[tuple] = None
         self._last_standby_state_notify: Optional[tuple] = None
+        self._notified_standby_slot_key: Optional[tuple[str, int]] = None
         self._last_cold_rotation_attempt: float = 0.0
         # Восстановить активный сервер, если был сохранён.
         # Если сервер не имеет resolved_ip (старый формат или hostname),
@@ -745,6 +746,8 @@ class Daemon:
         detail_part = f" — {detail}" if detail else ""
         if state == "READY":
             text = f"🟢 standby READY: {target}{suffix}{detail_part}"
+        elif state == "EMPTY":
+            text = f"🟠 standby EMPTY: {target}{suffix}{detail_part}"
         elif state == "FAILED":
             text = f"🔴 standby FAILED: {target}{suffix}{detail_part}"
         elif state == "PROMOTING":
@@ -754,12 +757,34 @@ class Daemon:
                       state, target, suffix, detail_part)
             return
 
-        key = (state, _server_key(server), reason, detail)
+        # READY details include TTL/fingerprint and naturally change on every
+        # successful revalidation. They must not make the same standby endpoint
+        # look like a new notification-worthy event.
+        key_detail = "" if state == "READY" else detail
+        key = (state, _server_key(server), reason, key_detail)
         with self._notify_state_lock:
             if key == self._last_standby_state_notify:
                 return
             self._last_standby_state_notify = key
         notify(text, urgent=urgent)
+
+    def _notify_standby_empty_locked(
+        self,
+        reason: str,
+        previous: PreparedStandby,
+        *,
+        detail: str = "no usable standby",
+    ) -> None:
+        if self._notified_standby_slot_key is None:
+            return
+        self._notified_standby_slot_key = None
+        self._notify_standby_state(
+            "EMPTY",
+            server=previous.server,
+            reason=reason,
+            detail=detail,
+            urgent=True,
+        )
 
     def _invalidate_standby(self, reason: str) -> None:
         with self._standby_cond:
@@ -767,11 +792,14 @@ class Daemon:
 
     def _invalidate_standby_locked(self, reason: str) -> None:
         self._standby_generation += 1
-        if self._standby is not None:
+        previous = self._standby
+        if previous is not None:
             log.info("standby invalidated: %s (%s)",
-                     reason, _fmt(self._standby.server))
-            self._standby.status = "STALE"
+                     reason, _fmt(previous.server))
+            previous.status = "STALE"
         self._standby = None
+        if previous is not None:
+            self._notify_standby_empty_locked(reason, previous)
         self._standby_cond.notify_all()
 
     def _sync_standby_after_ranked_refresh_locked(
@@ -791,6 +819,10 @@ class Daemon:
                      _fmt(standby.server))
             standby.status = "STALE"
             self._standby = None
+            self._notify_standby_empty_locked(
+                "subscription-removed",
+                standby,
+            )
             self._standby_cond.notify_all()
             return
 
@@ -801,6 +833,11 @@ class Daemon:
                         "failed: %s", exc)
             standby.status = "STALE"
             self._standby = None
+            self._notify_standby_empty_locked(
+                "subscription-fingerprint",
+                standby,
+                detail=str(exc),
+            )
             self._standby_cond.notify_all()
             return
 
@@ -816,6 +853,11 @@ class Daemon:
                  _fmt(standby.server), state)
         standby.status = "STALE"
         self._standby = None
+        self._notify_standby_empty_locked(
+            "subscription-refresh",
+            standby,
+            detail=f"state={state}",
+        )
         self._standby_cond.notify_all()
 
     def _discard_current_standby_locked(self, candidate: Server, reason: str) -> bool:
@@ -825,9 +867,11 @@ class Daemon:
             return False
         self._standby_generation += 1
         log.info("standby slot discarded: %s (%s)", reason, _fmt(candidate))
-        self._standby.status = "STALE"
+        previous = self._standby
+        previous.status = "STALE"
         self._standby = None
         self._standby_last_attempt = 0
+        self._notify_standby_empty_locked(reason, previous)
         self._standby_cond.notify_all()
         return True
 
@@ -844,19 +888,24 @@ class Daemon:
             return False
         previous = self._standby
         previous_state = "EMPTY"
-        content_changed = True
+        prepared_key = _server_key(prepared.server)
+        previous_key = None
         if previous is not None:
             previous_state = previous.lifecycle_state()
-            content_changed = previous.slot_key() != prepared.slot_key()
+            previous_key = _server_key(previous.server)
 
         self._standby = prepared
         detail = f"{prepared.ttl_detail()} slot={prepared.fingerprint[:8]}"
-        should_notify = (
-            previous is None or
-            previous_state not in ("READY", "PRE_STALE") or
-            content_changed
+        same_usable_endpoint = (
+            previous is not None and
+            previous_state in ("READY", "PRE_STALE") and
+            previous_key == prepared_key
         )
-        if content_changed and previous is not None:
+        should_notify = (
+            prepared_key != self._notified_standby_slot_key and
+            not same_usable_endpoint
+        )
+        if previous_key is not None and previous_key != prepared_key:
             detail = f"{detail}; replaced={_fmt(previous.server)}"
 
         if should_notify:
@@ -868,6 +917,7 @@ class Daemon:
         else:
             log.info("standby refreshed silently: %s %s",
                      _fmt(prepared.server), prepared.ttl_detail())
+        self._notified_standby_slot_key = prepared_key
         return True
 
     def _standby_worker_loop(self) -> None:
@@ -1007,8 +1057,14 @@ class Daemon:
             else:
                 log.info("standby no longer usable: %s state=%s",
                          _fmt(self._standby.server), state)
-                self._standby.status = "STALE"
+                previous = self._standby
+                previous.status = "STALE"
                 self._standby = None
+                self._notify_standby_empty_locked(
+                    "standby-stale",
+                    previous,
+                    detail=f"state={state}",
+                )
         active = self.state.active_snapshot()
         if not self.state.ranked_snapshot() or active is None:
             return None
@@ -1224,6 +1280,11 @@ class Daemon:
                             _fmt(prepared.server))
                 prepared.status = "STALE"
                 self._standby = None
+                self._notify_standby_empty_locked(
+                    "promotion-not-ready",
+                    prepared,
+                    detail=f"state={promotion_state}",
+                )
                 self._standby_cond.notify_all()
                 return False
             prepared.status = "PROMOTING"
@@ -1243,6 +1304,12 @@ class Daemon:
                 reason=reason,
                 detail=f"from={promotion_state}",
             )
+            with self._standby_cond:
+                self._notify_standby_empty_locked(
+                    reason,
+                    prepared,
+                    detail="slot consumed by promotion",
+                )
             self._notify_active_state(
                 "PROMOTING",
                 server=prev,

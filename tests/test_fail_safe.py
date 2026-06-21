@@ -555,6 +555,43 @@ class FailSafeTests(unittest.TestCase):
             with self.assertRaisesRegex(StandbyError, "inputs changed"):
                 standby.prepare_standby(srv)
 
+    def test_standby_fingerprint_ignores_subscription_metadata(self) -> None:
+        from xproxy import standby
+
+        base = Server(
+            uri="vless://token@standby.example.com:443?security=reality#Old",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            params={"security": "reality", "pbk": "public-key", "fp": "chrome"},
+            fragment="Old label",
+            country="Old Country",
+            rank=10,
+            resolved_ip="203.0.113.10",
+        )
+        relabeled = Server(
+            uri="vless://token@standby.example.com:443?security=reality#New",
+            protocol="vless",
+            uuid=base.uuid,
+            host=base.host,
+            port=base.port,
+            params=dict(base.params),
+            fragment="New label",
+            country="New Country",
+            rank=20,
+            resolved_ip=base.resolved_ip,
+        )
+
+        with mock.patch.object(standby, "detect_xray_asset_env",
+                               return_value=("/var/lib/xproxy/geo", "test")), \
+                mock.patch.object(standby, "_file_fingerprint",
+                                  return_value={"exists": True, "size": 1, "mtime_ns": 1}):
+            self.assertEqual(
+                standby.standby_fingerprint(base),
+                standby.standby_fingerprint(relabeled),
+            )
+
     def test_pre_stale_standby_is_revalidated_before_replacement_search(self) -> None:
         from xproxy import daemon
         from xproxy.standby import PreparedStandby
@@ -803,6 +840,60 @@ class FailSafeTests(unittest.TestCase):
         self.assertIs(d._standby, refreshed)
         notify_mock.assert_not_called()
 
+    def test_same_standby_endpoint_after_empty_slot_is_notified(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        srv = Server(
+            uri="standby-refreshed",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        previous = PreparedStandby(
+            server=srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="old-fingerprint",
+            created_at=now - 120,
+            last_ok_at=now - 120,
+            pre_stale_at=now - 1,
+            expires_at=now + 60,
+            status="PRE_STALE",
+        )
+        refreshed = PreparedStandby(
+            server=srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="new-fingerprint",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 60,
+            expires_at=now + 120,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = previous
+        d._notified_standby_slot_key = srv.key()
+
+        with mock.patch.object(daemon, "notify") as notify_mock:
+            with d._standby_cond:
+                d._invalidate_standby_locked("test-empty")
+                d._publish_standby_locked(refreshed)
+
+        self.assertIs(d._standby, refreshed)
+        messages = [call.args[0] for call in notify_mock.call_args_list]
+        self.assertEqual(len(messages), 2)
+        self.assertIn(
+            "🟠 standby EMPTY: Standby (standby.example.com:443) "
+            "reason=test-empty — no usable standby",
+            messages,
+        )
+        self.assertIn(
+            "🟢 standby READY: Standby (standby.example.com:443)",
+            messages[1],
+        )
+
     def test_standby_slot_replacement_is_notified(self) -> None:
         from xproxy import daemon
         from xproxy.standby import PreparedStandby
@@ -888,6 +979,7 @@ class FailSafeTests(unittest.TestCase):
         d = daemon.Daemon(dry_run=False)
         d.state.active = active
         d._standby = prepared
+        d._notified_standby_slot_key = standby_srv.key()
 
         with mock.patch.object(daemon, "standby_fingerprint", return_value="fp"), \
                 mock.patch.object(daemon, "apply_config_text") as apply_mock, \
@@ -922,7 +1014,11 @@ class FailSafeTests(unittest.TestCase):
             "reason=promoted:test-reason",
             messages,
         )
-        self.assertFalse(any("standby EMPTY" in msg for msg in messages))
+        self.assertIn(
+            "🟠 standby EMPTY: Standby (standby.example.com:443) "
+            "reason=test-reason — slot consumed by promotion",
+            messages,
+        )
 
     def test_daemon_promotes_pre_stale_standby(self) -> None:
         from xproxy import daemon
