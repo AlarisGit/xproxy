@@ -88,6 +88,9 @@ python main.py --daemon           # постоянный цикл
   - `🟠 active WAITING_FOR_STANDBY: ... reason=...` — боевой сервер признан проблемным, готового резерва пока нет;
   - `🔄 active PROMOTING: ... — next=...` и `🔄 standby PROMOTING: ...` — начинается быстрая promotion;
   - `🟢 active OK: ... reason=...` — активный канал снова в рабочем состоянии после recovery/switch/promotion.
+- **Публикация config.json**:
+  - `🟢 config synced to ... after standby promotion ...` — удалённая SCP-публикация нового боевого конфига успешно завершилась;
+  - `⚠️ config sync failed after standby promotion ...` — на хосте настроен `conf/sync.json`, standby promotion уже восстановила xray, но SCP-публикация нового конфига не удалась.
 - **Проблема с подпиской**:
   - `⚠️ subscription unavailable: ...` — подписка недоступна (даже кэш пуст)
   - `🔴 subscription stale for Nh — live fetch keeps failing` — подписка не обновлялась живым фетчем более 24ч (критично)
@@ -224,6 +227,58 @@ ReadWritePaths=/usr/local/etc/xray
 from xproxy.xray_control import restore_backup
 restore_backup()
 ```
+
+### Публикация config.json после standby failover
+
+Опционально xproxy может выкладывать новый боевой `config.json` на удалённый
+web-доступный путь после подтверждённого standby failover. Это нужно для
+клиентов xray, у которых нет локального watchdog: они смогут забрать свежий
+конфиг с web-сервера.
+
+Настройка локальная для конкретного хоста xproxy и не хранится в git:
+создайте `conf/sync.json` по примеру `conf/sync.example.json`:
+
+```json
+{
+  "host": "quietharbor.net",
+  "port": 57093,
+  "user": "sergey",
+  "path": "/var/www/quietharbor.net/config.json"
+}
+```
+
+Если `conf/sync.json` отсутствует, поведение полностью прежнее: xproxy ничего
+не публикует. Если файл есть, все четыре ключа обязательны:
+
+- `host` — SSH/SCP host;
+- `port` — SSH-порт;
+- `user` — SSH-пользователь;
+- `path` — полный удалённый путь, куда будет скопирован текущий xray config.
+
+Публикация выполняется командой `scp` без shell:
+
+```text
+scp -P <port> -o BatchMode=yes -o ConnectTimeout=10 \
+  /usr/local/etc/xray/config.json <user>@<host>:<path>
+```
+
+Если локальный OpenSSH падает до соединения с `Bad owner or permissions` в
+`ssh_config`, xproxy повторяет тот же SCP с `-F none`, чтобы не зависеть от
+сломанных system/user ssh config snippets.
+
+Фактический source path берётся из `PlatformInfo.xray_config`: на Linux это
+`/usr/local/etc/xray/config.json`, на macOS путь Homebrew. `BatchMode=yes`
+означает, что интерактивный ввод пароля невозможен: для пользователя, под
+которым работает `xproxy.service`, должен быть настроен SSH key и known_hosts.
+
+Sync запускается только после успешной standby promotion по причинам
+`proxy-failing` или `target-blocked`: старый active уже признан проблемным,
+standby config применён, xray перезапущен, `proxy_alive()` и `target_alive()`
+прошли. Для cold rotation, `xray-not-running`, dry-run и неуспешной promotion
+публикации нет. SCP выполняется в отдельном thread: failover уже завершён, а
+ошибка публикации не откатывает рабочий xray config. После фактического
+завершения sync отправляется Telegram-уведомление об успехе или ошибке, если
+notifier настроен.
 
 ### Безопасное скачивание geo-файлов
 
@@ -550,11 +605,14 @@ Promotion должна быть атомарной с точки зрения sh
 5. Выполнить быстрый post-promotion healthcheck.
 6. При успехе сохранить новый active, очистить standby slot и разбудить Standby
    Worker для подготовки следующего резерва.
-7. Если config уже был применён, но xray не стартовал или post-promotion
+7. Если promotion была вызвана блокировкой active (`proxy-failing` или
+   `target-blocked`) и настроен `conf/sync.json`, асинхронно опубликовать
+   текущий xray config на удалённый web-доступный путь через SCP.
+8. Если config уже был применён, но xray не стартовал или post-promotion
    healthcheck не прошёл, попытаться откатить `config.json` через последний
    backup. Если rollback не удался, daemon явно помечает applied standby как
    failed active, чтобы live-конфиг и состояние daemon не расходились молча.
-8. При ошибке promotion — штрафовать этот standby, очистить slot, вернуться в
+9. При ошибке promotion — штрафовать этот standby, очистить slot, вернуться в
    `WAITING_FOR_STANDBY` или в аварийный cold-rotation fallback.
 
 ### Сценарий ожидания standby

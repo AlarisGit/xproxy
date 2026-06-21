@@ -1280,6 +1280,7 @@ class FailSafeTests(unittest.TestCase):
                                   side_effect=apply_side_effect), \
                 mock.patch.object(daemon, "proxy_alive", return_value=True), \
                 mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
+                mock.patch.object(d, "_schedule_config_sync_after_promotion"), \
                 mock.patch.object(daemon, "notify"), \
                 mock.patch("xproxy.state._save_active"):
             promoted = d._promote_standby("proxy-failing")
@@ -1526,6 +1527,243 @@ class FailSafeTests(unittest.TestCase):
 
         write_mock.assert_called_once()
         restart_mock.assert_called_once_with(info)
+
+    def test_config_sync_loads_json_and_runs_scp(self) -> None:
+        from xproxy import config_sync
+        from xproxy.platform_utils import PlatformInfo
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            source = tmp / "config.json"
+            source.write_text("{}", encoding="utf-8")
+            sync = tmp / "sync.json"
+            sync.write_text(
+                '{"host":"quietharbor.net","port":57093,'
+                '"user":"sergey",'
+                '"path":"/var/www/quietharbor.net/config.json"}',
+                encoding="utf-8",
+            )
+            info = PlatformInfo(
+                name="linux",
+                xray_config=source,
+                restart_cmd=[],
+                needs_sudo_write=False,
+            )
+
+            with mock.patch.object(config_sync.shutil, "which",
+                                   return_value="/usr/bin/scp"), \
+                    mock.patch.object(
+                        config_sync.subprocess,
+                        "run",
+                        return_value=mock.Mock(returncode=0, stderr=b"", stdout=b""),
+                    ) as run_mock:
+                target = config_sync.sync_current_config(
+                    info=info,
+                    sync_path=sync,
+                )
+
+        self.assertIsNotNone(target)
+        self.assertEqual(target.host, "quietharbor.net")
+        self.assertEqual(target.port, 57093)
+        self.assertEqual(target.user, "sergey")
+        self.assertEqual(target.path, "/var/www/quietharbor.net/config.json")
+        cmd = run_mock.call_args.args[0]
+        self.assertEqual(cmd[:8], [
+            "scp",
+            "-P",
+            "57093",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            str(source),
+        ])
+        self.assertEqual(
+            cmd[-1],
+            "sergey@quietharbor.net:/var/www/quietharbor.net/config.json",
+        )
+
+    def test_config_sync_missing_file_is_noop(self) -> None:
+        from xproxy import config_sync
+        from xproxy.platform_utils import PlatformInfo
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            info = PlatformInfo(
+                name="linux",
+                xray_config=Path(tmp_s) / "config.json",
+                restart_cmd=[],
+                needs_sudo_write=False,
+            )
+
+            with mock.patch.object(config_sync.subprocess, "run") as run_mock:
+                target = config_sync.sync_current_config(
+                    info=info,
+                    sync_path=Path(tmp_s) / "missing-sync.json",
+                )
+
+        self.assertIsNone(target)
+        run_mock.assert_not_called()
+
+    def test_config_sync_retries_with_no_ssh_config_on_bad_permissions(self) -> None:
+        from xproxy import config_sync
+        from xproxy.platform_utils import PlatformInfo
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            source = tmp / "config.json"
+            source.write_text("{}", encoding="utf-8")
+            sync = tmp / "sync.json"
+            sync.write_text(
+                '{"host":"quietharbor.net","port":57093,'
+                '"user":"sergey",'
+                '"path":"/var/www/quietharbor.net/config.json"}',
+                encoding="utf-8",
+            )
+            info = PlatformInfo(
+                name="linux",
+                xray_config=source,
+                restart_cmd=[],
+                needs_sudo_write=False,
+            )
+
+            first = mock.Mock(
+                returncode=1,
+                stderr=(
+                    b"Bad owner or permissions on "
+                    b"/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf\n"
+                ),
+                stdout=b"",
+            )
+            second = mock.Mock(returncode=0, stderr=b"", stdout=b"")
+            with mock.patch.object(config_sync.shutil, "which",
+                                   return_value="/usr/bin/scp"), \
+                    mock.patch.object(
+                        config_sync.subprocess,
+                        "run",
+                        side_effect=[first, second],
+                    ) as run_mock:
+                target = config_sync.sync_current_config(
+                    info=info,
+                    sync_path=sync,
+                )
+
+        self.assertIsNotNone(target)
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertNotIn("-F", run_mock.call_args_list[0].args[0])
+        self.assertEqual(run_mock.call_args_list[1].args[0][:3],
+                         ["scp", "-F", "none"])
+
+    def test_config_sync_rejects_single_quoted_non_json_file(self) -> None:
+        from xproxy import config_sync
+        from xproxy.config_sync import ConfigSyncError
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            sync = Path(tmp_s) / "sync.json"
+            sync.write_text(
+                "{ 'host': 'quietharbor.net', 'port': 57093, "
+                "'user': 'sergey', "
+                "'path': '/var/www/quietharbor.net/config.json' }",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigSyncError, "cannot parse"):
+                config_sync.load_config_sync(sync)
+
+    def test_successful_blocked_standby_promotion_schedules_config_sync(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+        d._standby = prepared
+
+        class ImmediateThread:
+            def __init__(self, *, target, args, name, daemon):
+                self._target = target
+                self._args = args
+                self.name = name
+                self.daemon = daemon
+
+            def start(self):
+                self._target(*self._args)
+
+        target = mock.Mock()
+        target.safe_label.return_value = (
+            "sergey@quietharbor.net:/var/www/quietharbor.net/config.json"
+        )
+
+        with mock.patch.object(daemon, "standby_fingerprint", return_value="fp"), \
+                mock.patch.object(daemon, "apply_config_text"), \
+                mock.patch.object(daemon, "proxy_alive", return_value=True), \
+                mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
+                mock.patch.object(daemon, "sync_current_config",
+                                  return_value=target) as sync_mock, \
+                mock.patch.object(daemon.threading, "Thread",
+                                  side_effect=lambda **kwargs: ImmediateThread(**kwargs)) as thread_mock, \
+                mock.patch.object(daemon, "notify") as notify_mock, \
+                mock.patch("xproxy.state._save_active"):
+            promoted = d._promote_standby("target-blocked")
+
+        self.assertTrue(promoted)
+        thread_mock.assert_called_once()
+        self.assertEqual(thread_mock.call_args.kwargs["name"], "xproxy-config-sync")
+        sync_mock.assert_called_once_with(info=d.platform)
+        messages = [call.args[0] for call in notify_mock.call_args_list]
+        self.assertIn(
+            "🟢 config synced to "
+            "sergey@quietharbor.net:/var/www/quietharbor.net/config.json "
+            "after standby promotion Active (active.example.com:443) → "
+            "Standby (standby.example.com:443) reason=target-blocked",
+            messages,
+        )
+
+    def test_config_sync_not_scheduled_for_xray_not_running_promotion(self) -> None:
+        from xproxy import daemon
+
+        srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        d = daemon.Daemon(dry_run=False)
+
+        with mock.patch.object(daemon.threading, "Thread") as thread_mock:
+            d._schedule_config_sync_after_promotion(
+                reason="xray-not-running",
+                previous=None,
+                promoted=srv,
+            )
+
+        thread_mock.assert_not_called()
 
     def test_state_machine_notifications_are_deduplicated(self) -> None:
         from xproxy import daemon

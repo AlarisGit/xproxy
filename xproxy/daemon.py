@@ -17,6 +17,7 @@ from .autoupdate import (
     too_many_restarts,
     validate_new_code,
 )
+from .config_sync import ConfigSyncError, sync_current_config
 from .geo import ensure_geo_assets
 from .routing import build_xray_sections
 from .healthcheck import internet_alive, proxy_alive, target_alive, public_ips
@@ -53,6 +54,8 @@ from .xray_control import (
 )
 
 log = get_logger("xproxy.daemon")
+
+_CONFIG_SYNC_PROMOTION_REASONS = {"proxy-failing", "target-blocked"}
 
 
 def _jittered(interval: float, ratio: float = SCHEDULE_JITTER_RATIO) -> float:
@@ -1346,12 +1349,80 @@ class Daemon:
                 reason=f"promoted:{reason}",
             )
             self._xray_start_failure_notified = False
+            self._schedule_config_sync_after_promotion(
+                reason=reason,
+                previous=prev,
+                promoted=prepared.server,
+            )
             self._wake_standby_worker()
             return True
         finally:
             with self._standby_cond:
                 self._promotion_in_progress = False
                 self._standby_cond.notify_all()
+
+    def _schedule_config_sync_after_promotion(
+        self,
+        *,
+        reason: str,
+        previous: Optional[Server],
+        promoted: Server,
+    ) -> None:
+        if self.dry_run:
+            return
+        if reason not in _CONFIG_SYNC_PROMOTION_REASONS:
+            log.debug("config sync skipped after promotion: reason=%s", reason)
+            return
+
+        previous_label = _fmt(previous)
+        promoted_label = _fmt(promoted)
+        thread = threading.Thread(
+            target=self._run_config_sync_after_promotion,
+            name="xproxy-config-sync",
+            args=(reason, previous_label, promoted_label),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_config_sync_after_promotion(
+        self,
+        reason: str,
+        previous_label: str,
+        promoted_label: str,
+    ) -> None:
+        try:
+            target = sync_current_config(info=self.platform)
+        except ConfigSyncError as exc:
+            log.warning("config sync failed after standby promotion "
+                        "%s → %s reason=%s: %s",
+                        previous_label, promoted_label, reason, exc)
+            notify(
+                f"⚠️ config sync failed after standby promotion "
+                f"{previous_label} → {promoted_label}: {exc}",
+                urgent=True,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.exception("config sync crashed after standby promotion "
+                          "%s → %s reason=%s",
+                          previous_label, promoted_label, reason)
+            notify(
+                f"⚠️ config sync crashed after standby promotion "
+                f"{previous_label} → {promoted_label}: "
+                f"{type(exc).__name__}: {exc}",
+                urgent=True,
+            )
+            return
+
+        if target is None:
+            return
+        log.info("config sync completed after standby promotion %s → %s "
+                 "reason=%s target=%s",
+                 previous_label, promoted_label, reason, target.safe_label())
+        notify(
+            f"🟢 config synced to {target.safe_label()} after standby promotion "
+            f"{previous_label} → {promoted_label} reason={reason}"
+        )
 
     def _standby_ready_for_fast_path(self) -> bool:
         with self._standby_cond:

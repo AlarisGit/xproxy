@@ -28,6 +28,7 @@ DIRECT_LIST: Path = CONF_DIR / "direct.lst"
 
 SERVERS_CACHE: Path = STATE_DIR / "servers.json"
 ACTIVE_STATE: Path = STATE_DIR / "active.json"
+SYNC_CONFIG: Path = CONF_DIR / "sync.json"
 
 # Директория для geosite.dat / geoip.dat (XRAY_LOCATION_ASSET).
 #
@@ -84,6 +85,10 @@ STANDBY_FAIL_THRESHOLD = 1         # подряд-фейлов до promotion, �
 STANDBY_READY_TTL = 5 * 60         # READY → PRE_STALE после e2e-проверки
 STANDBY_PRE_STALE_TTL = 10 * 60    # PRE_STALE → STALE; PRE_STALE ещё можно promoted
 STANDBY_RETRY_INTERVAL = 60        # как часто пытаться подготовить standby при неудаче
+
+# ---------- Config sync ----------
+CONFIG_SYNC_TIMEOUT = 30           # общий timeout SCP-публикации config.json
+CONFIG_SYNC_CONNECT_TIMEOUT = 10   # timeout SSH connect внутри SCP
 
 # ---------- Heartbeat ----------
 HEARTBEAT_HOUR = 12           # локальный час суток, когда шлём суточный статус (0..23)
