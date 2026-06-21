@@ -79,6 +79,12 @@ FAIL_THRESHOLD = 5            # сколько подряд-фейлов про�
 ROTATION_COOLDOWN = 60        # не ротируем чаще, чем раз в минуту
 SERVER_PENALTY_DURATION = 5 * 60   # на сколько уводим упавший сервер в конец списка
 
+# ---------- Standby ----------
+STANDBY_FAIL_THRESHOLD = 1         # подряд-фейлов до promotion, если standby готов
+STANDBY_READY_TTL = 5 * 60         # READY → PRE_STALE после e2e-проверки
+STANDBY_PRE_STALE_TTL = 10 * 60    # PRE_STALE → STALE; PRE_STALE ещё можно promoted
+STANDBY_RETRY_INTERVAL = 60        # как часто пытаться подготовить standby при неудаче
+
 # ---------- Heartbeat ----------
 HEARTBEAT_HOUR = 12           # локальный час суток, когда шлём суточный статус (0..23)
 

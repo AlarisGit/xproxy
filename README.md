@@ -81,6 +81,13 @@ python main.py --daemon           # постоянный цикл
 - **Старт** — `🟢 xproxy started (active: Германия (...))`
 - **Остановка** — `🛑 xproxy stopped (signal SIGTERM, last active: ...)`
 - **Ротация** — `🔄 switched Германия → Австрия (host:port) reason=proxy-failing`
+- **State-machine active/standby**:
+  - `🟢 standby READY: ... — ready_ttl=Ns usable_ttl=Ns slot=...` — слот стал готовым после пустого/невалидного состояния или фактически заменил прежнее содержимое;
+  - плановый цикл `READY → PRE_STALE → READY` для того же standby-конфига не отправляет Telegram-уведомление;
+  - `🔴 standby FAILED: ... reason=...` — promotion не прошла проверку или подбор кандидата падает, пока active уже ждёт standby;
+  - `🟠 active WAITING_FOR_STANDBY: ... reason=...` — боевой сервер признан проблемным, готового резерва пока нет;
+  - `🔄 active PROMOTING: ... — next=...` и `🔄 standby PROMOTING: ...` — начинается быстрая promotion;
+  - `🟢 active OK: ... reason=...` — активный канал снова в рабочем состоянии после recovery/switch/promotion.
 - **Проблема с подпиской**:
   - `⚠️ subscription unavailable: ...` — подписка недоступна (даже кэш пуст)
   - `🔴 subscription stale for Nh — live fetch keeps failing` — подписка не обновлялась живым фетчем более 24ч (критично)
@@ -357,6 +364,268 @@ python main.py --routing-link
 10. **Geo-guard**: перед любым rebuild/rotation проверяется, что в построенном routing+dns не осталось ссылок на нечитаемые `.dat`. Если остались — rebuild/rotation пропускаются, live-config xray сохраняется (см. раздел «Fail-safe и geo-файлы» → «Различие "нет категории" и "файл нечитаем"»).
 
 Все тайминги — в `xproxy/settings.py`.
+
+## Целевая архитектура standby-режима
+
+Этот раздел описывает standby-режим: xproxy поддерживает два рабочих конфига —
+один применён в боевом xray, второй заранее проверен и готов к немедленному
+применению. Балансировка средствами xray (`routing.balancers`, `observatory`)
+намеренно не входит в этот этап: standby остаётся управляемым на стороне xproxy
+через подготовку конфига и быструю promotion-операцию.
+
+Текущий первый этап реализации хранит standby slot в памяти процесса. Persistent
+cache `state/standby.json` описан ниже как следующий шаг, но пока не является
+источником данных после рестарта демона.
+
+### Основные роли
+
+**Active Guard** — быстрый контур реакции. Он не подбирает серверы и не делает
+долгий перебор кандидатов. Его задача — быстро определить, что боевой xray
+перестал доставлять трафик к критичным внешним ресурсам при живом прямом
+интернете, и применить уже готовый standby.
+
+**Standby Worker** — медленный контур подготовки резерва. Он выбирает кандидата,
+собирает production-конфиг, тщательно проверяет его и поддерживает состояние
+`standby_slot` пригодным для promotion (`READY` или `PRE_STALE`). Этот процесс
+может занимать время и не должен блокировать быстрый healthcheck боевого xray.
+
+На уровне реализации это могут быть потоки/задачи внутри одного daemon-процесса,
+а не отдельные OS-процессы. Важнее не способ запуска, а разделение обязанностей
+и синхронизация доступа к общему состоянию.
+
+### Слоты конфигурации
+
+В нормальном состоянии демон стремится держать два рабочих слота:
+
+- `active_slot` — сервер и production-конфиг, который сейчас применён в xray.
+- `standby_slot` — другой сервер и production-конфиг, который прошёл проверку,
+  но ещё не применён.
+
+`standby_slot` хранит не только JSON-конфиг, но и метаданные:
+
+- ключ сервера (`server.key()`), страна, display name;
+- время подготовки (`created_at`) и последней успешной проверки (`last_ok_at`);
+- время перехода из `READY` в `PRE_STALE` (`pre_stale_at`) и окончательный
+  срок годности (`expires_at`);
+- hash/fingerprint входов, из которых собран конфиг: сервер, `routing.json`,
+  `direct.lst`, `config.tmpl`, geo-набор, service `XRAY_LOCATION_ASSET`;
+- статус слота: `EMPTY`, `READY`, `PRE_STALE`, `PROMOTING`, `STALE`.
+
+Если routing, geo-файлы, шаблон, подписка или service-env изменились так, что
+fingerprint больше не совпадает, standby нельзя использовать как fast path: он
+становится `STALE`, а Standby Worker должен подготовить новый.
+
+Для защиты от гонок у standby-подготовки есть generation/epoch. Любое изменение
+входов standby (`subscription`, geo/routing/template/service-env invalidation)
+инкрементит generation. Worker захватывает текущую generation перед долгой
+проверкой кандидата и публикует результат только если generation не изменилась.
+Сам `config_text` тоже защищён fixed-point проверкой fingerprint: fingerprint
+снимается до сборки/валидации и после end-to-end проверки, и кандидат
+отбрасывается, если входы изменились в середине подготовки. Отдельный
+waiting-generation защищает от поздней promotion: если active успел
+восстановиться и вышел из `WAITING_FOR_STANDBY`, результат worker'а остаётся
+готовым standby, но не применяется автоматически.
+
+`PREPARING` не является статусом опубликованного standby slot. Это внутреннее
+состояние Standby Worker: он может долго собирать и проверять нового кандидата,
+но уже опубликованный `READY`/`PRE_STALE` slot при этом остаётся доступным для
+Active Guard.
+
+Жизненный цикл пригодного слота разделён на два интервала:
+
+- `READY` — свежий standby, promotion разрешена, refresh ещё не нужен;
+- `PRE_STALE` — refresh уже нужен, но promotion всё ещё разрешена;
+- `STALE` — fast promotion запрещена, нужен новый проверенный standby.
+
+### Синхронизация и персистентность
+
+Общее состояние слотов должно обновляться под одним lock. Для связи между
+контурами достаточно `Condition`/`Event` внутри daemon-процесса:
+
+- Standby Worker публикует `standby_slot=READY` и отправляет `StandbyReady`;
+- Active Guard реагирует на `StandbyReady`, если всё ещё находится в
+  `WAITING_FOR_STANDBY`; параллельный cold fallback может восстановить active
+  раньше;
+- после promotion Active Guard очищает standby slot и отправляет worker'у
+  wakeup на подготовку следующего резерва;
+- refresh подписки bump'ит generation для in-flight worker'ов, но сохраняет
+  опубликованный standby, если endpoint остался в новом ranked и fingerprint
+  совпадает; geo-update и rebuild routing/template инвалидируют standby через
+  fingerprint и тоже будят Standby Worker.
+
+Персистентный `state/standby.json` полезен как cache между рестартами, но не
+должен быть безусловным источником истины. При старте демон может загрузить
+standby snapshot, проверить fingerprint/TTL и, если нужно, быстро перепроверить
+его end-to-end перед переводом в `READY`. Если проверка не пройдена — slot
+считается `EMPTY`, а Standby Worker начинает обычный подбор.
+
+### Проверка standby
+
+Standby Worker подготавливает кандидата по конвейеру. Если текущий slot перешёл
+в `PRE_STALE`, worker сначала перепроверяет именно сохранённый в slot сервер.
+Если он всё ещё проходит end-to-end проверку, slot возвращается в `READY`, а
+поиск нового сервера не запускается.
+
+1. Выбрать следующий сервер из `next_candidates()`, если slot `EMPTY`/`STALE`
+   или перепроверка `PRE_STALE` slot провалилась. Текущий active исключается.
+   Кандидаты из страны текущего active не запрещены, но понижаются в приоритете:
+   Standby Worker сначала пробует другие страны и только затем same-country
+   fallback.
+2. Выполнить быстрый `tcp_probe(candidate.address, candidate.port)`.
+3. Собрать production config тем же кодом, который будет использоваться при
+   promotion.
+4. Прогнать `xray -test` через `validate_config_for_service()`.
+5. Выполнить end-to-end проверку через временный xray:
+   - заменить inbounds на свободные локальные standby-порты, например
+     `127.0.0.1:11808` для SOCKS и `127.0.0.1:11809` для HTTP;
+   - заменить `log.access` и `log.error` на `"none"`;
+   - оставить outbound, routing, dns и geo окружение эквивалентными будущему
+     production-конфигу;
+   - запустить `xray` дочерним процессом с временным config.json;
+   - дождаться локального standby SOCKS listener;
+   - выполнить IP-check и `TARGET_CHECK_URLS` через standby SOCKS;
+   - остановить временный xray и убрать временный конфиг.
+6. Если все проверки прошли, атомарно опубликовать `standby_slot=READY` и
+   разбудить Active Guard событием `StandbyReady`.
+
+Временный xray нужен именно для end-to-end проверки: `xray -test` и TCP-проба
+не доказывают, что VLESS/TLS/Reality handshake проходит и критичные ресурсы
+доступны через конкретный сервер. Постоянно держать вторую копию xray не нужно:
+достаточно периодически запускать её на время проверки и обновлять TTL standby.
+
+Публикация нового standby сравнивает содержимое слота по `(server.key(),
+fingerprint)`. Если worker перепроверил тот же конфиг в цикле
+`READY → PRE_STALE → READY`, Telegram-уведомление не отправляется. Если slot был
+`EMPTY`/`STALE` или содержимое изменилось, отправляется `standby READY`.
+
+### Быстрый контур Active Guard
+
+Active Guard делает только дешёвые проверки:
+
+1. Проверить прямой интернет без proxy/env-переменных. Если прямой интернет
+   недоступен, ничего не переключать: это не блокировка VPN-сервера.
+2. Проверить боевой xray через SOCKS (`proxy_alive`) и критичные ресурсы
+   (`target_alive`).
+3. Проба `proxy_alive()` уже делает несколько приоритизированных попыток по
+   IP-check URL. Отдельный confirm-probe можно добавить позже, если быстрый
+   standby threshold окажется слишком чувствительным к одиночным таймаутам.
+4. Если active действительно не работает, а `standby_slot=READY` или
+   `standby_slot=PRE_STALE`, выполнить promotion.
+5. Если standby ещё `EMPTY`/`STALE`, перейти в
+   `WAITING_FOR_STANDBY`, разбудить Standby Worker и запустить осторожный
+   cold-rotation fallback. В `--once` это единственный путь реальной замены,
+   потому что Standby Worker в этом режиме не живёт фоном.
+6. Если active сам восстановился (`proxy_alive` и `target_alive` снова OK),
+   сбросить `WAITING_FOR_STANDBY`, чтобы поздний `StandbyReady` не переключил
+   здоровый active.
+
+Если standby пригоден (`READY` или `PRE_STALE`), используется отдельный быстрый порог
+`STANDBY_FAIL_THRESHOLD` (по умолчанию 1 подряд-фейл) вместо обычного
+`FAIL_THRESHOLD`. Это уменьшает время реакции: дорогой перебор уже сделан
+Standby Worker'ом заранее. `ROTATION_COOLDOWN` не задерживает promotion уже
+проверенного standby; cooldown относится только к дорогостоящему cold fallback.
+Cooldown учитывает и последнюю успешную ротацию, и последнюю попытку cold
+fallback, даже если она закончилась `no working server found`.
+
+Promotion — это не буквальный swap файлов. Старый active после блокировки
+становится `penalized`/`suspect`, а standby однонаправленно продвигается в
+active:
+
+```text
+standby_slot READY/PRE_STALE -> active_slot
+standby_slot EMPTY
+old active -> penalty/suspect
+Standby Worker wakeup -> prepare next standby
+```
+
+Promotion должна быть атомарной с точки зрения shared-state и применения
+боевого xray config:
+
+1. Под lock пометить standby как `PROMOTING`, чтобы Standby Worker не заменил
+   его во время применения.
+2. Взять общий apply-lock, который также использует cold rotation, чтобы две
+   ветки не писали `config.json` и не рестартили xray одновременно.
+3. Записать standby production-config в боевой путь `config.json`.
+4. Перезапустить xray и дождаться listener `SOCKS_HOST:SOCKS_PORT`.
+5. Выполнить быстрый post-promotion healthcheck.
+6. При успехе сохранить новый active, очистить standby slot и разбудить Standby
+   Worker для подготовки следующего резерва.
+7. Если config уже был применён, но xray не стартовал или post-promotion
+   healthcheck не прошёл, попытаться откатить `config.json` через последний
+   backup. Если rollback не удался, daemon явно помечает applied standby как
+   failed active, чтобы live-конфиг и состояние daemon не расходились молча.
+8. При ошибке promotion — штрафовать этот standby, очистить slot, вернуться в
+   `WAITING_FOR_STANDBY` или в аварийный cold-rotation fallback.
+
+### Сценарий ожидания standby
+
+Если основной сервер уже признан заблокированным, но standby ещё не готов,
+Active Guard фиксирует состояние `WAITING_FOR_STANDBY`, будит Standby Worker и
+параллельно использует cold-rotation fallback. Если worker раньше опубликует
+`READY`, Active Guard может забрать standby в promotion после повторной проверки
+active; если быстрее найдётся кандидат через cold rotation, active обновляется
+прежним осторожным путём.
+
+Когда Standby Worker публикует новый `READY` slot, он отправляет событие
+`StandbyReady`. Если Active Guard всё ещё находится в `WAITING_FOR_STANDBY`, он
+перепроверяет, что active всё ещё не доставляет трафик, и только затем забирает
+этот standby в promotion. Если active уже восстановился, waiting-state
+сбрасывается, а опубликованный standby остаётся готовым. Standby Worker после
+promotion продолжает работу и подбирает следующий резерв, пока снова не
+восстановится целевое состояние: `active_slot` работает, `standby_slot=READY`.
+Если в waiting-режиме кандидаты подряд проваливают подготовку, worker делает
+один проход по списку без повторов, затем ждёт `STANDBY_RETRY_INTERVAL` или
+нового wakeup-события.
+
+Telegram-уведомления standby намеренно отправляются только при полезном
+изменении содержимого slot: новый usable standby после `EMPTY`/`STALE` или
+замена сервера/fingerprint. Внутренние события Standby Worker (`PREPARING`,
+`VALIDATING`, плановый refresh того же slot) остаются в логах.
+
+### Инварианты
+
+- Active Guard применяет standby только если slot `READY` или `PRE_STALE`.
+- Standby Worker никогда не выбирает текущий active как standby.
+- При `PRE_STALE` Standby Worker сначала перепроверяет текущий standby slot и
+  возвращает его в `READY`, если он всё ещё работает.
+- Standby Worker понижает приоритет страны текущего active только при реальной
+  замене standby: другой endpoint в той же стране допустим как fallback.
+- Старый active после сбоя не становится standby автоматически.
+- `standby_slot=READY` всегда означает, что конфиг прошёл `xray -test` и
+  end-to-end проверку через временный xray.
+- `standby_slot=PRE_STALE` всё ещё можно promoted; это сигнал worker'у
+  подготовить свежую замену без потери fast path.
+- Любое изменение geo/routing/template/service-env инвалидирует standby через
+  fingerprint.
+- Refresh подписки сохраняет usable standby, если сервер всё ещё присутствует
+  в ranked и fingerprint совпадает; если сервер удалён из подписки, slot
+  инвалидируется.
+- Подготовка нового кандидата не очищает текущий usable standby slot.
+- Результат подготовки standby, начатой на старой generation, не публикуется и
+  не штрафует кандидата.
+- Promotion забирает standby под lock, явно помечает `PROMOTING` на всё время
+  применения и через общий apply-lock не допускает параллельной записи
+  `config.json` со стороны cold rotation.
+- Если promotion не удалась, кандидат штрафуется и не переиспользуется без
+  новой проверки.
+- Standby Worker не штрафует кандидата, если за время проверки он стал текущим
+  active.
+- При отсутствии готового standby сохраняется текущий fail-safe принцип:
+  не публиковать непроверенный конфиг только ради скорости.
+
+### Отношение к текущей cold rotation
+
+Текущая `_rotate_until_working()` остаётся полезной как fallback: при пустом
+standby, ошибке promotion или первом запуске без подготовленного резерва демон
+может использовать прежний осторожный перебор кандидатов. Однако штатный путь
+после внедрения standby должен быть таким:
+
+1. Standby Worker заранее держит `standby_slot=READY` или `PRE_STALE`.
+2. Active Guard при блокировке делает быструю promotion.
+3. Standby Worker сразу готовит новый standby.
+
+Так достигается целевая конфигурация: два рабочих конфига одновременно известны
+xproxy, один применён в xray, второй проверен и готов к применению.
 
 ## Что дальше (возможные улучшения)
 

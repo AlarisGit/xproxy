@@ -61,8 +61,29 @@ def apply_server(server: Server, *, dry_run: bool = False,
     Если сгенерированный конфиг совпадает с текущим на диске — поднимает
     ConfigUnchanged (xray не перезагружается, соединения не рвутся).
     """
-    info = info or detect_platform()
     cfg_text = build_xray_config_text(server)
+    apply_config_text(
+        cfg_text,
+        label=f"{_fmt_server(server)}, {server.country}",
+        dry_run=dry_run,
+        info=info,
+    )
+
+
+def apply_config_text(
+    cfg_text: str,
+    *,
+    label: str = "prepared config",
+    dry_run: bool = False,
+    info: PlatformInfo | None = None,
+) -> None:
+    """Провалидировать, записать готовый config.json и перезапустить xray.
+
+    Используется для standby promotion: конфиг уже был собран и проверен
+    заранее, но перед публикацией всё равно прогоняем production validation,
+    чтобы не применить устаревший или несовместимый snapshot.
+    """
+    info = info or detect_platform()
 
     # 1. Валидация: xray -test на временном файле. Сначала проверяем конфиг
     # на asset-каталоге xproxy, затем повторяем тест в окружении продового
@@ -73,7 +94,7 @@ def apply_server(server: Server, *, dry_run: bool = False,
     if not ok:
         short = err.strip().splitlines()[-1] if err.strip() else "unknown error"
         raise XrayConfigError(
-            f"xray -test failed for {_fmt_server(server)}: {short}"
+            f"xray -test failed for {label}: {short}"
         )
 
     # 2. Diff: если конфиг не изменился — не трогаем xray.
@@ -82,9 +103,9 @@ def apply_server(server: Server, *, dry_run: bool = False,
     # маскировать.
     if not dry_run and _config_matches_current(cfg_text, info):
         log.info("config unchanged, skip write+restart (%s)",
-                 _fmt_server(server))
+                 label)
         raise ConfigUnchanged(
-            f"config for {_fmt_server(server)} is identical to current"
+            f"config for {label} is identical to current"
         )
 
     if dry_run:
@@ -98,12 +119,16 @@ def apply_server(server: Server, *, dry_run: bool = False,
     except Exception as exc:  # noqa: BLE001
         log.warning("config backup skipped: %s", exc)
 
-    log.info("write xray config → %s (%s, %s)",
-             info.xray_config, _fmt_server(server), server.country)
+    log.info("write xray config → %s (%s)", info.xray_config, label)
     write_xray_config(cfg_text, info)
 
     log.info("restart xray: %s", " ".join(info.restart_cmd))
-    _platform_restart(info)
+    try:
+        _platform_restart(info)
+    except Exception as exc:  # noqa: BLE001
+        msg = f"xray restart failed after writing config for {label}: {exc}"
+        log.error(msg)
+        raise XrayStartError(msg) from exc
 
     if wait_for_proxy_port():
         log.info("xray listener ready on %s:%d", SOCKS_HOST, SOCKS_PORT)
@@ -336,10 +361,15 @@ def restore_backup(info: PlatformInfo | None = None) -> bool:
     return wait_for_proxy_port()
 
 
-def wait_for_proxy_port(timeout: float = BOOT_GRACE) -> bool:
+def wait_for_proxy_port(
+    timeout: float = BOOT_GRACE,
+    *,
+    host: str = SOCKS_HOST,
+    port: int = SOCKS_PORT,
+) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if _port_open(SOCKS_HOST, SOCKS_PORT):
+        if _port_open(host, port):
             return True
         time.sleep(0.25)
     return False

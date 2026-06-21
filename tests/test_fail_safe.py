@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -439,6 +440,1115 @@ class FailSafeTests(unittest.TestCase):
 
         self.assertEqual(apply_mock.call_count, 1)
         self.assertEqual(d.state.penalized_keys(), {})
+
+    def test_proxy_alive_uses_custom_socks_endpoint(self) -> None:
+        from xproxy import healthcheck
+
+        with mock.patch.object(healthcheck, "_any_probe",
+                               return_value="203.0.113.1") as any_probe:
+            ok = healthcheck.proxy_alive(
+                socks_host="127.0.0.1",
+                socks_port=11808,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            any_probe.call_args.kwargs["proxies"],
+            {
+                "http": "socks5h://127.0.0.1:11808",
+                "https": "socks5h://127.0.0.1:11808",
+            },
+        )
+
+    def test_standby_test_config_rewrites_inbounds_and_logs(self) -> None:
+        import json
+        from xproxy.standby import build_standby_test_config_text
+
+        prod = json.dumps({
+            "log": {
+                "access": "/var/log/xray/access.log",
+                "error": "/var/log/xray/error.log",
+            },
+            "inbounds": [
+                {
+                    "tag": "socks-in",
+                    "listen": "0.0.0.0",
+                    "port": 10808,
+                    "protocol": "socks",
+                    "settings": {"auth": "noauth"},
+                },
+                {
+                    "tag": "http-in",
+                    "listen": "0.0.0.0",
+                    "port": 10809,
+                    "protocol": "http",
+                    "settings": {"timeout": 300},
+                },
+            ],
+            "outbounds": [],
+        })
+
+        test_text = build_standby_test_config_text(
+            prod,
+            socks_port=11808,
+            http_port=11809,
+        )
+        cfg = json.loads(test_text)
+
+        self.assertEqual(cfg["log"]["access"], "none")
+        self.assertEqual(cfg["log"]["error"], "none")
+        ports = {i["tag"]: i["port"] for i in cfg["inbounds"]}
+        listens = {i["tag"]: i["listen"] for i in cfg["inbounds"]}
+        self.assertEqual(ports["socks-in"], 11808)
+        self.assertEqual(ports["http-in"], 11809)
+        self.assertEqual(listens["socks-in"], "127.0.0.1")
+        self.assertEqual(listens["http-in"], "127.0.0.1")
+
+    def test_pre_stale_standby_is_usable_but_needs_refresh(self) -> None:
+        from xproxy.standby import PreparedStandby
+
+        srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now - 120,
+            last_ok_at=now - 120,
+            pre_stale_at=now - 1,
+            expires_at=now + 60,
+        )
+
+        self.assertEqual(prepared.lifecycle_state(), "PRE_STALE")
+        self.assertFalse(prepared.is_ready())
+        self.assertTrue(prepared.is_usable())
+        self.assertTrue(prepared.needs_refresh())
+
+    def test_prepare_standby_rejects_fingerprint_drift(self) -> None:
+        from xproxy import standby
+        from xproxy.standby import StandbyError
+
+        srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+
+        with mock.patch.object(standby, "tcp_probe", return_value=True), \
+                mock.patch.object(standby, "build_xray_config_text",
+                                  return_value='{"inbounds":[],"outbounds":[]}'), \
+                mock.patch.object(standby, "validate_config_for_service",
+                                  return_value=(True, "ok")), \
+                mock.patch.object(standby, "validate_standby_end_to_end"), \
+                mock.patch.object(standby, "standby_fingerprint",
+                                  side_effect=["before", "after"]):
+            with self.assertRaisesRegex(StandbyError, "inputs changed"):
+                standby.prepare_standby(srv)
+
+    def test_pre_stale_standby_is_revalidated_before_replacement_search(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        replacement = Server(
+            uri="replacement",
+            protocol="vless",
+            uuid="33333333-3333-3333-3333-333333333333",
+            host="replacement.example.com",
+            port=443,
+            country="Replacement",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now - 120,
+            last_ok_at=now - 120,
+            pre_stale_at=now - 1,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+        d.state.ranked = [active, standby_srv, replacement]
+        d._standby = prepared
+        d._standby_last_attempt = 0
+
+        with d._standby_cond:
+            candidate = d._select_standby_candidate_locked()
+
+        self.assertEqual(candidate, standby_srv)
+        self.assertIs(d._standby, prepared)
+        self.assertTrue(d._standby.is_usable())
+
+    def test_failed_current_standby_revalidation_discards_slot(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now - 120,
+            last_ok_at=now - 120,
+            pre_stale_at=now - 1,
+            expires_at=now + 60,
+            status="PRE_STALE",
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+        d._standby_last_attempt = time.time()
+
+        with d._standby_cond:
+            discarded = d._discard_current_standby_locked(
+                standby_srv,
+                "test failure",
+            )
+
+        self.assertTrue(discarded)
+        self.assertIsNone(d._standby)
+        self.assertEqual(d._standby_last_attempt, 0)
+
+    def test_stale_generation_standby_publish_is_discarded(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 60,
+            expires_at=now + 120,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby_generation = 2
+
+        with mock.patch.object(daemon, "notify") as notify_mock:
+            with d._standby_cond:
+                published = d._publish_standby_locked(prepared, generation=1)
+
+        self.assertFalse(published)
+        self.assertIsNone(d._standby)
+        notify_mock.assert_not_called()
+
+    def test_penalty_is_skipped_for_active_server(self) -> None:
+        from xproxy import daemon
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+
+        penalized = d._penalize_if_not_active(active, "test")
+
+        self.assertFalse(penalized)
+        self.assertEqual(d.state.penalized_keys(), {})
+
+    def test_standby_candidate_prefers_country_different_from_active(self) -> None:
+        from xproxy import daemon
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Germany",
+        )
+        same_country = Server(
+            uri="same-country",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="same-country.example.com",
+            port=443,
+            country="Germany",
+        )
+        other_country = Server(
+            uri="other-country",
+            protocol="vless",
+            uuid="33333333-3333-3333-3333-333333333333",
+            host="other-country.example.com",
+            port=443,
+            country="Austria",
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+        d.state.ranked = [same_country, other_country]
+        d._standby_last_attempt = 0
+
+        with d._standby_cond:
+            candidate = d._select_standby_candidate_locked()
+
+        self.assertEqual(candidate, other_country)
+
+    def test_standby_candidate_falls_back_to_active_country(self) -> None:
+        from xproxy import daemon
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Germany",
+        )
+        same_country = Server(
+            uri="same-country",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="same-country.example.com",
+            port=443,
+            country="Germany",
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+        d.state.ranked = [same_country]
+        d._standby_last_attempt = 0
+
+        with d._standby_cond:
+            candidate = d._select_standby_candidate_locked()
+
+        self.assertEqual(candidate, same_country)
+
+    def test_same_standby_slot_refresh_is_not_notified(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        previous = PreparedStandby(
+            server=srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now - 120,
+            last_ok_at=now - 120,
+            pre_stale_at=now - 1,
+            expires_at=now + 60,
+            status="PRE_STALE",
+        )
+        refreshed = PreparedStandby(
+            server=srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 60,
+            expires_at=now + 120,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = previous
+
+        with mock.patch.object(daemon, "notify") as notify_mock:
+            with d._standby_cond:
+                d._publish_standby_locked(refreshed)
+
+        self.assertIs(d._standby, refreshed)
+        notify_mock.assert_not_called()
+
+    def test_standby_slot_replacement_is_notified(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        old_srv = Server(
+            uri="old",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="old.example.com",
+            port=443,
+            country="Old",
+        )
+        new_srv = Server(
+            uri="new",
+            protocol="vless",
+            uuid="33333333-3333-3333-3333-333333333333",
+            host="new.example.com",
+            port=443,
+            country="New",
+        )
+        now = time.time()
+        previous = PreparedStandby(
+            server=old_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="old-fingerprint",
+            created_at=now - 120,
+            last_ok_at=now - 120,
+            pre_stale_at=now - 1,
+            expires_at=now + 60,
+            status="PRE_STALE",
+        )
+        replacement = PreparedStandby(
+            server=new_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="new-fingerprint",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 60,
+            expires_at=now + 120,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = previous
+
+        with mock.patch.object(daemon, "notify") as notify_mock:
+            with d._standby_cond:
+                d._publish_standby_locked(replacement)
+
+        messages = [call.args[0] for call in notify_mock.call_args_list]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("🟢 standby READY: New (new.example.com:443)", messages[0])
+        self.assertIn("replaced=Old (old.example.com:443)", messages[0])
+
+    def test_daemon_promotes_ready_standby(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+        d._standby = prepared
+
+        with mock.patch.object(daemon, "standby_fingerprint", return_value="fp"), \
+                mock.patch.object(daemon, "apply_config_text") as apply_mock, \
+                mock.patch.object(daemon, "proxy_alive", return_value=True), \
+                mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
+                mock.patch.object(daemon, "notify") as notify_mock, \
+                mock.patch("xproxy.state._save_active"):
+            promoted = d._promote_standby("test-reason")
+
+        self.assertTrue(promoted)
+        apply_mock.assert_called_once()
+        self.assertEqual(d.state.active, standby_srv)
+        self.assertIsNone(d._standby)
+        messages = [call.args[0] for call in notify_mock.call_args_list]
+        self.assertIn(
+            "🔄 standby PROMOTING: Standby (standby.example.com:443) "
+            "reason=test-reason — from=READY",
+            messages,
+        )
+        self.assertIn(
+            "🔄 active PROMOTING: Active (active.example.com:443) "
+            "reason=test-reason — next=Standby (standby.example.com:443)",
+            messages,
+        )
+        self.assertIn(
+            "🔄 standby promoted Active → Standby (standby.example.com:443) "
+            "reason=test-reason",
+            messages,
+        )
+        self.assertIn(
+            "🟢 active OK: Standby (standby.example.com:443) "
+            "reason=promoted:test-reason",
+            messages,
+        )
+        self.assertFalse(any("standby EMPTY" in msg for msg in messages))
+
+    def test_daemon_promotes_pre_stale_standby(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now - 120,
+            last_ok_at=now - 120,
+            pre_stale_at=now - 1,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+        d._standby = prepared
+
+        with mock.patch.object(daemon, "standby_fingerprint", return_value="fp"), \
+                mock.patch.object(daemon, "apply_config_text") as apply_mock, \
+                mock.patch.object(daemon, "proxy_alive", return_value=True), \
+                mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
+                mock.patch.object(daemon, "notify") as notify_mock, \
+                mock.patch("xproxy.state._save_active"):
+            promoted = d._promote_standby("test-reason")
+
+        self.assertTrue(promoted)
+        apply_mock.assert_called_once()
+        messages = [call.args[0] for call in notify_mock.call_args_list]
+        self.assertIn(
+            "🔄 standby PROMOTING: Standby (standby.example.com:443) "
+            "reason=test-reason — from=PRE_STALE",
+            messages,
+        )
+
+    def test_ready_standby_promotion_bypasses_rotation_cooldown(self) -> None:
+        from xproxy import daemon
+        from xproxy.settings import STANDBY_FAIL_THRESHOLD
+
+        d = daemon.Daemon(dry_run=False)
+        d.state.last_rotation = time.time()
+
+        with mock.patch.object(daemon, "is_running", return_value=True), \
+                mock.patch.object(daemon, "internet_alive", return_value=True), \
+                mock.patch.object(daemon, "proxy_alive", return_value=False), \
+                mock.patch.object(d, "_standby_ready_for_fast_path",
+                                  return_value=True), \
+                mock.patch.object(d, "_handle_rotation_needed") as handle_mock:
+            d.tick_health()
+
+        self.assertEqual(d.state.consecutive_proxy_failures, STANDBY_FAIL_THRESHOLD)
+        handle_mock.assert_called_once_with(reason="proxy-failing")
+
+    def test_standby_promotion_bypasses_cold_rotation_cooldown(self) -> None:
+        from xproxy import daemon
+
+        d = daemon.Daemon(dry_run=False)
+        d.state.last_rotation = time.time()
+        d._last_cold_rotation_attempt = time.time()
+
+        with mock.patch.object(d, "_promote_standby", return_value=True) as promote_mock, \
+                mock.patch.object(d, "_enter_waiting_for_standby") as waiting_mock, \
+                mock.patch.object(d, "_rotate_until_working") as rotate_mock:
+            d._handle_rotation_needed("proxy-failing")
+
+        promote_mock.assert_called_once_with("proxy-failing")
+        waiting_mock.assert_not_called()
+        rotate_mock.assert_not_called()
+
+    def test_active_failure_without_standby_uses_cold_rotation_fallback(self) -> None:
+        from xproxy import daemon
+
+        d = daemon.Daemon(dry_run=False)
+        d.state.consecutive_proxy_failures = 5
+
+        with mock.patch.object(d, "_promote_standby", return_value=False), \
+                mock.patch.object(d, "_enter_waiting_for_standby") as waiting_mock, \
+                mock.patch.object(d, "_rotate_until_working") as rotate_mock:
+            d._handle_rotation_needed("proxy-failing")
+
+        waiting_mock.assert_called_once_with("proxy-failing")
+        rotate_mock.assert_called_once_with(reason="proxy-failing")
+
+    def test_cold_rotation_fallback_respects_recent_attempt_cooldown(self) -> None:
+        from xproxy import daemon
+
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        d._last_cold_rotation_attempt = time.time()
+        d.state.consecutive_proxy_failures = 5
+
+        with mock.patch.object(d, "_promote_standby", return_value=False), \
+                mock.patch.object(d, "_enter_waiting_for_standby") as waiting_mock, \
+                mock.patch.object(d, "_rotate_until_working") as rotate_mock:
+            d._handle_rotation_needed("proxy-failing")
+
+        waiting_mock.assert_called_once_with("proxy-failing")
+        rotate_mock.assert_not_called()
+
+    def test_cold_rotation_fallback_respects_recent_successful_rotation(self) -> None:
+        from xproxy import daemon
+
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        d.state.last_rotation = time.time()
+        d.state.consecutive_proxy_failures = 5
+
+        with mock.patch.object(d, "_promote_standby", return_value=False), \
+                mock.patch.object(d, "_enter_waiting_for_standby") as waiting_mock, \
+                mock.patch.object(d, "_rotate_until_working") as rotate_mock:
+            d._handle_rotation_needed("target-blocked")
+
+        waiting_mock.assert_called_once_with("target-blocked")
+        rotate_mock.assert_not_called()
+
+    def test_xray_not_running_bypasses_cold_rotation_cooldown(self) -> None:
+        from xproxy import daemon
+
+        d = daemon.Daemon(dry_run=False)
+        d._last_cold_rotation_attempt = time.time()
+        d.state.last_rotation = time.time()
+
+        with mock.patch.object(d, "_promote_standby", return_value=False), \
+                mock.patch.object(d, "_enter_waiting_for_standby") as waiting_mock, \
+                mock.patch.object(d, "_rotate_until_working") as rotate_mock:
+            d._handle_rotation_needed("xray-not-running")
+
+        waiting_mock.assert_called_once_with("xray-not-running")
+        rotate_mock.assert_called_once_with(reason="xray-not-running")
+
+    def test_active_recovery_clears_waiting_for_standby(self) -> None:
+        from xproxy import daemon
+
+        d = daemon.Daemon(dry_run=False)
+        d.state.consecutive_proxy_failures = 3
+        with d._standby_cond:
+            d._active_waiting_for_standby = True
+            d._active_waiting_reason = "proxy-failing"
+            d._active_waiting_generation = 7
+
+        with mock.patch.object(daemon, "is_running", return_value=True), \
+                mock.patch.object(daemon, "proxy_alive", return_value=True), \
+                mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
+                mock.patch.object(daemon, "notify"):
+            d.tick_health(has_internet=True)
+
+        self.assertFalse(d._active_waiting_for_standby)
+        self.assertEqual(d._active_waiting_reason, "")
+        self.assertEqual(d._active_waiting_generation, 8)
+        self.assertEqual(d.state.consecutive_proxy_failures, 0)
+
+    def test_stale_wait_generation_does_not_promote_standby(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+        d._active_waiting_for_standby = False
+        d._active_waiting_generation = 2
+
+        with mock.patch.object(daemon, "apply_config_text") as apply_mock:
+            promoted = d._promote_standby(
+                "standby-ready",
+                expected_wait_generation=1,
+                require_active_failure=True,
+            )
+
+        self.assertFalse(promoted)
+        apply_mock.assert_not_called()
+        self.assertIs(d._standby, prepared)
+
+    def test_worker_promotion_recheck_keeps_ready_standby_if_active_recovered(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+        d._active_waiting_for_standby = True
+        d._active_waiting_reason = "proxy-failing"
+        d._active_waiting_generation = 1
+
+        with mock.patch.object(daemon, "is_running", return_value=True), \
+                mock.patch.object(daemon, "internet_alive", return_value=True), \
+                mock.patch.object(daemon, "proxy_alive", return_value=True), \
+                mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
+                mock.patch.object(daemon, "apply_config_text") as apply_mock:
+            promoted = d._promote_standby(
+                "proxy-failing",
+                expected_wait_generation=1,
+                require_active_failure=True,
+            )
+
+        self.assertFalse(promoted)
+        apply_mock.assert_not_called()
+        self.assertIs(d._standby, prepared)
+        self.assertFalse(d._active_waiting_for_standby)
+
+    def test_promotion_in_progress_blocks_health_rotation(self) -> None:
+        from xproxy import daemon
+
+        d = daemon.Daemon(dry_run=False)
+        d._promotion_in_progress = True
+
+        with mock.patch.object(d, "_promote_standby") as promote_mock, \
+                mock.patch.object(d, "_enter_waiting_for_standby") as waiting_mock, \
+                mock.patch.object(d, "_rotate_until_working") as rotate_mock:
+            d._handle_rotation_needed("xray-not-running")
+
+        promote_mock.assert_not_called()
+        waiting_mock.assert_not_called()
+        rotate_mock.assert_not_called()
+
+    def test_stale_proxy_failure_request_after_switch_does_not_enter_waiting(self) -> None:
+        from xproxy import daemon
+
+        d = daemon.Daemon(dry_run=False)
+        d.state.consecutive_proxy_failures = 5
+
+        def promote_side_effect(_reason: str) -> bool:
+            d.state.note_proxy_ok()
+            return False
+
+        with mock.patch.object(d, "_promote_standby",
+                               side_effect=promote_side_effect), \
+                mock.patch.object(d, "_enter_waiting_for_standby") as waiting_mock, \
+                mock.patch.object(d, "_rotate_until_working") as rotate_mock:
+            d._handle_rotation_needed("proxy-failing")
+
+        waiting_mock.assert_not_called()
+        rotate_mock.assert_not_called()
+
+    def test_stale_xray_not_running_request_after_recovery_does_not_rotate(self) -> None:
+        from xproxy import daemon
+
+        d = daemon.Daemon(dry_run=False)
+
+        with mock.patch.object(d, "_promote_standby", return_value=False), \
+                mock.patch.object(daemon, "is_running", return_value=True), \
+                mock.patch.object(d, "_enter_waiting_for_standby") as waiting_mock, \
+                mock.patch.object(d, "_rotate_until_working") as rotate_mock:
+            d._handle_rotation_needed("xray-not-running")
+
+        waiting_mock.assert_not_called()
+        rotate_mock.assert_not_called()
+
+    def test_promotion_flag_is_visible_during_apply(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+        d._standby = prepared
+
+        def apply_side_effect(*_args, **_kwargs):
+            self.assertTrue(d._promotion_in_progress)
+            with mock.patch.object(d, "_rotate_until_working") as rotate_mock:
+                d._handle_rotation_needed("xray-not-running")
+            rotate_mock.assert_not_called()
+
+        with mock.patch.object(daemon, "standby_fingerprint", return_value="fp"), \
+                mock.patch.object(daemon, "apply_config_text",
+                                  side_effect=apply_side_effect), \
+                mock.patch.object(daemon, "proxy_alive", return_value=True), \
+                mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
+                mock.patch.object(daemon, "notify"), \
+                mock.patch("xproxy.state._save_active"):
+            promoted = d._promote_standby("proxy-failing")
+
+        self.assertTrue(promoted)
+        self.assertFalse(d._promotion_in_progress)
+
+    def test_waiting_standby_selection_backs_off_after_candidate_pass(self) -> None:
+        from xproxy import daemon
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        one = Server(
+            uri="one",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="one.example.com",
+            port=443,
+            country="One",
+        )
+        two = Server(
+            uri="two",
+            protocol="vless",
+            uuid="33333333-3333-3333-3333-333333333333",
+            host="two.example.com",
+            port=443,
+            country="Two",
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.set_ranked([active, one, two])
+        d.state.active = active
+        d._active_waiting_for_standby = True
+        d._active_waiting_generation = 3
+        d._standby_waiting_generation = 3
+
+        with d._standby_cond:
+            self.assertEqual(d._select_standby_candidate_locked(), one)
+            self.assertEqual(d._select_standby_candidate_locked(), two)
+            self.assertIsNone(d._select_standby_candidate_locked())
+
+    def test_subscription_refresh_preserves_matching_standby_slot(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+        d._standby_generation = 4
+
+        with mock.patch.object(daemon, "standby_fingerprint", return_value="fp"):
+            with d._standby_cond:
+                d._sync_standby_after_ranked_refresh_locked([standby_srv])
+
+        self.assertIs(d._standby, prepared)
+        self.assertEqual(d._standby_generation, 5)
+
+    def test_subscription_refresh_discards_removed_standby_slot(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        replacement = Server(
+            uri="replacement",
+            protocol="vless",
+            uuid="33333333-3333-3333-3333-333333333333",
+            host="replacement.example.com",
+            port=443,
+            country="Replacement",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+
+        with d._standby_cond:
+            d._sync_standby_after_ranked_refresh_locked([replacement])
+
+        self.assertIsNone(d._standby)
+
+    def test_failed_post_promotion_check_rolls_back_backup(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+        d._standby = prepared
+
+        with mock.patch.object(daemon, "standby_fingerprint", return_value="fp"), \
+                mock.patch.object(daemon, "apply_config_text"), \
+                mock.patch.object(daemon, "proxy_alive", return_value=False), \
+                mock.patch.object(daemon, "restore_backup",
+                                  return_value=True) as restore_mock, \
+                mock.patch.object(daemon, "notify"), \
+                mock.patch("xproxy.state._save_active"):
+            promoted = d._promote_standby("test-reason")
+
+        self.assertFalse(promoted)
+        restore_mock.assert_called_once_with(d.platform)
+        self.assertEqual(d.state.active, active)
+        self.assertTrue(d._active_waiting_for_standby)
+
+    def test_promotion_xray_start_error_rolls_back_backup(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+        from xproxy.xray_control import XrayStartError
+
+        active = Server(
+            uri="active",
+            protocol="vless",
+            uuid="11111111-1111-1111-1111-111111111111",
+            host="active.example.com",
+            port=443,
+            country="Active",
+        )
+        standby_srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d.state.active = active
+        d._standby = prepared
+
+        with mock.patch.object(daemon, "standby_fingerprint", return_value="fp"), \
+                mock.patch.object(daemon, "apply_config_text",
+                                  side_effect=XrayStartError("restart boom")), \
+                mock.patch.object(daemon, "restore_backup",
+                                  return_value=True) as restore_mock, \
+                mock.patch.object(daemon, "notify"), \
+                mock.patch("xproxy.state._save_active"):
+            promoted = d._promote_standby("proxy-failing")
+
+        self.assertFalse(promoted)
+        restore_mock.assert_called_once_with(d.platform)
+        self.assertEqual(d.state.active, active)
+        self.assertTrue(d._active_waiting_for_standby)
+
+    def test_restart_failure_after_config_write_is_xray_start_error(self) -> None:
+        from xproxy import xray_control
+        from xproxy.platform_utils import PlatformInfo
+        from xproxy.xray_control import XrayStartError
+
+        info = PlatformInfo(
+            name="linux",
+            xray_config=Path("/tmp/xray-config.json"),
+            restart_cmd=["systemctl", "restart", "xray"],
+            needs_sudo_write=False,
+        )
+
+        with mock.patch.object(xray_control, "validate_config_for_service",
+                               return_value=(True, "")), \
+                mock.patch.object(xray_control, "_config_matches_current",
+                                  return_value=False), \
+                mock.patch.object(xray_control, "_backup_current_config"), \
+                mock.patch.object(xray_control, "write_xray_config") as write_mock, \
+                mock.patch.object(xray_control, "_platform_restart",
+                                  side_effect=RuntimeError("restart boom")) as restart_mock:
+            with self.assertRaisesRegex(
+                XrayStartError,
+                "restart failed after writing config",
+            ):
+                xray_control.apply_config_text(
+                    '{"inbounds":[],"outbounds":[]}',
+                    label="standby test",
+                    info=info,
+                )
+
+        write_mock.assert_called_once()
+        restart_mock.assert_called_once_with(info)
+
+    def test_state_machine_notifications_are_deduplicated(self) -> None:
+        from xproxy import daemon
+
+        srv = Server(
+            uri="standby",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="standby.example.com",
+            port=443,
+            country="Standby",
+        )
+        d = daemon.Daemon(dry_run=False)
+
+        with mock.patch.object(daemon, "notify") as notify_mock:
+            d._notify_standby_state("READY", server=srv, detail="ttl=60s")
+            d._notify_standby_state("READY", server=srv, detail="ttl=60s")
+            d._notify_active_state("WAITING_FOR_STANDBY", server=srv,
+                                   reason="proxy-failing", urgent=True)
+            d._notify_active_state("WAITING_FOR_STANDBY", server=srv,
+                                   reason="proxy-failing", urgent=True)
+
+        self.assertEqual(notify_mock.call_count, 2)
 
 
 if __name__ == "__main__":

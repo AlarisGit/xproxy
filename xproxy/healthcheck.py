@@ -72,8 +72,8 @@ def _any_probe(urls: Iterable[str], proxies: Optional[dict],
     return None
 
 
-def _socks_proxies() -> dict:
-    socks = f"socks5h://{SOCKS_HOST}:{SOCKS_PORT}"
+def _socks_proxies(host: str = SOCKS_HOST, port: int = SOCKS_PORT) -> dict:
+    socks = f"socks5h://{host}:{port}"
     return {"http": socks, "https": socks}
 
 
@@ -82,9 +82,16 @@ def internet_alive() -> bool:
     return _any_probe(IP_CHECK_URLS, proxies=None) is not None
 
 
-def proxy_alive() -> bool:
+def proxy_alive(
+    *,
+    socks_host: str = SOCKS_HOST,
+    socks_port: int = SOCKS_PORT,
+) -> bool:
     """Живой ли xray-прокси."""
-    return _any_probe(IP_CHECK_URLS, proxies=_socks_proxies()) is not None
+    return _any_probe(
+        IP_CHECK_URLS,
+        proxies=_socks_proxies(socks_host, socks_port),
+    ) is not None
 
 
 def public_ips() -> tuple[Optional[str], Optional[str]]:
@@ -136,7 +143,11 @@ def _target_probe(session: requests.Session, url: str) -> Optional[str]:
     return f"{resp.status_code}"
 
 
-def target_alive() -> tuple[bool, str]:
+def target_alive(
+    *,
+    socks_host: str = SOCKS_HOST,
+    socks_port: int = SOCKS_PORT,
+) -> tuple[bool, str]:
     """Проверка доступности целевых ресурсов через прокси.
 
     Возвращает (ok, detail):
@@ -148,7 +159,7 @@ def target_alive() -> tuple[bool, str]:
     if not TARGET_CHECK_URLS:
         return True, ""
 
-    proxies = _socks_proxies()
+    proxies = _socks_proxies(socks_host, socks_port)
     session = _make_session(proxies)
     for url in TARGET_CHECK_URLS:
         result = _target_probe(session, url)
