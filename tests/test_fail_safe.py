@@ -1505,7 +1505,7 @@ class FailSafeTests(unittest.TestCase):
         self.assertIs(d._standby, prepared)
         self.assertIs(d._standby.server, standby_srv)
 
-    def test_subscription_refresh_discards_same_endpoint_config_change(self) -> None:
+    def test_subscription_refresh_schedules_same_endpoint_config_change(self) -> None:
         from xproxy import daemon
         from xproxy.standby import PreparedStandby
 
@@ -1548,9 +1548,160 @@ class FailSafeTests(unittest.TestCase):
                 d._sync_standby_after_ranked_refresh_locked([
                     changed_same_endpoint,
                 ])
+                candidate = d._select_standby_candidate_locked()
 
+        self.assertIs(d._standby, prepared)
+        self.assertIs(d._standby_refresh_candidate, changed_same_endpoint)
+        self.assertIs(candidate, changed_same_endpoint)
+        self.assertTrue(d._standby_prepare_is_refresh)
+        notify_mock.assert_not_called()
+
+    def test_standby_refresh_candidate_failure_keeps_usable_slot(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby-old",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="shared.example.com",
+            port=443,
+            params={"security": "reality", "sni": "old.example.com"},
+            country="Standby",
+        )
+        changed_same_endpoint = Server(
+            uri="standby-new",
+            protocol="vless",
+            uuid=standby_srv.uuid,
+            host=standby_srv.host,
+            port=standby_srv.port,
+            params={"security": "reality", "sni": "new.example.com"},
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="old-fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+        d._standby_refresh_candidate = changed_same_endpoint
+
+        with d._standby_cond:
+            discarded = d._handle_prepare_failure_locked(
+                changed_same_endpoint,
+                "revalidation failed",
+                prepare_is_refresh=True,
+            )
+
+        self.assertFalse(discarded)
+        self.assertIs(d._standby, prepared)
+        self.assertTrue(d._standby.is_usable())
+        self.assertIsNone(d._standby_refresh_candidate)
+
+    def test_standby_refresh_candidate_failure_discards_unusable_slot(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby-old",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="shared.example.com",
+            port=443,
+            country="Standby",
+        )
+        changed_same_endpoint = Server(
+            uri="standby-new",
+            protocol="vless",
+            uuid=standby_srv.uuid,
+            host=standby_srv.host,
+            port=standby_srv.port,
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="old-fp",
+            created_at=now - 120,
+            last_ok_at=now - 120,
+            pre_stale_at=now - 60,
+            expires_at=now - 1,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+        d._standby_refresh_candidate = changed_same_endpoint
+        d._standby_last_attempt = time.time()
+
+        with d._standby_cond:
+            discarded = d._handle_prepare_failure_locked(
+                changed_same_endpoint,
+                "revalidation failed",
+                prepare_is_refresh=True,
+            )
+
+        self.assertTrue(discarded)
         self.assertIsNone(d._standby)
-        notify_mock.assert_called_once()
+        self.assertIsNone(d._standby_refresh_candidate)
+
+    def test_publish_standby_clears_refresh_candidate(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby-old",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="shared.example.com",
+            port=443,
+            params={"security": "reality", "sni": "old.example.com"},
+            country="Standby",
+        )
+        changed_same_endpoint = Server(
+            uri="standby-new",
+            protocol="vless",
+            uuid=standby_srv.uuid,
+            host=standby_srv.host,
+            port=standby_srv.port,
+            params={"security": "reality", "sni": "new.example.com"},
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="old-fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        refreshed = PreparedStandby(
+            server=changed_same_endpoint,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="new-fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+        d._standby_refresh_candidate = changed_same_endpoint
+
+        with mock.patch.object(daemon, "notify") as notify_mock:
+            with d._standby_cond:
+                d._publish_standby_locked(refreshed)
+
+        self.assertIs(d._standby, refreshed)
+        self.assertIsNone(d._standby_refresh_candidate)
+        notify_mock.assert_not_called()
 
     def test_subscription_refresh_discards_removed_standby_slot(self) -> None:
         from xproxy import daemon

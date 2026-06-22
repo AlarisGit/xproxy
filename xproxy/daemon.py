@@ -114,6 +114,8 @@ class Daemon:
         self._apply_lock = threading.RLock()
         self._standby: Optional[PreparedStandby] = None
         self._standby_preparing: bool = False
+        self._standby_prepare_is_refresh: bool = False
+        self._standby_refresh_candidate: Optional[Server] = None
         self._promotion_in_progress: bool = False
         self._standby_stop: bool = False
         self._standby_thread: Optional[threading.Thread] = None
@@ -798,6 +800,7 @@ class Daemon:
                      reason, _fmt(previous.server))
             previous.status = "STALE"
         self._standby = None
+        self._standby_refresh_candidate = None
         if previous is not None:
             self._notify_standby_empty_locked(reason, previous)
         self._standby_cond.notify_all()
@@ -808,6 +811,7 @@ class Daemon:
     ) -> None:
         self._standby_generation += 1
         if self._standby is None:
+            self._standby_refresh_candidate = None
             self._standby_cond.notify_all()
             return
 
@@ -823,6 +827,7 @@ class Daemon:
                      _fmt(standby.server))
             standby.status = "STALE"
             self._standby = None
+            self._standby_refresh_candidate = None
             self._notify_standby_empty_locked(
                 "subscription-removed",
                 standby,
@@ -848,6 +853,7 @@ class Daemon:
         if matched is not None:
             matched_server, matched_state = matched
             standby.server = matched_server
+            self._standby_refresh_candidate = None
             log.info("standby preserved after subscription refresh: %s state=%s "
                      "endpoint_matches=%d",
                      _fmt(matched_server), matched_state, len(endpoint_matches))
@@ -861,6 +867,7 @@ class Daemon:
                         len(endpoint_matches), exc)
             standby.status = "STALE"
             self._standby = None
+            self._standby_refresh_candidate = None
             self._notify_standby_empty_locked(
                 "subscription-fingerprint",
                 standby,
@@ -879,17 +886,62 @@ class Daemon:
             log.warning("standby fingerprint check after subscription refresh "
                         "produced no lifecycle state; invalidating slot")
             last_state = "UNKNOWN"
+
+        current_state = standby.lifecycle_state()
+        if current_state in ("READY", "PRE_STALE"):
+            same_country = [
+                server for server in endpoint_matches
+                if server.country == standby.server.country
+            ]
+            self._standby_refresh_candidate = same_country[0] \
+                if same_country else endpoint_matches[0]
+            self._standby_last_attempt = 0
+            log.info("standby config changed after subscription refresh; "
+                     "preserving current usable slot and scheduling refresh: "
+                     "%s -> %s state=%s current_state=%s endpoint_matches=%d",
+                     _fmt(standby.server),
+                     _fmt(self._standby_refresh_candidate),
+                     last_state,
+                     current_state,
+                     len(endpoint_matches))
+            self._standby_cond.notify_all()
+            return
+
         log.info("standby invalidated after subscription refresh: %s state=%s "
                  "endpoint_matches=%d",
                  _fmt(standby.server), last_state, len(endpoint_matches))
         standby.status = "STALE"
         self._standby = None
+        self._standby_refresh_candidate = None
         self._notify_standby_empty_locked(
             "subscription-refresh",
             standby,
             detail=f"state={last_state}",
         )
         self._standby_cond.notify_all()
+
+    def _handle_prepare_failure_locked(
+        self,
+        candidate: Server,
+        reason: str,
+        prepare_is_refresh: bool,
+    ) -> bool:
+        """Decide whether to discard the current standby after a prepare failure.
+
+        A failed config-refresh attempt shares the current slot's endpoint key,
+        so the usual discard-by-key path would drop a still-usable slot. When
+        refreshing and the current slot remains usable, keep it and clear the
+        pending refresh candidate instead. Returns True if the current standby
+        was discarded.
+        """
+        if prepare_is_refresh and self._standby is not None and \
+                self._standby.is_usable():
+            log.info("standby refresh candidate failed; keeping current usable "
+                     "slot: %s failed=%s reason=%s",
+                     _fmt(self._standby.server), _fmt(candidate), reason)
+            self._standby_refresh_candidate = None
+            return False
+        return self._discard_current_standby_locked(candidate, reason)
 
     def _discard_current_standby_locked(self, candidate: Server, reason: str) -> bool:
         if self._standby is None:
@@ -901,6 +953,7 @@ class Daemon:
         previous = self._standby
         previous.status = "STALE"
         self._standby = None
+        self._standby_refresh_candidate = None
         self._standby_last_attempt = 0
         self._notify_standby_empty_locked(reason, previous)
         self._standby_cond.notify_all()
@@ -926,6 +979,7 @@ class Daemon:
             previous_key = _server_key(previous.server)
 
         self._standby = prepared
+        self._standby_refresh_candidate = None
         detail = f"{prepared.ttl_detail()} slot={prepared.fingerprint[:8]}"
         same_usable_endpoint = (
             previous is not None and
@@ -961,6 +1015,7 @@ class Daemon:
                     self._standby_cond.wait(timeout=STANDBY_RETRY_INTERVAL)
                     continue
                 self._standby_preparing = True
+                prepare_is_refresh = self._standby_prepare_is_refresh
                 self._standby_last_attempt = time.time()
                 generation = self._standby_generation
 
@@ -978,9 +1033,10 @@ class Daemon:
                                  _fmt(candidate), generation, self._standby_generation)
                         discarded_current = False
                     else:
-                        discarded_current = self._discard_current_standby_locked(
+                        discarded_current = self._handle_prepare_failure_locked(
                             candidate,
                             "revalidation failed",
+                            prepare_is_refresh,
                         )
                 if active_waiting and not generation_changed:
                     self._notify_standby_state(
@@ -1011,9 +1067,10 @@ class Daemon:
                                  _fmt(candidate), generation, self._standby_generation)
                         discarded_current = False
                     else:
-                        discarded_current = self._discard_current_standby_locked(
+                        discarded_current = self._handle_prepare_failure_locked(
                             candidate,
                             f"revalidation crashed: {type(exc).__name__}",
+                            prepare_is_refresh,
                         )
                 if active_waiting and not generation_changed:
                     self._notify_standby_state(
@@ -1075,8 +1132,22 @@ class Daemon:
     def _select_standby_candidate_locked(self) -> Optional[Server]:
         if self._standby_preparing:
             return None
+        self._standby_prepare_is_refresh = False
         if self._standby is not None:
             state = self._standby.lifecycle_state()
+            if self._standby_refresh_candidate is not None:
+                if state in ("READY", "PRE_STALE"):
+                    if not self._active_waiting_for_standby and \
+                            time.time() - self._standby_last_attempt < \
+                            STANDBY_RETRY_INTERVAL:
+                        return None
+                    candidate = self._standby_refresh_candidate
+                    log.info("standby config refresh pending, preparing updated "
+                             "slot: %s (current=%s state=%s)",
+                             _fmt(candidate), _fmt(self._standby.server), state)
+                    self._standby_prepare_is_refresh = True
+                    return candidate
+                self._standby_refresh_candidate = None
             if state == "READY":
                 return None
             if state == "PRE_STALE":
@@ -1320,6 +1391,7 @@ class Daemon:
                 return False
             prepared.status = "PROMOTING"
             self._standby = None
+            self._standby_refresh_candidate = None
             self._promotion_in_progress = True
             self._clear_waiting_for_standby_locked(f"promotion-start:{reason}")
 
