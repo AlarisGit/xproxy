@@ -1456,6 +1456,102 @@ class FailSafeTests(unittest.TestCase):
         self.assertIs(d._standby, prepared)
         self.assertEqual(d._standby_generation, 5)
 
+    def test_subscription_refresh_preserves_matching_duplicate_endpoint(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby-austria",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="shared.example.com",
+            port=443,
+            params={"security": "reality", "sni": "austria.example.com"},
+            country="Austria",
+        )
+        wrong_same_endpoint = Server(
+            uri="standby-italy",
+            protocol="vless",
+            uuid=standby_srv.uuid,
+            host=standby_srv.host,
+            port=standby_srv.port,
+            params={"security": "reality", "sni": "italy.example.com"},
+            country="Italy",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="austria-fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+
+        def fake_fingerprint(server: Server, **_: object) -> str:
+            return "austria-fp" if server.country == "Austria" else "italy-fp"
+
+        with mock.patch.object(daemon, "standby_fingerprint",
+                               side_effect=fake_fingerprint):
+            with d._standby_cond:
+                d._sync_standby_after_ranked_refresh_locked([
+                    standby_srv,
+                    wrong_same_endpoint,
+                ])
+
+        self.assertIs(d._standby, prepared)
+        self.assertIs(d._standby.server, standby_srv)
+
+    def test_subscription_refresh_discards_same_endpoint_config_change(self) -> None:
+        from xproxy import daemon
+        from xproxy.standby import PreparedStandby
+
+        standby_srv = Server(
+            uri="standby-old",
+            protocol="vless",
+            uuid="22222222-2222-2222-2222-222222222222",
+            host="shared.example.com",
+            port=443,
+            params={"security": "reality", "sni": "old.example.com"},
+            country="Standby",
+        )
+        changed_same_endpoint = Server(
+            uri="standby-new",
+            protocol="vless",
+            uuid=standby_srv.uuid,
+            host=standby_srv.host,
+            port=standby_srv.port,
+            params={"security": "reality", "sni": "new.example.com"},
+            country="Standby",
+        )
+        now = time.time()
+        prepared = PreparedStandby(
+            server=standby_srv,
+            config_text='{"inbounds":[],"outbounds":[]}',
+            fingerprint="old-fp",
+            created_at=now,
+            last_ok_at=now,
+            pre_stale_at=now + 30,
+            expires_at=now + 60,
+        )
+        d = daemon.Daemon(dry_run=False)
+        d._standby = prepared
+        d._notified_standby_slot_key = standby_srv.key()
+
+        with mock.patch.object(daemon, "standby_fingerprint",
+                               return_value="new-fp"), \
+                mock.patch.object(daemon, "notify") as notify_mock:
+            with d._standby_cond:
+                d._sync_standby_after_ranked_refresh_locked([
+                    changed_same_endpoint,
+                ])
+
+        self.assertIsNone(d._standby)
+        notify_mock.assert_called_once()
+
     def test_subscription_refresh_discards_removed_standby_slot(self) -> None:
         from xproxy import daemon
         from xproxy.standby import PreparedStandby

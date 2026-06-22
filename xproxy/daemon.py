@@ -812,9 +812,13 @@ class Daemon:
             return
 
         standby = self._standby
-        by_key = {server.key(): server for server in ranked}
-        refreshed_server = by_key.get(standby.server.key())
-        if refreshed_server is None:
+        # The same endpoint can appear multiple times with different VLESS
+        # parameters, so endpoint key alone is not enough to preserve a slot.
+        endpoint_matches = [
+            server for server in ranked
+            if server.key() == standby.server.key()
+        ]
+        if not endpoint_matches:
             log.info("standby invalidated: subscription removed %s",
                      _fmt(standby.server))
             standby.status = "STALE"
@@ -826,11 +830,35 @@ class Daemon:
             self._standby_cond.notify_all()
             return
 
-        try:
-            current_fp = standby_fingerprint(refreshed_server, info=self.platform)
-        except Exception as exc:  # noqa: BLE001
+        matched: tuple[Server, str] | None = None
+        fingerprint_errors: list[Exception] = []
+        last_state: str | None = None
+        for refreshed_server in endpoint_matches:
+            try:
+                current_fp = standby_fingerprint(refreshed_server, info=self.platform)
+            except Exception as exc:  # noqa: BLE001
+                fingerprint_errors.append(exc)
+                continue
+            state = standby.lifecycle_state(current_fp)
+            last_state = state
+            if state in ("READY", "PRE_STALE"):
+                matched = (refreshed_server, state)
+                break
+
+        if matched is not None:
+            matched_server, matched_state = matched
+            standby.server = matched_server
+            log.info("standby preserved after subscription refresh: %s state=%s "
+                     "endpoint_matches=%d",
+                     _fmt(matched_server), matched_state, len(endpoint_matches))
+            self._standby_cond.notify_all()
+            return
+
+        if fingerprint_errors and len(fingerprint_errors) == len(endpoint_matches):
+            exc = fingerprint_errors[-1]
             log.warning("standby fingerprint check after subscription refresh "
-                        "failed: %s", exc)
+                        "failed for %d endpoint matches: %s",
+                        len(endpoint_matches), exc)
             standby.status = "STALE"
             self._standby = None
             self._notify_standby_empty_locked(
@@ -841,22 +869,25 @@ class Daemon:
             self._standby_cond.notify_all()
             return
 
-        state = standby.lifecycle_state(current_fp)
-        if state in ("READY", "PRE_STALE"):
-            standby.server = refreshed_server
-            log.info("standby preserved after subscription refresh: %s state=%s",
-                     _fmt(refreshed_server), state)
-            self._standby_cond.notify_all()
-            return
+        if fingerprint_errors:
+            log.warning("standby fingerprint check after subscription refresh "
+                        "failed for %d/%d endpoint matches; no matching "
+                        "fingerprint found",
+                        len(fingerprint_errors), len(endpoint_matches))
 
-        log.info("standby invalidated after subscription refresh: %s state=%s",
-                 _fmt(standby.server), state)
+        if last_state is None:
+            log.warning("standby fingerprint check after subscription refresh "
+                        "produced no lifecycle state; invalidating slot")
+            last_state = "UNKNOWN"
+        log.info("standby invalidated after subscription refresh: %s state=%s "
+                 "endpoint_matches=%d",
+                 _fmt(standby.server), last_state, len(endpoint_matches))
         standby.status = "STALE"
         self._standby = None
         self._notify_standby_empty_locked(
             "subscription-refresh",
             standby,
-            detail=f"state={state}",
+            detail=f"state={last_state}",
         )
         self._standby_cond.notify_all()
 
