@@ -80,15 +80,25 @@ python main.py --daemon           # постоянный цикл
 
 - **Старт** — `🟢 xproxy started (active: Германия (...))`
 - **Остановка** — `🛑 xproxy stopped (signal SIGTERM, last active: ...)`
-- **Ротация** — `🔄 switched Германия → Австрия (host:port) reason=proxy-failing`
-- **State-machine active/standby**:
-  - `🟢 standby READY: ... — ready_ttl=Ns usable_ttl=Ns slot=...` — standby slot перешёл из `EMPTY` в готовый endpoint или выбран другой standby endpoint;
-  - `🟠 standby EMPTY: ... reason=...` — standby slot потерял ранее готовый endpoint, готового резервного сервера сейчас нет;
-  - плановый цикл `READY → PRE_STALE → READY` или пересборка того же standby endpoint не отправляет Telegram-уведомление;
-  - `🔴 standby FAILED: ... reason=...` — promotion не прошла проверку или подбор кандидата падает, пока active уже ждёт standby;
-  - `🟠 active WAITING_FOR_STANDBY: ... reason=...` — боевой сервер признан проблемным, готового резерва пока нет;
-  - `🔄 active PROMOTING: ... — next=...` и `🔄 standby PROMOTING: ...` — начинается быстрая promotion;
-  - `🟢 active OK: ... reason=...` — активный канал снова в рабочем состоянии после recovery/switch/promotion.
+- **Глобальный статус active/standby**:
+  - демон не отправляет Telegram на каждую смену state-machine слотов
+    (`READY`, `EMPTY`, `WAITING_FOR_STANDBY`, `PROMOTING`, `OK`, `FAILED`) и
+    на сам факт ротации active-сервера, эти события остаются в логах;
+  - Telegram отправляется только при устойчивой смене агрегированного статуса
+    `active_ok/standby_ready/active_country`;
+  - если active-сервер устойчиво сменил страну, Telegram отправляется даже при
+    сохранении общего состояния `active=OK; standby=READY`; смена endpoint внутри
+    той же страны остаётся только в логах;
+  - по умолчанию нужна серия из `STATUS_NOTIFY_STABLE_SAMPLES=3` одинаковых
+    замеров с интервалом не меньше `STATUS_NOTIFY_SAMPLE_INTERVAL=30` секунд;
+  - первый устойчивый статус после старта фиксируется как baseline без
+    Telegram-уведомления, дальше уведомления приходят только при смене baseline;
+  - если прямой интернет недоступен, замеры global status не выполняются, а
+    незавершённая серия сбрасывается;
+  - Формат: `🟢 xproxy status READY: active=OK ...; standby=READY ...`,
+    `🟠 xproxy status DEGRADED: active=OK ...; standby=EMPTY -`,
+    `🔴 xproxy status ACTIVE_FAILED: active=FAILED ...; standby=READY ...`,
+    `🔴 xproxy status DOWN: active=FAILED ...; standby=EMPTY -`.
 - **Публикация config.json**:
   - `🟢 config synced to ... after standby promotion ...` — удалённая SCP-публикация нового боевого конфига успешно завершилась;
   - `⚠️ config sync failed after standby promotion ...` — на хосте настроен `conf/sync.json`, standby promotion уже восстановила xray, но SCP-публикация нового конфига не удалась.
@@ -549,10 +559,11 @@ Standby Worker подготавливает кандидата по конвей
 доступны через конкретный сервер. Постоянно держать вторую копию xray не нужно:
 достаточно периодически запускать её на время проверки и обновлять TTL standby.
 
-Публикация нового standby уведомляет только при изменении состояния standby
-slot: `EMPTY → endpoint`, `endpoint → EMPTY` или `endpoint A → endpoint B`.
-Если worker перепроверил или пересобрал тот же endpoint в цикле
-`READY → PRE_STALE → READY`, Telegram-уведомление не отправляется.
+Публикация нового standby больше не отправляет точечное Telegram-уведомление.
+Такие события остаются в логах, а Telegram получает только устойчивое изменение
+глобального статуса active/standby после нескольких замеров. Это отсекает
+короткие пары вроде `EMPTY → READY`, которые не влияют на долговременное
+состояние сервиса.
 
 ### Быстрый контур Active Guard
 

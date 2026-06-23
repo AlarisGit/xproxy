@@ -37,6 +37,8 @@ from .settings import (
     STALE_SUBSCRIPTION_SEC,
     SCHEDULE_JITTER_RATIO,
     STARTUP_JITTER,
+    STATUS_NOTIFY_SAMPLE_INTERVAL,
+    STATUS_NOTIFY_STABLE_SAMPLES,
     STANDBY_FAIL_THRESHOLD,
     STANDBY_RETRY_INTERVAL,
     SUBSCR_REFRESH,
@@ -126,10 +128,12 @@ class Daemon:
         self._active_waiting_generation: int = 0
         self._standby_waiting_generation: int = 0
         self._standby_waiting_attempted: set[tuple[str, int]] = set()
-        self._notify_state_lock = threading.RLock()
-        self._last_active_state_notify: Optional[tuple] = None
-        self._last_standby_state_notify: Optional[tuple] = None
         self._notified_standby_slot_key: Optional[tuple[str, int]] = None
+        self._active_channel_ok: Optional[bool] = None
+        self._status_last_sample_at: float = 0.0
+        self._status_candidate_key: Optional[tuple[bool, bool, Optional[str]]] = None
+        self._status_candidate_count: int = 0
+        self._status_stable_key: Optional[tuple[bool, bool, Optional[str]]] = None
         self._last_cold_rotation_attempt: float = 0.0
         # Восстановить активный сервер, если был сохранён.
         # Если сервер не имеет resolved_ip (старый формат или hostname),
@@ -307,6 +311,7 @@ class Daemon:
                 self.tick_autoupdate()
                 self._git_period = _jittered(GIT_PULL_INTERVAL)
         self.tick_health(has_internet=has_internet)
+        self._sample_global_status(has_internet=has_internet)
         self.tick_heartbeat()
 
     def tick_heartbeat(self) -> None:
@@ -712,25 +717,8 @@ class Daemon:
         if self.dry_run:
             return
         server = server if server is not None else self.state.active
-        key = (state, _server_key(server), reason, detail)
-        with self._notify_state_lock:
-            if key == self._last_active_state_notify:
-                return
-            self._last_active_state_notify = key
-
-        suffix = f" reason={reason}" if reason else ""
-        detail_part = f" — {detail}" if detail else ""
-        if state == "OK":
-            text = f"🟢 active OK: {_fmt(server)}{suffix}{detail_part}"
-        elif state == "WAITING_FOR_STANDBY":
-            text = f"🟠 active WAITING_FOR_STANDBY: {_fmt(server)}{suffix}{detail_part}"
-        elif state == "PROMOTING":
-            text = f"🔄 active PROMOTING: {_fmt(server)}{suffix}{detail_part}"
-        elif state == "FAILED":
-            text = f"🔴 active FAILED: {_fmt(server)}{suffix}{detail_part}"
-        else:
-            text = f"ℹ️ active {state}: {_fmt(server)}{suffix}{detail_part}"
-        notify(text, urgent=urgent)
+        log.info("active state event: %s %s reason=%s detail=%s urgent=%s",
+                 state, _fmt(server), reason, detail, urgent)
 
     def _notify_standby_state(
         self,
@@ -744,31 +732,91 @@ class Daemon:
         if self.dry_run:
             return
         target = _fmt(server)
-        suffix = f" reason={reason}" if reason else ""
-        detail_part = f" — {detail}" if detail else ""
-        if state == "READY":
-            text = f"🟢 standby READY: {target}{suffix}{detail_part}"
-        elif state == "EMPTY":
-            text = f"🟠 standby EMPTY: {target}{suffix}{detail_part}"
-        elif state == "FAILED":
-            text = f"🔴 standby FAILED: {target}{suffix}{detail_part}"
-        elif state == "PROMOTING":
-            text = f"🔄 standby PROMOTING: {target}{suffix}{detail_part}"
-        else:
-            log.debug("standby notification suppressed: state=%s target=%s%s%s",
-                      state, target, suffix, detail_part)
+        log.info("standby state event: %s %s reason=%s detail=%s urgent=%s",
+                 state, target, reason, detail, urgent)
+
+    def _record_active_health(self, ok: bool) -> None:
+        self._active_channel_ok = ok
+
+    def _sample_global_status(
+        self,
+        *,
+        has_internet: bool,
+        now: float | None = None,
+    ) -> None:
+        if self.dry_run or not has_internet:
+            if not self.dry_run and not has_internet:
+                self._status_last_sample_at = 0.0
+                self._status_candidate_key = None
+                self._status_candidate_count = 0
+            return
+        if self._active_channel_ok is None:
             return
 
-        # READY details include TTL/fingerprint and naturally change on every
-        # successful revalidation. They must not make the same standby endpoint
-        # look like a new notification-worthy event.
-        key_detail = "" if state == "READY" else detail
-        key = (state, _server_key(server), reason, key_detail)
-        with self._notify_state_lock:
-            if key == self._last_standby_state_notify:
-                return
-            self._last_standby_state_notify = key
-        notify(text, urgent=urgent)
+        ts = time.time() if now is None else now
+        interval = max(0.0, STATUS_NOTIFY_SAMPLE_INTERVAL)
+        if self._status_last_sample_at and \
+                ts - self._status_last_sample_at < interval:
+            return
+        self._status_last_sample_at = ts
+
+        snapshot_key, text = self._global_status_snapshot()
+        if snapshot_key == self._status_candidate_key:
+            self._status_candidate_count += 1
+        else:
+            self._status_candidate_key = snapshot_key
+            self._status_candidate_count = 1
+
+        required = max(1, STATUS_NOTIFY_STABLE_SAMPLES)
+        if self._status_candidate_count < required:
+            log.debug("global status candidate %s sample %d/%d",
+                      snapshot_key, self._status_candidate_count, required)
+            return
+
+        if self._status_stable_key is None:
+            self._status_stable_key = snapshot_key
+            log.info("global status baseline established: %s", text)
+            return
+
+        if snapshot_key == self._status_stable_key:
+            return
+
+        self._status_stable_key = snapshot_key
+        notify(text, urgent=not snapshot_key[0] or not snapshot_key[1])
+
+    def _global_status_snapshot(
+        self,
+    ) -> tuple[tuple[bool, bool, Optional[str]], str]:
+        active = self.state.active_snapshot()
+        active_ok = bool(self._active_channel_ok and active is not None)
+        active_country = active.country if active_ok and active is not None else None
+        with self._standby_cond:
+            standby = self._standby
+            standby_ok = standby is not None and standby.is_usable()
+            standby_server = standby.server if standby is not None else None
+
+        key = (active_ok, standby_ok, active_country)
+        if active_ok and standby_ok:
+            emoji = "🟢"
+            status = "READY"
+        elif active_ok:
+            emoji = "🟠"
+            status = "DEGRADED"
+        elif standby_ok:
+            emoji = "🔴"
+            status = "ACTIVE_FAILED"
+        else:
+            emoji = "🔴"
+            status = "DOWN"
+
+        active_state = "OK" if active_ok else "FAILED"
+        standby_state = "READY" if standby_ok else "EMPTY"
+        text = (
+            f"{emoji} xproxy status {status}: "
+            f"active={active_state} {_fmt(active)}; "
+            f"standby={standby_state} {_fmt(standby_server)}"
+        )
+        return key, text
 
     def _notify_standby_empty_locked(
         self,
@@ -1509,10 +1557,8 @@ class Daemon:
 
             prev_country = prev.country if prev else "-"
             self.state.set_active(prepared.server)
-            notify(
-                f"🔄 standby promoted {prev_country} → "
-                f"{_fmt(prepared.server)} reason={reason}"
-            )
+            log.info("standby promoted %s -> %s reason=%s",
+                     prev_country, _fmt(prepared.server), reason)
             self._notify_active_state(
                 "OK",
                 server=prepared.server,
@@ -1606,6 +1652,7 @@ class Daemon:
     # ---------- health / rotation ----------
     def tick_health(self, *, has_internet: bool | None = None) -> None:
         if not is_running():
+            self._record_active_health(False)
             log.warning("xray is not running; trying to start with best server")
             self._handle_rotation_needed(reason="xray-not-running")
             return
@@ -1619,6 +1666,7 @@ class Daemon:
             return
 
         if not proxy_alive():
+            self._record_active_health(False)
             # --- Прокси совсем не работает (даже IP-чекеры не проходят) ---
             fails = self.state.note_proxy_fail()
             threshold = self._fail_threshold_for_current_state()
@@ -1632,6 +1680,7 @@ class Daemon:
         # Прокси работает (IP-чекеры прошли). Проверяем целевые ресурсы.
         target_ok, target_detail = target_alive()
         if not target_ok:
+            self._record_active_health(False)
             # Целевой ресурс недоступен через этот прокси.
             # Считаем proxy fail — сервер блокирует нужные ресурсы.
             fails = self.state.note_proxy_fail()
@@ -1654,6 +1703,7 @@ class Daemon:
             )
         self._clear_waiting_for_standby("active-health-ok")
         self.state.note_proxy_ok()
+        self._record_active_health(True)
         # Если активный сервер неизвестен, но сам xray proxy работает,
         # не трогаем live-config. Потеря state/active.json или ручной
         # конфиг не являются внешним условием, которое оправдывает
@@ -1814,10 +1864,6 @@ class Daemon:
                     self._active_waiting_for_standby = False
                     self._active_waiting_reason = ""
                 log.info("switched %s → %s", prev_country or "-", _fmt(candidate))
-                notify(
-                    f"🔄 switched {prev_country or '-'} → "
-                    f"{_fmt(candidate)} reason={reason}"
-                )
                 self._notify_active_state(
                     "OK",
                     server=candidate,

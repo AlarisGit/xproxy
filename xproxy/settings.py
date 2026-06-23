@@ -71,6 +71,8 @@ AUTOUPDATE_RESTARTS_LIMIT = 3      # если рестартов в окне >= 
 
 # ---------- Notifier ----------
 NOTIFIER_IDENTITY_TTL = 6 * 3600   # как часто освежать внешний IP для префикса
+STATUS_NOTIFY_STABLE_SAMPLES = 3   # одинаковых замеров для смены статуса
+STATUS_NOTIFY_SAMPLE_INTERVAL = 30 # минимальный интервал между замерами
 
 # ---------- Stale subscription ----------
 STALE_SUBSCRIPTION_SEC = 24 * 3600  # подписка считается устаревшей через 24ч без live-фетча
