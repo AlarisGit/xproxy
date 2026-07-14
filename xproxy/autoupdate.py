@@ -27,6 +27,8 @@ from .logger import get_logger
 from .settings import (
     AUTOUPDATE_RESTARTS_LIMIT,
     AUTOUPDATE_RESTARTS_WINDOW,
+    HTTP_HOST,
+    HTTP_PORT,
     PROJECT_ROOT,
     STATE_DIR,
 )
@@ -43,6 +45,10 @@ _MANUAL_DEPLOY_FILES: tuple[Path, ...] = (
 _ENV_MARKER = "XPROXY_UPDATED_AT"   # ставится перед exec, видим в новом процессе
 _VALIDATE_TIMEOUT = 25
 _PIP_TIMEOUT = 300
+_PROXY_ENV_KEYS = (
+    "ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+    "all_proxy", "https_proxy", "http_proxy", "no_proxy",
+)
 
 
 # ---------- git helpers ----------
@@ -51,22 +57,80 @@ class GitError(RuntimeError):
     pass
 
 
-def _git(*args: str, timeout: int = 30) -> str:
+def _git(
+    *args: str,
+    timeout: int = 30,
+    network_proxy: Optional[bool] = None,
+) -> str:
     """Выполнить git <args> в корне проекта, вернуть stdout. Кидает GitError."""
     git_bin = shutil.which("git")
     if git_bin is None:
         raise GitError("git not found in PATH")
-    proc = subprocess.run(
-        [git_bin, "-C", str(PROJECT_ROOT), *args],
-        capture_output=True,
-        timeout=timeout,
-    )
+
+    command = [git_bin, "-C", str(PROJECT_ROOT)]
+    env = None
+    if network_proxy is not None:
+        # Не наследуем proxy env процесса: direct и xray-маршруты должны быть
+        # явными и предсказуемыми. Command-level config имеет приоритет над
+        # пользовательским/global git config.
+        env = os.environ.copy()
+        for key in _PROXY_ENV_KEYS:
+            env.pop(key, None)
+        proxy_url = f"http://{HTTP_HOST}:{HTTP_PORT}" if network_proxy else ""
+        command.extend(["-c", f"http.proxy={proxy_url}"])
+    command.extend(args)
+
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(
+            f"git {' '.join(args)} timed out after {timeout}s"
+        ) from exc
     if proc.returncode != 0:
         raise GitError(
             f"git {' '.join(args)} exited {proc.returncode}: "
             f"{proc.stderr.decode(errors='replace').strip()}"
         )
     return proc.stdout.decode(errors="replace").strip()
+
+
+def _git_network(
+    *args: str,
+    timeout: int = 60,
+    proxy_first: bool = False,
+) -> tuple[str, bool]:
+    """Выполнить сетевую git-команду direct, затем через локальный xray.
+
+    Возвращает (stdout, used_proxy). Если предыдущая команда уже потребовала
+    fallback, proxy_first позволяет не ждать заведомо неработающий direct ещё
+    раз в рамках той же попытки обновления.
+    """
+    routes = (True,) if proxy_first else (False, True)
+    failures: list[str] = []
+    for via_proxy in routes:
+        route_name = "xray-http" if via_proxy else "direct"
+        try:
+            output = _git(
+                *args,
+                timeout=timeout,
+                network_proxy=via_proxy,
+            )
+        except GitError as exc:
+            failures.append(f"{route_name}: {exc}")
+            log.warning("git %s via %s failed: %s", args[0], route_name, exc)
+            continue
+        if failures:
+            log.info(
+                "git %s succeeded via %s after fallback (%s)",
+                args[0], route_name, "; ".join(failures),
+            )
+        return output, via_proxy
+    raise GitError("; ".join(failures))
 
 
 def _is_git_repo() -> bool:
@@ -162,7 +226,7 @@ def check_and_pull() -> UpdateResult:
         return UpdateResult(False, reason=f"no upstream for {branch}")
 
     try:
-        _git("fetch", "--quiet", timeout=60)
+        _, fetch_used_proxy = _git_network("fetch", "--quiet", timeout=60)
     except GitError as exc:
         log.warning("git fetch failed: %s", exc)
         return UpdateResult(False, reason="fetch failed", error=str(exc))
@@ -176,7 +240,11 @@ def check_and_pull() -> UpdateResult:
     old_deploy_hashes = _file_hashes(_MANUAL_DEPLOY_FILES)
 
     try:
-        _git("pull", "--ff-only", "--quiet", timeout=60)
+        _git_network(
+            "pull", "--ff-only", "--quiet",
+            timeout=60,
+            proxy_first=fetch_used_proxy,
+        )
     except GitError as exc:
         log.warning("git pull --ff-only failed: %s", exc)
         return UpdateResult(False, reason="pull failed", error=str(exc))
