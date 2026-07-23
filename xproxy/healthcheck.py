@@ -41,10 +41,10 @@ def _probe(session: requests.Session, url: str, via: str) -> Optional[str]:
     try:
         resp = session.get(url, timeout=HEALTH_TIMEOUT)
     except requests.RequestException as exc:
-        log.debug("probe %s fail (%s): %s", url, via, exc)
+        log.warning("probe %s fail (%s): %s", url, via, exc)
         return None
     if resp.status_code != 200:
-        log.debug("probe %s (%s) status=%s", url, via, resp.status_code)
+        log.info("probe %s (%s) status=%s", url, via, resp.status_code)
         return None
     return resp.text.strip()
 
@@ -78,8 +78,13 @@ def _socks_proxies(host: str = SOCKS_HOST, port: int = SOCKS_PORT) -> dict:
 
 
 def internet_alive() -> bool:
-    """Живой ли прямой интернет-канал (в обход env-прокси)."""
-    return _any_probe(IP_CHECK_URLS, proxies=None) is not None
+    """Живой ли прямой интернет-канал (в обход env-прокси).
+
+    Пробуем ВСЕ URL из IP_CHECK_URLS (attempts=len), а не только первые 2:
+    если первые 2 недоступны (кратковременный сбой CDN/DNS после пробуждения),
+    оставшиеся могут ответить и предотвратить ложное «no direct internet».
+    """
+    return _any_probe(IP_CHECK_URLS, proxies=None, attempts=len(IP_CHECK_URLS)) is not None
 
 
 def proxy_alive(
