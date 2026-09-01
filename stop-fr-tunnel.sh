@@ -16,31 +16,46 @@
 # иначе его healthcheck увидит «прокси работает» через тоннель.
 #
 # Запуск: bash stop-fr-tunnel.sh
-# Только Linux (systemctl, /usr/local/etc/xray).
-#
+# macOS + Linux. Автоопределение платформы.
 
 set -euo pipefail
 
 STATE_DIR="$HOME/.fr-tunnel"
 BACKUP="$STATE_DIR/xray-config.pre-emergency.json"
-XRAY_CONFIG="/usr/local/etc/xray/config.json"
-XRAY_TMP="/usr/local/etc/xray/.config.json.xproxy.fr-tunnel.tmp"
-GEO_DIR="/var/lib/xproxy/geo"
 LOCAL_SOCKS=20808
 LOCAL_HTTP=20809
 
-[ "$(uname -s)" = "Linux" ] || { echo "!! только Linux (systemctl)" >&2; exit 1; }
+OS="$(uname -s)"
+case "$OS" in
+    Darwin)
+        XRAY_CONFIG="/opt/homebrew/etc/xray/config.json"
+        XRAY_TMP="/opt/homebrew/etc/xray/.config.json.xproxy.fr-tunnel.tmp"
+        GEO_DIR="$HOME/.config/xproxy/geo"
+        XRAY_BIN="xray"
+        ;;
+    Linux)
+        XRAY_CONFIG="/usr/local/etc/xray/config.json"
+        XRAY_TMP="/usr/local/etc/xray/.config.json.xproxy.fr-tunnel.tmp"
+        GEO_DIR="/var/lib/xproxy/geo"
+        XRAY_BIN="xray"
+        ;;
+    *)
+        echo "!! неподдерживаемая ОС: $OS" >&2; exit 1 ;;
+esac
 
 log()  { printf '    %s\n' "$*"; }
 fail() { printf '    !! %s\n' "$*" >&2; exit 1; }
 
 # ── 1. xproxy вниз (если был) ─────────────────────────────────
-# Bounded stop: при зависшем graceful-stop (mid-rotation + retry-queue)
-# не ждём TimeoutStopSec=90s — добиваем и чистим failed-статус.
 echo "[1/5] Останавливаю xproxy…"
-sudo -n timeout 25 systemctl stop xproxy 2>/dev/null || \
-    sudo -n systemctl kill --signal=SIGKILL xproxy 2>/dev/null || true
-sudo -n systemctl reset-failed xproxy 2>/dev/null || true
+if [ "$OS" = "Darwin" ]; then
+    launchctl bootout gui/"$(id -u)"/com.xproxy.daemon 2>/dev/null || \
+        launchctl unload ~/Library/LaunchAgents/com.xproxy.daemon.plist 2>/dev/null || true
+else
+    sudo -n timeout 25 systemctl stop xproxy 2>/dev/null || \
+        sudo -n systemctl kill --signal=SIGKILL xproxy 2>/dev/null || true
+    sudo -n systemctl reset-failed xproxy 2>/dev/null || true
+fi
 
 # ── 2. Restore config.json ────────────────────────────────────
 echo "[2/5] Восстанавливаю config.json из бэкапа…"
@@ -57,9 +72,13 @@ cfg["log"]["access"] = "none"
 cfg["log"]["error"] = "none"
 json.dump(cfg, open(sys.argv[2], "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 PYEOF
-    if XRAY_LOCATION_ASSET="$GEO_DIR" xray -test -c "$TEST_TMP" >/dev/null 2>&1; then
-        sudo -n tee "$XRAY_TMP" < "$BACKUP" > /dev/null
-        sudo -n mv -f "$XRAY_TMP" "$XRAY_CONFIG"
+    if XRAY_LOCATION_ASSET="$GEO_DIR" "$XRAY_BIN" -test -c "$TEST_TMP" >/dev/null 2>&1; then
+        if [ "$OS" = "Darwin" ]; then
+            cp "$BACKUP" "$XRAY_CONFIG"
+        else
+            sudo -n tee "$XRAY_TMP" < "$BACKUP" > /dev/null
+            sudo -n mv -f "$XRAY_TMP" "$XRAY_CONFIG"
+        fi
         log "бэкап восстановлен (прошёл xray -test)"
     else
         fail "бэкап не проходит xray -test (geo могли измениться) — ${XRAY_CONFIG} не тронут"
@@ -84,19 +103,35 @@ log "тоннель остановлен, порты ${LOCAL_SOCKS}/${LOCAL_HTTP
 
 # ── 4. xray рестарт с восстановленным конфигом ────────────────
 echo "[4/5] Рестартую xray…"
-sudo systemctl restart xray
+if [ "$OS" = "Darwin" ]; then
+    brew services restart xray 2>/dev/null || true
+else
+    sudo systemctl restart xray
+fi
 sleep 3
 # xray должен подняться на 10808 независимо от того, VLESS-конфиг это
 # или emergency (тоннель уже мёртв, но listener поднимается в любом случае).
-ss -tln 2>/dev/null | grep -qE ":10808\b" || \
-    fail "xray не поднял 10808 — journalctl -u xray; VLESS может быть ещё заблокирован: bash start-fr-tunnel.sh вернёт аварийный режим"
+if [ "$OS" = "Darwin" ]; then
+    lsof -nP -iTCP:10808 -sTCP:LISTEN 2>/dev/null | grep -q LISTEN || \
+        fail "xray не поднял 10808 — VLESS может быть ещё заблокирован: bash start-fr-tunnel.sh вернёт аварийный режим"
+else
+    ss -tln 2>/dev/null | grep -qE ":10808\b" || \
+        fail "xray не поднял 10808 — journalctl -u xray; VLESS может быть ещё заблокирован: bash start-fr-tunnel.sh вернёт аварийный режим"
+fi
 log "xray рестартован (listener 10808 жив)"
 
 # ── 5. xproxy старт ───────────────────────────────────────────
 echo "[5/5] Запускаю xproxy…"
-sudo systemctl start xproxy
-sleep 2
-systemctl is-active xproxy >/dev/null 2>&1 || fail "xproxy не запустился — systemctl status xproxy"
+if [ "$OS" = "Darwin" ]; then
+    launchctl load ~/Library/LaunchAgents/com.xproxy.daemon.plist 2>/dev/null || \
+        launchctl bootstrap gui/"$(id -u)" ~/Library/LaunchAgents/com.xproxy.daemon.plist 2>/dev/null || true
+    sleep 2
+    pgrep -f "main.py --daemon" >/dev/null 2>&1 || fail "xproxy не запустился — проверьте launchctl"
+else
+    sudo systemctl start xproxy
+    sleep 2
+    systemctl is-active xproxy >/dev/null 2>&1 || fail "xproxy не запустился — systemctl status xproxy"
+fi
 log "xproxy запущен; при первом успешном healthcheck пересоберёт конфиг сам"
 
 echo ""
