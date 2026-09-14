@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "local_port": 20808,
+  "tunnels": [
+    {
+      "id": "primary",
+      "host": "203.0.113.10",
+      "port": 22,
+      "user": "xproxy",
+      "identity_file": "~/.ssh/id_ed25519",
+      "known_hosts_file": "~/.ssh/known_hosts",
+      "remote_socks_port": 10808
+    }
+  ]
+}

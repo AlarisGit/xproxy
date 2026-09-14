@@ -29,6 +29,7 @@ DIRECT_LIST: Path = CONF_DIR / "direct.lst"
 SERVERS_CACHE: Path = STATE_DIR / "servers.json"
 ACTIVE_STATE: Path = STATE_DIR / "active.json"
 SYNC_CONFIG: Path = CONF_DIR / "sync.json"
+TUNNELS_CONFIG: Path = CONF_DIR / "tunnels.json"
 
 # Директория для geosite.dat / geoip.dat (XRAY_LOCATION_ASSET).
 #
@@ -87,6 +88,22 @@ STANDBY_FAIL_THRESHOLD = 1         # подряд-фейлов до promotion, �
 STANDBY_READY_TTL = 5 * 60         # READY → PRE_STALE после e2e-проверки
 STANDBY_PRE_STALE_TTL = 10 * 60    # PRE_STALE → STALE; PRE_STALE ещё можно promoted
 STANDBY_RETRY_INTERVAL = 60        # как часто пытаться подготовить standby при неудаче
+
+# Emergency SSH is opt-in through conf/tunnels.json. These timers never cause
+# contact with an SSH host unless VLESS failure has been confirmed.
+NETWORK_STATUS_TTL = 90
+STANDBY_FAILURE_TTL = 5 * 60
+SSH_LOCAL_PORT = 20808
+SSH_CONNECT_TIMEOUT = 10
+SSH_START_TIMEOUT = 30
+SSH_HEALTH_INTERVAL = 30
+SSH_HEALTH_FAILURES = 2
+SSH_READY_TTL = 90
+SSH_RETRY_SCHEDULE = (30, 60, 120, 300)
+VLESS_RECOVERY_SAMPLES = 2
+VLESS_RECOVERY_INTERVAL = 15
+VLESS_STABLE_SECONDS = 120
+VLESS_STANDBY_FRESH_SECONDS = 30
 
 # ---------- Config sync ----------
 CONFIG_SYNC_TIMEOUT = 30           # общий timeout SCP-публикации config.json

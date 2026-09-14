@@ -12,7 +12,9 @@
 - В текст сообщения всегда добавляется timestamp события `[HH:MM:SS]`
   в локальной TZ, чтобы время отправки не путалось со временем события;
 - Failed-сообщения уходят в конец очереди — новые urgent-сообщения не ждут;
-- Перед отправкой проверяется интернет через internet_alive();
+- Sender использует общий кэш состояния сети, не запускает отдельные пробы;
+- Новое состояние темы заменяет ещё не отправленное; очередь ограничена 256
+  событиями, срок хранения 24 часа;
 - Маршрут: сначала SOCKS-прокси (через локальный xray), при неудаче — direct;
 - `trust_env=False` везде: env-переменные не переопределяют маршрут;
 - Токен автоматически скрабится в логируемых сообщениях.
@@ -63,6 +65,9 @@ _identity_lock = threading.Lock()
 # Кэширование медленных hardware-метрик — внутри провайдера (hardware_status).
 # None — не добавлять статус к сообщениям.
 _status_provider: Optional[Callable[[], Optional[str]]] = None
+_network_provider: Optional[Callable[[], bool]] = None
+_MAX_QUEUE = 256
+_EVENT_TTL = 24 * 3600
 
 
 # ──────────────────────────────────────────────────────────────
@@ -75,6 +80,7 @@ class _PendingNotify:
     event_time: float       # time.time() момента события
     attempts: int = 0       # сколько попыток отправки было
     next_retry: float = 0.0  # когда следующая попытка (0 = немедленно)
+    topic: str | None = None  # pending state changes supersede the same topic
 
     def retry_delay(self) -> float:
         """Exponential backoff: BASE * 2^(attempts-1), с потолком CAP."""
@@ -91,6 +97,7 @@ class _PendingNotify:
             event_time=d["event_time"],
             attempts=d.get("attempts", 0),
             next_retry=d.get("next_retry", 0.0),
+            topic=d.get("topic"),
         )
 
 
@@ -130,18 +137,20 @@ class _NotificationQueue:
             self._sender.start()
         log.info("notification queue started (%d pending)", len(self._queue))
 
-    def enqueue(self, text: str, *, urgent: bool = False) -> None:
+    def enqueue(self, text: str, *, urgent: bool = False, topic: str | None = None) -> None:
         """Поставить сообщение в очередь."""
         if not is_configured():
             return
 
+        self._load_from_disk()
         # throttle проверяем по сырым текстам (без prefix/timestamp),
         # чтобы `🛑 stopped` не дедуплицировался из-за разницы во времени
-        if not urgent and _is_throttled(text):
+        if not topic and not urgent and _is_throttled(text):
             return
 
-        pending = _PendingNotify(text=text, event_time=time.time())
+        pending = _PendingNotify(text=text, event_time=time.time(), topic=topic)
         with self._cond:
+            self._replace_topic(pending)
             self._queue.append(pending)
             self._cond.notify()
         # Персистентность сразу — чтобы не потерять при crash / os.execv
@@ -151,7 +160,9 @@ class _NotificationQueue:
 
     def enqueue_blocking(self, pending: _PendingNotify) -> None:
         """Поставить уже сформированное сообщение в очередь (blocking-путь)."""
+        self._load_from_disk()
         with self._cond:
+            self._replace_topic(pending)
             self._queue.append(pending)
         self._save_to_disk()
 
@@ -175,6 +186,26 @@ class _NotificationQueue:
 
     # ── internals ──
 
+    def _replace_topic(self, pending: _PendingNotify) -> None:
+        self._queue = deque(it for it in self._queue if
+                            time.time() - it.event_time < _EVENT_TTL and
+                            (not pending.topic or it.topic != pending.topic))
+        while len(self._queue) >= _MAX_QUEUE:
+            self._queue.popleft()
+
+    def _remove(self, item: _PendingNotify) -> None:
+        # enqueue may replace an event while the sender is performing HTTP.
+        # Never pop a different, newer event after the old request completes.
+        try:
+            self._queue.remove(item)
+        except ValueError:
+            pass
+
+    def _defer(self, item: _PendingNotify) -> None:
+        if item in self._queue:
+            self._remove(item)
+            self._queue.append(item)
+
     def _rotate_to_back(self) -> None:
         """Переместить head в конец очереди, чтобы не блокировать новые сообщения."""
         # Вызывается под self._cond или из sender-треда (единственный consumer).
@@ -197,23 +228,31 @@ class _NotificationQueue:
                 item = self._queue[0]
                 peek_retry = item.next_retry
             now = time.time()
+            if now - item.event_time >= _EVENT_TTL:
+                with self._cond:
+                    self._remove(item)
+                self._save_to_disk()
+                continue
 
             # Если время retry ещё не наступило — переносим в конец,
             # чтобы не блокировать более свежие сообщения (head-of-line)
             if peek_retry > now:
                 with self._cond:
-                    self._rotate_to_back()
+                    self._defer(item)
+                    if self._stopping:
+                        return
                     self._cond.wait(timeout=min(peek_retry - now, 5.0))
                 continue
 
             # Не тратим попытки, если интернета нет — просто отложим.
             # Ленивый импорт, чтобы избежать цикла на уровне модуля.
-            from .healthcheck import internet_alive
-            if not internet_alive():
+            if not _network_available():
                 log.debug("skip notification send: no internet")
                 with self._cond:
                     item.next_retry = now + item.retry_delay()
-                    self._rotate_to_back()
+                    self._defer(item)
+                    if self._stopping:
+                        return
                     self._cond.wait(timeout=min(item.retry_delay(), 30.0))
                 continue
 
@@ -234,14 +273,14 @@ class _NotificationQueue:
             if not token or not chat_id:
                 # Конфигурация пропала — отбрасываем
                 with self._cond:
-                    self._queue.popleft()
+                    self._remove(item)
                 self._save_to_disk()
                 continue
 
             ok = _send_sync(token, chat_id, full)
             if ok:
                 with self._cond:
-                    self._queue.popleft()
+                    self._remove(item)
                 log.debug("notification sent: %.60s", item.text[:60])
                 self._save_to_disk()
             else:
@@ -249,11 +288,11 @@ class _NotificationQueue:
                 with self._cond:
                     item.attempts += 1
                     if item.attempts >= _MAX_ATTEMPTS:
-                        self._queue.popleft()
+                        self._remove(item)
                         drop = True
                     else:
                         item.next_retry = now + item.retry_delay()
-                        self._rotate_to_back()
+                        self._defer(item)
                         drop = False
                 if drop:
                     log.warning(
@@ -280,25 +319,35 @@ class _NotificationQueue:
 
     def _load_from_disk(self) -> None:
         """Восстановить очередь из файла при старте."""
-        if self._loaded:
-            return
-        self._loaded = True
-        try:
-            if not _QUEUE_FILE.exists():
+        # Startup configuration alerts may arrive before start(). Loading and
+        # merging must finish before any producer can persist a newer event.
+        with self._cond:
+            if self._loaded:
                 return
-            data = json.loads(_QUEUE_FILE.read_text(encoding="utf-8"))
-            items = [_PendingNotify.from_dict(d) for d in data]
-            with self._cond:
-                self._queue.extend(items)
-            if items:
-                log.info("restored %d pending notifications from disk", len(items))
-        except Exception:  # noqa: BLE001
-            log.exception("failed to load notification queue from disk")
+            try:
+                if not _QUEUE_FILE.exists():
+                    return
+                data = json.loads(_QUEUE_FILE.read_text(encoding="utf-8"))
+                items = [_PendingNotify.from_dict(d) for d in data]
+                for item in items:
+                    if time.time() - item.event_time < _EVENT_TTL:
+                        self._replace_topic(item)
+                        self._queue.append(item)
+                if items:
+                    log.info("restored %d pending notifications from disk", len(items))
+            except Exception:  # noqa: BLE001
+                log.exception("failed to load notification queue from disk")
+            finally:
+                self._loaded = True
 
     def _save_to_disk(self) -> None:
         """Сохранить очередь на диск через secure_write (атомарно, 0600)."""
+        self._load_from_disk()
         with self._cond:
-            items = list(self._queue)
+            self._save_locked()
+
+    def _save_locked(self) -> None:
+        items = list(self._queue)
         try:
             if not items:
                 # Пустая очередь — удалить файл, если он есть
@@ -338,7 +387,8 @@ def is_configured() -> bool:
     return bool(env_get("TELEGRAM_BOT_TOKEN")) and bool(env_get("TELEGRAM_ALERTS_USER_ID"))
 
 
-def notify(text: str, *, urgent: bool = False, blocking: bool = False) -> None:
+def notify(text: str, *, urgent: bool = False, blocking: bool = False,
+           topic: str | None = None) -> None:
     """Отправить сообщение в Telegram через очередь.
 
     К тексту автоматически добавляется префикс `hostname/public_ip: `
@@ -350,6 +400,12 @@ def notify(text: str, *, urgent: bool = False, blocking: bool = False) -> None:
       треде, а при неудаче — ставит в очередь.
     """
     if not is_configured():
+        return
+
+    # A topic represents current operational state, not an unbounded history
+    # of retries. Always use the queue for these events.
+    if topic or (blocking and not _network_available()):
+        _get_queue().enqueue(text, urgent=urgent, topic=topic)
         return
 
     # blocking-режим: shutdown — отправляем напрямую, а если не вышло — в очередь
@@ -375,6 +431,18 @@ def notify(text: str, *, urgent: bool = False, blocking: bool = False) -> None:
         return
 
     _get_queue().enqueue(text, urgent=urgent)
+
+
+def set_network_provider(provider: Optional[Callable[[], bool]]) -> None:
+    global _network_provider
+    _network_provider = provider
+
+
+def _network_available() -> bool:
+    if _network_provider is not None:
+        return _network_provider()
+    from .healthcheck import internet_alive
+    return internet_alive()
 
 
 def start_queue() -> None:
@@ -521,6 +589,8 @@ def _send_sync(token: str, chat_id: str, text: str) -> bool:
     )
     errors: list[str] = []
     for label, proxies in routes:
+        if _network_provider is not None and not _network_provider():
+            return False
         session = _make_session(proxies)
         try:
             resp = session.post(url, data=payload, timeout=_TIMEOUT)
@@ -533,5 +603,7 @@ def _send_sync(token: str, chat_id: str, text: str) -> bool:
             errors.append(f"via {label}: {_scrub(str(exc), token)}")
         except Exception as exc:  # noqa: BLE001
             errors.append(f"via {label}: {_scrub(''.join(traceback.format_exception_only(type(exc), exc)).strip(), token)}")
+        finally:
+            session.close()
     log.warning("telegram send failed on all routes: %s", "; ".join(errors))
     return False

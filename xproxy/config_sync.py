@@ -1,9 +1,11 @@
-"""Optional SCP publication of the active xray config after standby failover."""
+"""Optional SCP publication of a verified config after a VLESS upstream change."""
 from __future__ import annotations
 
 import json
 import shutil
 import subprocess
+import tempfile
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -88,6 +90,7 @@ def sync_current_config(
     *,
     info: PlatformInfo | None = None,
     sync_path: Path = SYNC_CONFIG,
+    config_text: str | None = None,
 ) -> Optional[ConfigSyncTarget]:
     """Copy the current xray config to the optional sync target via SCP.
 
@@ -101,16 +104,33 @@ def sync_current_config(
 
     info = info or detect_platform()
     source = info.xray_config
-    if not source.exists():
+    if config_text is None and not source.exists():
         raise ConfigSyncError(f"xray config does not exist: {source}")
+    text = config_text if config_text is not None else source.read_text(encoding="utf-8")
+    try:
+        cfg = json.loads(text)
+    except ValueError as exc:
+        raise ConfigSyncError("cannot publish invalid xray JSON") from exc
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("outbounds"), list) or \
+            not all(isinstance(o, dict) for o in cfg["outbounds"]):
+        raise ConfigSyncError("cannot publish malformed xray outbounds")
+    upstreams = [o for o in cfg["outbounds"] if o.get("tag") == "proxy"]
+    if len(upstreams) != 1 or upstreams[0].get("protocol") != "vless":
+        log.info("config sync skipped: only VLESS configurations can be published")
+        return None
     if shutil.which("scp") is None:
         raise ConfigSyncError("scp binary not found in PATH")
 
-    detail = _run_scp(source, target, ignore_ssh_config=False)
-    if detail and _ssh_config_permissions_error(detail):
-        log.warning("scp failed because local ssh config permissions are bad; "
-                    "retrying with -F none: %s", detail)
-        detail = _run_scp(source, target, ignore_ssh_config=True)
+    # A private directory protects the local snapshot, while 0644 preserves the
+    # permissions expected by the existing remote publication setup.
+    with tempfile.TemporaryDirectory(prefix="xproxy-sync-") as tmp:
+        snapshot = Path(tmp) / "config.json"
+        snapshot.write_text(text, encoding="utf-8")
+        os.chmod(snapshot, 0o644)
+        detail = _run_scp(snapshot, target, ignore_ssh_config=False)
+        if detail and _ssh_config_permissions_error(detail):
+            log.warning("scp SSH config permissions error; retrying with -F none")
+            detail = _run_scp(snapshot, target, ignore_ssh_config=True)
     if detail:
         raise ConfigSyncError(
             f"scp to {target.safe_label()} failed: {detail}"

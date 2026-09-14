@@ -9,9 +9,10 @@ import socket
 import subprocess
 import tempfile
 import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .healthcheck import proxy_alive, target_alive
 from .logger import get_logger
@@ -31,10 +32,29 @@ from .xray_config import build_xray_config_text
 from .xray_control import validate_config_for_service, wait_for_proxy_port
 
 log = get_logger("xproxy.standby")
+_processes: set[subprocess.Popen] = set()
+_processes_lock = threading.Lock()
+
+
+def stop_probes() -> None:
+    """Cancel owned temporary xray instances before shutdown or exec."""
+    with _processes_lock:
+        processes = list(_processes)
+    for proc in processes:
+        _terminate_process(proc)
 
 
 class StandbyError(RuntimeError):
     """Standby candidate failed preparation or validation."""
+
+
+class StandbyLocalError(StandbyError):
+    """Local config/process failure is not evidence of a blocked VLESS route."""
+
+
+def _continue(check: Callable[[], bool] | None) -> None:
+    if check is not None and not check():
+        raise StandbyLocalError("preparation cancelled: network or generation changed")
 
 
 @dataclass
@@ -101,25 +121,30 @@ def prepare_standby(
     info: PlatformInfo | None = None,
     ready_ttl: float = STANDBY_READY_TTL,
     pre_stale_ttl: float = STANDBY_PRE_STALE_TTL,
+    should_continue: Callable[[], bool] | None = None,
 ) -> PreparedStandby:
     """Build and validate a standby production config for `server`."""
     _validate_ttl("ready_ttl", ready_ttl)
     _validate_ttl("pre_stale_ttl", pre_stale_ttl)
     info = info or detect_platform()
+    _continue(should_continue)
     if not tcp_probe(server.address, server.port, timeout=TCP_PROBE_TIMEOUT):
         raise StandbyError(f"tcp probe failed for {_fmt_server(server)}")
 
     fingerprint_before = standby_fingerprint(server, info=info)
+    _continue(should_continue)
     config_text = build_xray_config_text(server)
     ok, output = validate_config_for_service(config_text, info)
     if not ok:
         last = output.strip().splitlines()[-1] if output.strip() else "unknown error"
-        raise StandbyError(f"xray -test failed for {_fmt_server(server)}: {last}")
+        raise StandbyLocalError(f"xray -test failed for {_fmt_server(server)}: {last}")
 
-    validate_standby_end_to_end(config_text)
+    _continue(should_continue)
+    validate_standby_end_to_end(config_text, should_continue=should_continue)
+    _continue(should_continue)
     fingerprint_after = standby_fingerprint(server, info=info)
     if fingerprint_after != fingerprint_before:
-        raise StandbyError(
+        raise StandbyLocalError(
             f"standby inputs changed during validation for {_fmt_server(server)}"
         )
 
@@ -175,11 +200,12 @@ def validate_standby_end_to_end(
     production_config_text: str,
     *,
     boot_timeout: float = BOOT_GRACE,
+    should_continue: Callable[[], bool] | None = None,
 ) -> None:
     """Run a temporary xray instance and check traffic through its SOCKS port."""
     xray_bin = shutil.which("xray")
     if xray_bin is None:
-        raise StandbyError("xray binary not found in PATH")
+        raise StandbyLocalError("xray binary not found in PATH")
 
     socks_port, http_port = _pick_two_free_ports()
     test_config_text = build_standby_test_config_text(
@@ -187,6 +213,18 @@ def validate_standby_end_to_end(
         socks_port=socks_port,
         http_port=http_port,
     )
+    # The first listener tests production routing. The second forces the
+    # candidate outbound, preventing direct rules from hiding a dead upstream.
+    cfg = json.loads(test_config_text)
+    cfg["inbounds"] = [i for i in cfg["inbounds"] if i.get("protocol") != "http"]
+    cfg["inbounds"].append({
+        "tag": "xproxy-upstream-probe", "listen": "127.0.0.1", "port": http_port,
+        "protocol": "socks", "settings": {"auth": "noauth", "udp": False},
+    })
+    cfg.setdefault("routing", {}).setdefault("rules", []).insert(0, {
+        "type": "field", "inboundTag": ["xproxy-upstream-probe"], "outboundTag": "proxy",
+    })
+    test_config_text = json.dumps(cfg)
 
     env = os.environ.copy()
     env["XRAY_LOCATION_ASSET"] = str(GEO_DIR)
@@ -198,25 +236,33 @@ def validate_standby_end_to_end(
 
     proc: subprocess.Popen[bytes] | None = None
     try:
+        _continue(should_continue)
         proc = subprocess.Popen(
             [xray_bin, "run", "-c", tmp_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
         )
+        with _processes_lock:
+            _processes.add(proc)
         if not wait_for_proxy_port(
             boot_timeout,
             host="127.0.0.1",
             port=socks_port,
         ):
-            raise StandbyError(
+            raise StandbyLocalError(
                 "temporary xray listener did not start: "
                 f"{_process_output_tail(proc)}"
             )
 
+        _continue(should_continue)
+        if not proxy_alive(socks_host="127.0.0.1", socks_port=http_port):
+            raise StandbyError("standby forced-upstream IP check failed")
+        _continue(should_continue)
         if not proxy_alive(socks_host="127.0.0.1", socks_port=socks_port):
             raise StandbyError("standby proxy IP check failed")
 
+        _continue(should_continue)
         target_ok, target_detail = target_alive(
             socks_host="127.0.0.1",
             socks_port=socks_port,
@@ -226,6 +272,8 @@ def validate_standby_end_to_end(
     finally:
         if proc is not None:
             _terminate_process(proc)
+            with _processes_lock:
+                _processes.discard(proc)
         try:
             os.unlink(tmp_path)
         except OSError:

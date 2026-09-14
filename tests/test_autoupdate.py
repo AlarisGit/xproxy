@@ -9,6 +9,13 @@ from xproxy import autoupdate
 
 
 class AutoupdateProxyFallbackTests(unittest.TestCase):
+    def test_network_loss_prevents_fallback_after_first_git_failure(self) -> None:
+        with mock.patch.object(autoupdate, "_git", side_effect=autoupdate.GitError("failed")) as git:
+            current = mock.Mock(side_effect=[True, False])
+            with self.assertRaises(autoupdate.GitError):
+                autoupdate._git_network("fetch", should_continue=current)
+            self.assertEqual(git.call_count, 1)
+
     def test_network_command_uses_direct_route_first(self) -> None:
         with mock.patch.object(autoupdate, "_git", return_value="ok") as git:
             output, used_proxy = autoupdate._git_network("fetch", "--quiet")

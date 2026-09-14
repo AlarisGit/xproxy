@@ -25,6 +25,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterable
 
@@ -82,6 +83,9 @@ def ensure_geo_assets(
     *,
     validation_server=None,
     platform_info=None,
+    publish_lock=None,
+    should_continue=None,
+    config_builder=None,
 ) -> GeoResult:
     """Убедиться, что geosite.dat / geoip.dat доступны и свежие.
 
@@ -95,6 +99,9 @@ def ensure_geo_assets(
     state = _load_state()
     state_before = json.dumps(state, sort_keys=True)
     result = GeoResult()
+    if should_continue is not None and not should_continue():
+        result.next_attempt_in = 10
+        return result
     now = time.time()
 
     # Минимальный бэкофф среди файлов, которые сейчас не нужно трогать
@@ -169,7 +176,14 @@ def ensure_geo_assets(
             validation_server=validation_server,
             platform_info=platform_info,
             errors=result.errors,
+            publish_lock=publish_lock,
+            should_continue=should_continue,
+            config_builder=config_builder,
         )
+        if should_continue is not None and not should_continue() and not downloaded:
+            result.errors.clear()
+            result.next_attempt_in = 10
+            return result  # cancelled network work must not increase failure backoff
         if downloaded:
             for name, _url, target, file_state in download_plan:
                 file_state["last_attempt"] = now
@@ -306,6 +320,9 @@ def _stage_and_validate_geo(
     validation_server,
     platform_info,
     errors: dict[str, str],
+    publish_lock=None,
+    should_continue=None,
+    config_builder=None,
 ) -> set[str]:
     """Download planned geo files into staging and publish only after checks."""
     planned_names = {name for name, _url, _target, _state in download_plan}
@@ -324,94 +341,104 @@ def _stage_and_validate_geo(
 
         downloaded: set[str] = set()
         for name, url, _target, _state in download_plan:
+            if should_continue is not None and not should_continue():
+                return set()
             try:
-                _download(url, staging_path / name)
+                if should_continue is None:
+                    _download(url, staging_path / name)
+                else:
+                    _download(url, staging_path / name, should_continue=should_continue)
             except Exception as exc:  # noqa: BLE001
                 errors[name] = str(exc)
                 log.warning("download %s into staging failed: %s", name, exc)
                 return set()
             downloaded.add(name)
 
-        categories = load_geo_categories(staging_path)
-        from .routing import validate_geo_categories_for_routing
-        missing = validate_geo_categories_for_routing(categories)
-        if missing:
-            summary = ", ".join(f"{group}:{entry}" for group, entry in missing[:10])
-            tail = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
-            errors["geo-set"] = (
-                "staged geo assets do not cover routing references: "
-                f"{summary}{tail}"
-            )
-            log.warning("%s", errors["geo-set"])
-            return set()
-
-        if validation_server is not None:
-            from .xray_config import build_xray_config_text
-            from .xray_control import validate_config_text
-
-            cfg_text = build_xray_config_text(
-                validation_server,
-                categories=categories,
-            )
-            ok, output = validate_config_text(
-                cfg_text,
-                platform_info,
-                asset_dir=staging_path,
-            )
-            if not ok:
-                last = output.strip().splitlines()[-1] if output.strip() else "unknown error"
-                errors["geo-set"] = f"xray -test failed with staged geo assets: {last}"
+        # Downloads do not hold the writer lock. Validation of the current
+        # transport and publication of the complete asset set do.
+        with publish_lock if publish_lock is not None else nullcontext():
+            if should_continue is not None and not should_continue():
+                return set()
+            categories = load_geo_categories(staging_path)
+            from .routing import validate_geo_categories_for_routing
+            missing = validate_geo_categories_for_routing(categories)
+            if missing:
+                summary = ", ".join(f"{group}:{entry}" for group, entry in missing[:10])
+                tail = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+                errors["geo-set"] = (
+                    "staged geo assets do not cover routing references: "
+                    f"{summary}{tail}"
+                )
                 log.warning("%s", errors["geo-set"])
                 return set()
-        else:
-            errors["geo-set"] = (
-                "staged geo assets passed category validation, but no server "
-                "is available for xray -test"
-            )
-            log.warning("%s", errors["geo-set"])
-            return set()
 
-        backups: dict[Path, Path | None] = {}
-        for name, _url, target, _state in download_plan:
-            if target.exists():
-                backup = staging_path / f"{name}.live-backup"
-                shutil.copy2(target, backup)
-                backups[target] = backup
+            if validation_server is not None or config_builder is not None:
+                from .xray_config import build_xray_config_text
+                from .xray_control import validate_config_text
+
+                cfg_text = (config_builder(categories) if config_builder is not None else
+                            build_xray_config_text(validation_server, categories=categories))
+                ok, output = validate_config_text(
+                    cfg_text,
+                    platform_info,
+                    asset_dir=staging_path,
+                )
+                if not ok:
+                    last = output.strip().splitlines()[-1] if output.strip() else "unknown error"
+                    errors["geo-set"] = f"xray -test failed with staged geo assets: {last}"
+                    log.warning("%s", errors["geo-set"])
+                    return set()
             else:
-                backups[target] = None
+                errors["geo-set"] = (
+                    "staged geo assets passed category validation, but no server "
+                    "is available for xray -test"
+                )
+                log.warning("%s", errors["geo-set"])
+                return set()
 
-        replaced: list[Path] = []
-        try:
+            if should_continue is not None and not should_continue():
+                return set()
+            backups: dict[Path, Path | None] = {}
             for name, _url, target, _state in download_plan:
-                staged = staging_path / name
-                os.chmod(staged, 0o644)
-                os.replace(staged, target)
-                replaced.append(target)
-        except OSError as exc:
-            log.error("geo publish failed after staging validation: %s", exc)
-            for target in reversed(replaced):
-                backup = backups.get(target)
-                try:
-                    if backup is not None and backup.exists():
-                        os.replace(backup, target)
-                    else:
-                        target.unlink(missing_ok=True)
-                except OSError as rollback_exc:
-                    # A partial rollback is possible only after an FS/I/O
-                    # failure. Later live-config writes are still gated by
-                    # geo category validation and xray -test, so mixed live
-                    # geo files must not be blindly published into config.
-                    log.error("geo rollback failed for %s: %s", target, rollback_exc)
-            errors["geo-set"] = f"failed to publish staged geo assets: {exc}"
-            return set()
-        return downloaded
+                if target.exists():
+                    backup = staging_path / f"{name}.live-backup"
+                    shutil.copy2(target, backup)
+                    backups[target] = backup
+                else:
+                    backups[target] = None
+
+            replaced: list[Path] = []
+            try:
+                for name, _url, target, _state in download_plan:
+                    staged = staging_path / name
+                    os.chmod(staged, 0o644)
+                    os.replace(staged, target)
+                    replaced.append(target)
+            except OSError as exc:
+                log.error("geo publish failed after staging validation: %s", exc)
+                for target in reversed(replaced):
+                    backup = backups.get(target)
+                    try:
+                        if backup is not None and backup.exists():
+                            os.replace(backup, target)
+                        else:
+                            target.unlink(missing_ok=True)
+                    except OSError as rollback_exc:
+                        # A partial rollback is possible only after an FS/I/O
+                        # failure. Later live-config writes are still gated by
+                        # geo category validation and xray -test, so mixed live
+                        # geo files must not be blindly published into config.
+                        log.error("geo rollback failed for %s: %s", target, rollback_exc)
+                errors["geo-set"] = f"failed to publish staged geo assets: {exc}"
+                return set()
+            return downloaded
     finally:
         shutil.rmtree(staging_path, ignore_errors=True)
 
 
 # ---------- download ----------
 
-def _download(url: str, target: Path) -> None:
+def _download(url: str, target: Path, *, should_continue=None) -> None:
     """Скачать url, проверить полноту и сделать atomic rename.
 
     Сначала пробуем прямой доступ. Если CDN GitHub/release-assets недоступен
@@ -420,8 +447,13 @@ def _download(url: str, target: Path) -> None:
     """
     failures: list[str] = []
     for route in _download_routes():
+        if should_continue is not None and not should_continue():
+            raise IOError("geo download cancelled")
         try:
-            _download_via_route(url, target, route)
+            if should_continue is None:
+                _download_via_route(url, target, route)
+            else:
+                _download_via_route(url, target, route, should_continue=should_continue)
         except Exception as exc:  # noqa: BLE001
             failures.append(f"{route.name}: {exc}")
             log.warning("download via %s failed: %s", route.name, exc)
@@ -441,7 +473,7 @@ def _download_routes() -> tuple[_DownloadRoute, ...]:
     )
 
 
-def _download_via_route(url: str, target: Path, route: _DownloadRoute) -> None:
+def _download_via_route(url: str, target: Path, route: _DownloadRoute, *, should_continue=None) -> None:
     """Скачать url через конкретный маршрут в target.part и опубликовать."""
     # Отдельный tmp-файл в той же директории — критично для os.replace()
     # (atomic rename работает только в рамках одной FS).
@@ -478,6 +510,8 @@ def _download_via_route(url: str, target: Path, route: _DownloadRoute) -> None:
                 # обнаружим обрыв соединения по несовпадению с Content-Length.
                 with tmp.open("wb") as fh:
                     for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if should_continue is not None and not should_continue():
+                            raise IOError("geo download cancelled")
                         if not chunk:
                             continue
                         fh.write(chunk)

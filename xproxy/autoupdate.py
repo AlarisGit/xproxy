@@ -103,6 +103,7 @@ def _git_network(
     *args: str,
     timeout: int = 60,
     proxy_first: bool = False,
+    should_continue=None,
 ) -> tuple[str, bool]:
     """Выполнить сетевую git-команду direct, затем через локальный xray.
 
@@ -113,6 +114,8 @@ def _git_network(
     routes = (True,) if proxy_first else (False, True)
     failures: list[str] = []
     for via_proxy in routes:
+        if should_continue is not None and not should_continue():
+            raise GitError("network operation paused")
         route_name = "xray-http" if via_proxy else "direct"
         try:
             output = _git(
@@ -212,7 +215,7 @@ class UpdateResult:
 FAILURE_REASONS = frozenset({"fetch failed", "pull failed"})
 
 
-def check_and_pull() -> UpdateResult:
+def check_and_pull(*, should_continue=None) -> UpdateResult:
     """Попытаться обновиться. Возвращает UpdateResult с деталями."""
     if not _is_git_repo():
         return UpdateResult(False, reason="not a git repo")
@@ -226,7 +229,8 @@ def check_and_pull() -> UpdateResult:
         return UpdateResult(False, reason=f"no upstream for {branch}")
 
     try:
-        _, fetch_used_proxy = _git_network("fetch", "--quiet", timeout=60)
+        _, fetch_used_proxy = _git_network("fetch", "--quiet", timeout=60,
+                                           should_continue=should_continue)
     except GitError as exc:
         log.warning("git fetch failed: %s", exc)
         return UpdateResult(False, reason="fetch failed", error=str(exc))
@@ -244,6 +248,7 @@ def check_and_pull() -> UpdateResult:
             "pull", "--ff-only", "--quiet",
             timeout=60,
             proxy_first=fetch_used_proxy,
+            should_continue=should_continue,
         )
     except GitError as exc:
         log.warning("git pull --ff-only failed: %s", exc)

@@ -1,760 +1,146 @@
 # xproxy
 
-Небольшой watchdog поверх [xray](https://github.com/XTLS/Xray-core), который:
+Watchdog для xray на **macOS и Linux**: обновляет подписку VLESS, готовит проверенный резервный маршрут, переключает upstream при сбоях и управляет аварийным SSH-туннелем.
 
-- регулярно обновляет список серверов из подписки;
-- фильтрует серверы по `conf/country.lst` и сортирует по приоритету стран;
-- скачивает актуальные `geosite.dat` / `geoip.dat` для маршрутизации с экспоненциальным бэкоффом и валидацией формата;
-- сам чистит routing/DNS от ссылок на отсутствующие `geosite:*`/`geoip:*` категории, чтобы `xray -test` не падал из-за несовпадения `.dat` и `routing.json`;
-- постоянно следит за тем, что трафик реально идёт через xray;
-- **если** интернет жив, но проксируемый трафик не проходит N раз подряд — переключается на следующий рабочий сервер, регенерируя `config.json` и рестартуя xray.
+SSH — аварийный ресурс. Пока VLESS active и standby работают, xproxy **не подключается к SSH-хостам, не резолвит их имена и не проверяет их порты**. Резервные SSH-хосты используются последовательно, только после неудачи текущего. Наличие пустого standby-слота при старте само по себе не разрешает SSH.
 
-Работает на macOS (`brew services restart xray`, `/opt/homebrew/etc/xray/config.json`) и Linux (`sudo systemctl restart xray`, `/usr/local/etc/xray/config.json`).
+- [Аварийный режим: условия, конфигурация, миграция](docs/emergency.md)
+- [Архитектура, проверки и восстановление после сбоев](docs/architecture.md)
+- [Telegram: события и доставка](docs/notifications.md)
 
-## Структура
+## Платформы
 
-```
-xproxy/            пакет
-  settings.py      все тайминги/пути
-  platform_utils.py детект платформы + команды рестарта/записи
-  env_config.py    чтение .env с валидацией
-  subscription.py  загрузка и кэш подписки
-  servers.py       парсинг vless://, страна, сортировка, TCP-проба
-  routing.py       конвертер conf/routing.json → xray routing/dns/fakedns
-                   + strip-missing-geo (вырезает ссылки на отсутствующие категории)
-  geo.py           скачивание geosite.dat / geoip.dat:
-                   atomic replace, Content-Length + format validation,
-                   exponential backoff, persistent state, self-heal от битых файлов
-  xray_config.py   сборка итогового config.json
-  xray_control.py  запись/рестарт xray
-  healthcheck.py   приоритизированные пробы через прокси и напрямую
-  state.py         состояние демона (активный сервер, счётчики)
-  notifier.py      уведомления в Telegram (SOCKS → direct)
-  autoupdate.py    git pull --ff-only, валидация, безопасный рестарт
-  daemon.py        главный цикл + one-shot
-conf/              шаблоны и справочники (версионируются)
-  config.tmpl      базовый xray-конфиг (log + inbounds); остальное добавляется
-  subscription.tmpl ссылка подписки с плейсхолдерами
-  country.lst      разрешённые страны в порядке приоритета (сверху = лучше)
-  routing.json     маршрутная конфигурация (Hiddify-like)
-state/             кэш и состояние (в .gitignore)
-                   active.json       — текущий активный сервер
-                   servers.json      — последняя успешная подписка
-                   geo_state.json    — успехи/попытки/failure-счётчики по .dat
-                   xray_config.backup.json — последний рабочий xray config
-deploy/            systemd/launchd/sudoers + install.sh
-main.py            CLI-entrypoint
-```
+| | macOS | Linux |
+|---|---|---|
+| Сервис xproxy | launchd, пользовательский LaunchAgent | systemd, пользователь из unit |
+| Перезапуск xray | `brew services restart xray` | `sudo -n systemctl restart xray` |
+| Конфиг xray | `/opt/homebrew/etc/xray/config.json`, fallback `/usr/local/etc/xray/config.json` | `/usr/local/etc/xray/config.json` |
+| Geo-assets | `~/.config/xproxy/geo` | `/var/lib/xproxy/geo` |
+| SSH | системный OpenSSH, дочерний процесс xproxy | системный OpenSSH, дочерний процесс xproxy |
 
-## Установка зависимостей
+Требуются Python 3.10+, xray в `PATH` и зависимости из `requirements.txt`. Для аварийного режима также нужны `ssh`, `ssh-keygen`, ключ аутентификации и заранее подготовленный `known_hosts`. Отдельные autossh, SSH service unit и HTTP-forward не нужны.
+
+## Установка и запуск
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-`PySocks` **обязателен** — без него проба прокси всегда будет падать.
-
-## Логи
-
-Пишутся в `/var/log/xproxy/xproxy.log` с ротацией 100 КБ × 3 файла (итого ≤ 400 КБ на диск). Также дублируются в stderr. Директория создаётся `deploy/install.sh` (потребует `sudo` один раз) и сразу передаётся текущему пользователю, так что дальнейшая работа — без sudo. Если директории нет/нет прав — файловый хендлер молча отключается, остаётся только stderr.
-
-## Запуск
+Заполните `SUBSCR_UUID` в `.env`. Для Telegram задайте `TELEGRAM_BOT_TOKEN` и `TELEGRAM_ALERTS_USER_ID`. `PySocks` обязателен для проверки прокси. Файлы `.env`, `conf/tunnels.json`, `conf/sync.json` и `state/` не версионируются; права доступа к локальным секретам настраиваются отдельно.
 
 ```bash
-python main.py --once --dry-run   # одна диагностическая итерация, не трогает xray
-python main.py --once             # одна итерация с реальной ротацией, если нужно
-python main.py --daemon           # постоянный цикл
+.venv/bin/python main.py --once --dry-run  # только чтение локальных настроек/кэша
+.venv/bin/python main.py --once            # одна итерация VLESS, может менять xray
+.venv/bin/python main.py --daemon          # полный автомат, включая аварийный режим
 ```
 
-Флаг `-v` включает DEBUG.
+`--dry-run` не выполняет сеть, не запускает процессы и не пишет состояние или файловые логи. `--once` не запускает SSH-supervisor; если конфиг xray уже использует туннель, для автоматического восстановления нужен `--daemon`. Флаг `-v` включает DEBUG. Одна установка допускает только один процесс, изменяющий конфигурацию: `--daemon` и `--once` используют общий lock.
 
-Перед первым запуском скопируйте `.env.example` → `.env` и заполните `SUBSCR_UUID`. Опционально добавьте `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALERTS_USER_ID` для уведомлений.
-
-## Telegram-уведомления
-
-Если в `.env` заданы оба ключа `TELEGRAM_BOT_TOKEN` и `TELEGRAM_ALERTS_USER_ID`, демон шлёт сообщения в ключевых точках:
-
-Формат сообщения: `hostname/public_ip: <текст>` (префикс добавляется автоматически).
-
-- **Старт** — `🟢 xproxy started (active: Германия (...))`
-- **Остановка** — `🛑 xproxy stopped (signal SIGTERM, last active: ...)`
-- **Глобальный статус active/standby**:
-  - демон не отправляет Telegram на каждую смену state-machine слотов
-    (`READY`, `EMPTY`, `WAITING_FOR_STANDBY`, `PROMOTING`, `OK`, `FAILED`) и
-    на сам факт ротации active-сервера, эти события остаются в логах;
-  - Telegram отправляется только при устойчивой смене агрегированного статуса
-    `active_ok/standby_ready/active_country`;
-  - если active-сервер устойчиво сменил страну, Telegram отправляется даже при
-    сохранении общего состояния `active=OK; standby=READY`; смена endpoint внутри
-    той же страны остаётся только в логах;
-  - по умолчанию нужна серия из `STATUS_NOTIFY_STABLE_SAMPLES=3` одинаковых
-    замеров с интервалом не меньше `STATUS_NOTIFY_SAMPLE_INTERVAL=30` секунд;
-  - первый устойчивый статус после старта фиксируется как baseline без
-    Telegram-уведомления, дальше уведомления приходят только при смене baseline;
-  - если прямой интернет недоступен, замеры global status не выполняются, а
-    незавершённая серия сбрасывается;
-  - Формат: `🟢 xproxy status READY: active=OK ...; standby=READY ...`,
-    `🟠 xproxy status DEGRADED: active=OK ...; standby=EMPTY -`,
-    `🔴 xproxy status ACTIVE_FAILED: active=FAILED ...; standby=READY ...`,
-    `🔴 xproxy status DOWN: active=FAILED ...; standby=EMPTY -`.
-- **Публикация config.json**:
-  - `🟢 config synced to ... after standby promotion ...` — удалённая SCP-публикация нового боевого конфига успешно завершилась;
-  - `⚠️ config sync failed after standby promotion ...` — на хосте настроен `conf/sync.json`, standby promotion уже восстановила xray, но SCP-публикация нового конфига не удалась.
-- **Проблема с подпиской**:
-  - `⚠️ subscription unavailable: ...` — подписка недоступна (даже кэш пуст)
-  - `🔴 subscription stale for Nh — live fetch keeps failing` — подписка не обновлялась живым фетчем более 24ч (критично)
-  - Кэш-фетч вместо живого — только в лог, без Telegram (штатная ситуация, демон восстановится сам)
-- **Автоапдейт** (успехи):
-  - `🆙 xproxy updating abc1234 → def5678, restarting` (ок, pull + restart; отправляется **blocking**, чтобы сообщение успело уйти до `os.execv`)
-  - `⚠️ autoupdate pulled ..., but requirements.txt changed` (нужен ручной pip install)
-- **Автоапдейт** (неудачи):
-  - `⚠️ autoupdate failed: fetch failed — <error>` (git fetch не прошёл)
-  - `⚠️ autoupdate failed: pull failed — <error>` (git pull ff-only отклонён)
-  - `⚠️ autoupdate paused: too many recent restarts (rate-limit)` (сработал лимит перезапусков)
-  - `⚠️ autoupdate failed (check_and_pull exception): ...` (неожиданное исключение)
-  - `🔴 autoupdate: new code failed import check` (откат на старый)
-- **Автоапдейт** (стабильные no-op, без уведомлений): `up to date`, `working tree not clean`, `no upstream`, `detached HEAD`, `not a git repo`.
-- **Нет рабочего сервера** — `🔴 no working server found (tried N of M, K in penalty box, reason=...)` (отправляется **blocking**, чтобы максимизировать шанс доставки при сломанном прокси).
-- **Geo-файлы**:
-  - `⚠️ geo download error (geosite.dat: ...); working copy kept, next retry in Ns` — скачивание не прошло (HTTP ошибка, обрыв соединения, битый ответ); боевая копия на диске не тронута.
-  - `⚠️ routing: dropped entries referencing missing geo categories (N total): ...` — в `routing.json` указаны `geosite:*` / `geoip:*` категории, которых нет в свежескачанных `.dat`. Эти правила вырезаны, чтобы `xray -test` не падал. Отправляется только при **изменении** набора выкинутых записей (не спамит).
-- **Тупик** — `🔴 xproxy stuck: rotation needed (...) but geo assets unreadable ...` (отправляется **blocking**, **urgent**). Срабатывает, если одновременно нужно переключить сервер И все `.dat`, на которые опирается текущий `routing.json`, нечитаемы. Дедуплицируется: следующее уведомление уйдёт, только когда geo-assets снова станут валидными и ситуация повторится.
-- **Суточный heartbeat** (раз в сутки, после `HEARTBEAT_HOUR=12:00` локально) — `💚 daily heartbeat: active=..., proxy=ok, uptime=2d 3h, rotations_today=N`. Если heartbeat перестал приходить — значит инстанс умер или потерял оба канала.
-
-Защиты:
-
-- **Маршрут**: сначала пробуем через xray SOCKS-прокси (во многих юрисдикциях `api.telegram.org` заблокирован на прямом канале — это одна из основных причин, почему вы используете xproxy), при неудаче — fallback на direct.
-- Каждое сообщение автоматически префиксируется `hostname/public_ip:`. Внешний IP определяется через **consensus** из нескольких `IP_CHECK_URLS` (защита от сервисов, возвращающих IP upstream-провайдера вместо реального source-IP), **без прокси**, и кэшируется на `NOTIFIER_IDENTITY_TTL` (6 часов).
-- Одинаковые сообщения не повторяются чаще 60 секунд (throttle). `urgent=True` в коде обходит throttle.
-- Отправка в daemon-треде с таймаутом 6 сек — не блокирует основной цикл.
-- Токен никогда не логируется (автоматически редактируется в любых сообщениях об ошибках).
-- Если любой из ключей не задан — функция молча ничего не делает.
-
-## Автозапуск
-
-Универсальный скрипт: `deploy/install.sh`. Он рендерит шаблоны (подставляет `$HOME`, пользователя, путь проекта, `python3`) и печатает команды установки.
-
-### macOS (LaunchAgent)
+Для автозапуска выполните:
 
 ```bash
 ./deploy/install.sh
-launchctl load -w ~/Library/LaunchAgents/com.xproxy.daemon.plist
-# чтобы xray видел кастомные geo-файлы:
+```
+
+Скрипт готовит зависимости, каталоги и шаблоны сервисов и печатает команды установки. На Linux установите сгенерированные sudoers и xray drop-in **до запуска xproxy**. Проверьте sudoers через `sudo visudo -c`. `XRAY_LOCATION_ASSET` должен быть одинаковым у xproxy и сервиса xray.
+
+На macOS:
+
+```bash
 launchctl setenv XRAY_LOCATION_ASSET "$HOME/.config/xproxy/geo"
 brew services restart xray
+launchctl load -w "$HOME/Library/LaunchAgents/com.xproxy.daemon.plist"
 ```
 
-Управление сервисом:
+На Linux следуйте напечатанным командам установки unit, sudoers и drop-in, затем:
 
 ```bash
-# Статус
-launchctl list | grep xproxy          # PID и exit-код
-
-# Логи
-tail -f /var/log/xproxy/xproxy.log
-
-# Перезапуск (отправляет SIGTERM, ждёт завершения, затем стартует)
-launchctl stop com.xproxy.daemon && launchctl start com.xproxy.daemon
-# Или одной командой:
-launchctl kickstart gui/$(id -u)/com.xproxy.daemon
-
-# Полная перезагрузка конфига
-launchctl unload ~/Library/LaunchAgents/com.xproxy.daemon.plist
-launchctl load -w ~/Library/LaunchAgents/com.xproxy.daemon.plist
-```
-
-### Linux (systemd)
-
-```bash
-./deploy/install.sh      # напечатает готовые команды
-# Установить unit:
-sudo install -m 0644 /tmp/tmp.XXXX /etc/systemd/system/xproxy.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now xproxy.service
-
-# Разрешить рестарт xray и запись config.json без пароля:
-sudo install -m 0440 /tmp/tmp.YYYY /etc/sudoers.d/xproxy
-sudo visudo -c
-
-# Сделать так, чтобы xray использовал наши geo-файлы:
-sudo systemctl edit xray
-# добавить:
-# [Service]
-# Environment=XRAY_LOCATION_ASSET=/var/lib/xproxy/geo
 sudo systemctl daemon-reload
 sudo systemctl restart xray
+sudo systemctl enable --now xproxy.service
 ```
 
-Управление сервисом:
+Linux unit использует `ProtectSystem=full` и `ReadWritePaths=/usr/local/etc/xray`. При другом расположении конфига нужно согласовать путь, sudoers и sandbox. Geo-каталог на Linux доступен для чтения пользователю xray, даже если тот отличается от пользователя xproxy.
+
+## Конфигурация
+
+| Файл | Назначение |
+|---|---|
+| `.env` | UUID подписки и Telegram |
+| `conf/subscription.tmpl` | URL подписки с плейсхолдерами UUID |
+| `conf/country.lst` | Допустимые страны в порядке приоритета |
+| `conf/config.tmpl` | Production logging и клиентские inbounds xray |
+| `conf/routing.json` | Routing, DNS, источники geo-assets |
+| `conf/direct.lst` | Дополнительные direct-домены/IP |
+| `conf/tunnels.template.json` | Версионируемый пример аварийных SSH-хостов |
+| `conf/tunnels.json` | Локальный приоритетный список SSH-хостов; отсутствует/пуст — SSH не включается |
+| `conf/sync.example.json` | Пример отдельной настройки публикации VLESS-конфига |
+| `conf/sync.json` | Локальная настройка SCP-публикации |
+| `xproxy/settings.py` | Тайминги, пороги и пути |
+
+`tunnels.json` перечитывается во время работы, без перезапуска сервиса. Изменения остальных настроек требуют перезапуска xproxy, если для них не предусмотрено собственное периодическое обновление. Параметры DNS/routing одинаково используются при VLESS и SSH; особенности TCP-туннеля описаны в [аварийном режиме](docs/emergency.md).
+
+Готовый Happ routing link из `routing.json`:
 
 ```bash
-# Статус
-sudo systemctl status xproxy.service
+.venv/bin/python main.py --routing-link
+```
 
-# Логи
+## Проверки и переключения
+
+Основной цикл проверяет интернет и трафик через xray. Отдельный worker проверяет кандидатов VLESS во временном xray на свободных loopback-портах. Он подтверждает сам upstream и применимость production routing, не переписывая рабочий конфиг при переборе.
+
+Готовый standby хранится в памяти: `READY` 5 минут, затем `PRE_STALE` ещё 10 минут с перепроверкой. Оба состояния допускают переключение после проверки fingerprint. После исчерпания кандидатов новый проход начинается через 60 секунд; отсутствие результата не останавливает поиск навсегда. Штраф кандидата меняет приоритет, но не исключает его из дальнейших проходов.
+
+При наличии проверенного резерва достаточно одного сбоя active; без него — пяти последовательных неудач. В daemon-режиме переключается только заранее проверенный маршрут. Одноразовый `--once` сохраняет последовательный VLESS fallback с проверкой и откатом после каждой попытки.
+
+Каждая смена production-конфига проходит `xray -test`, сохранение предыдущей версии, запись, перезапуск, проверку listener и трафика. Журнал `state/config-transition.json` позволяет обработать незавершённую смену после перезапуска. Ошибка запуска локального xray не считается доказательством блокировки удалённых SSH-хостов.
+
+Без интернета приостанавливаются подбор маршрутов, новые SSH-подключения и их проверки, плановые загрузки и отправка Telegram. Уже начавшийся сетевой запрос может завершиться по таймауту; его результат не используется как доказательство блокировки после смены сети. После сна/смены маршрута требуется свежая проверка.
+
+## Geo-assets
+
+Geo-файлы загружаются напрямую с fallback через HTTP-inbound xray. Проверяются полнота скачивания, формат и совместимость нового набора с текущей конфигурацией. Публикация geo и смена конфигурации синхронизированы. Ошибочная загрузка сохраняет рабочую копию; повторы используют интервалы 10 с, 1 мин, 5 мин, 30 мин, 1 ч, 6 ч с jitter.
+
+Отсутствующая категория в читаемом `.dat` удаляется из итоговых routing/DNS с уведомлением. Нечитаемый файл — другая ситуация: xproxy сохраняет ссылки, откладывает пересборку и пытается восстановить assets. Проверка `xray -test` использует managed-assets и, когда его можно определить, окружение production-сервиса. Если service-env определить не удалось, остаётся managed-проверка и предупреждение в логе.
+
+## Публикация VLESS-конфига
+
+`conf/sync.json` задаёт `host`, `port`, `user`, абсолютный удалённый `path`; пример — `conf/sync.example.json`. Отсутствующий файл отключает публикацию.
+
+Публикация запускается при фактической смене активного **VLESS-upstream**, после применения конфига, успешных IP/target-проверок и фиксации перехода. Причина смены не ограничивает отправку: учитываются promotion, восстановление xray с другим upstream, cold rotation в `--once` и возврат с SSH на другой VLESS. При возврате с SSH сравнение идёт с последним VLESS до аварии. Изменение UUID/Reality-параметров на прежнем адресе также требует публикации.
+
+Публикуется неизменяемая копия проверенного VLESS-конфига. Аварийный SOCKS-конфиг с локальным концом SSH-туннеля не отправляется. Возврат на тот же VLESS, смена standby, обычный restart/rebuild без смены upstream и dry-run публикацию не запускают. При возврате на новый VLESS отправка не ждёт окончания периода удержания SSH.
+
+В daemon-режиме SCP выполняется одним фоновым sender: ожидающие изменения объединяются до последнего, а устаревшая версия не отправляется после более новой. Перед началом отправки повторно проверяются сеть и текущий VLESS-upstream. В `--once` отправка завершается до выхода процесса; перед остановкой/exec daemon дожидается уже начатой SCP-попытки. Начатая перед последующим переключением SCP передаёт только свой сохранённый VLESS-конфиг. Ошибка SCP не отменяет восстановленный маршрут и отражается в Telegram; отдельной постоянной очереди повторных публикаций нет.
+
+Это отдельная, явно включаемая интеграция: `sync.json` не является списком аварийных туннелей и использует собственные SSH/SCP-настройки. Аутентификация должна работать без интерактивного ввода от имени пользователя сервиса.
+
+## Автообновление
+
+При наличии интернета раз в час с jitter: проверка чистого git working tree/upstream, fetch и `pull --ff-only`, при необходимости установка зависимостей, проверка импорта нового кода, затем `os.execv`. Git использует direct → HTTP xray fallback. Ошибка установки/валидации вызывает попытку возврата к предыдущему commit. Есть ограничение частых рестартов; `GIT_PULL_INTERVAL = 0` отключает обновления.
+
+Перед exec останавливаются фоновые писатели и временные xray. Работающий управляемый SSH сохраняется, а новый процесс принимает его по записи владения и перепроверяет. Обычная остановка xproxy завершает принадлежащий ему туннель. Если в этот момент трафик шёл через SSH, он останется недоступен до восстановления supervision или перехода на VLESS.
+
+## Диагностика и тесты
+
+Логи: `/var/log/xproxy/xproxy.log`, 100 КБ × 4 файла, плюс stderr. При отсутствии прав на лог-каталог остаётся stderr. SSH пишет локальный `state/ssh.log` с ротацией между попытками; этот файл может содержать адрес текущего хоста. Telegram использует идентификатор туннеля вместо его адреса.
+
+```bash
 tail -f /var/log/xproxy/xproxy.log
-# или через journalctl:
+# Linux
+systemctl status xproxy.service
 journalctl -u xproxy.service -f
-
-# Перезапуск
-sudo systemctl restart xproxy.service
-
-# Полная перезагрузка (если меняли unit-файл):
-sudo systemctl daemon-reload
-sudo systemctl restart xproxy.service
+# macOS
+launchctl list com.xproxy.daemon
 ```
 
-## Fail-safe и geo-файлы
-
-Перед каждой записью `config.json` xproxy прогоняет `xray -test` на временном файле. Проверка выполняется дважды: сначала с asset-каталогом xproxy (`XRAY_LOCATION_ASSET=GEO_DIR`), затем с `XRAY_LOCATION_ASSET`, который виден продовому xray-сервису (`systemctl show xray ...` на Linux или launchd/Homebrew plist + `launchctl getenv` на macOS). Если любой тест не прошёл — боевой `/etc/xray/config.json` **не меняется**, xray продолжает работать со старым конфигом. Сломать работающий xray нельзя, даже если мы ошибёмся в шаблоне, подписка выдаст странный URI или продовый xray не видит свежие geo-файлы.
-
-Если сгенерированный конфиг бит-в-бит совпадает с текущим на диске — запись и рестарт xray пропускаются (`ConfigUnchanged`). Это нужно, чтобы post-download rebuild или startup-rebuild не рвали живые соединения, если на самом деле ничего не изменилось.
-
-Важно: `ConfigUnchanged` проверяется только после `xray -test`. Если уже опубликованный файл совпадает с новым, но больше не проходит prod-проверку (например, у `xray.service` потерялся `XRAY_LOCATION_ASSET`), xproxy не будет маскировать это как no-op.
-
-После записи и рестарта xproxy обязательно ждёт локальный listener xray (`127.0.0.1:10808`). Если listener не поднялся за `BOOT_GRACE`, это считается аварией запуска xray, а не нерабочим сервером: ротация останавливается на первом таком кандидате, в лог пишется диагностика (`xray_running`, prod `XRAY_LOCATION_ASSET`, повторный prod `xray -test`, хвост error-log), и следующий конфиг не публикуется.
-
-На время теста пути `log.access` / `log.error` в копии конфига заменяются на `"none"` — иначе `xray -test`, запущенный из-под пользователя xproxy, пытался бы открыть боевой `/var/log/xray/*.log` (принадлежит root) и падал бы с `permission denied`, хотя сам конфиг валиден. Боевой файл на диске пишется с оригинальными путями.
-
-### systemd-sandbox: `ReadWritePaths`
-
-Юнит `xproxy.service` использует `ProtectSystem=full` — `/usr`, `/boot`, `/efi` делаются read-only для процесса в приватном mount namespace. Это хорошая практика безопасности, но у неё есть ловушка: **любая запись в `/usr/local/etc/xray/config.json` вернёт `[Errno 30] EROFS`**, даже если файл принадлежит вашему пользователю, даже через sudo (дочерние процессы наследуют namespace юнита).
-
-Поэтому в юните обязательно есть:
-
-```
-ReadWritePaths=/usr/local/etc/xray
-```
-
-Если xray на вашей системе читает конфиг из другого пути (например `/etc/xray/config.json` при установке из deb/rpm), поменяйте значение соответственно — иначе демон будет штрафовать все серверы с ошибкой `Read-only file system`, хотя FS на самом деле read-write.
-
-Запись `config.json` атомарна: сначала пишется соседний временный файл, затем выполняется rename поверх боевого файла. На Linux sudo-fallback делает то же самое через `sudo tee` во временный файл и `sudo mv -f` в целевой путь. Для совместимости первого автообновления со старыми `/etc/sudoers.d/xproxy` оставлен fallback на прежний `sudo tee config.json`, если запись во временный файл не разрешена; после применения нового `deploy/sudoers.xproxy` используется атомарный путь.
-
-Перед записью также сохраняется бэкап текущего `config.json` в `state/xray_config.backup.json`. Откатиться можно вручную или через Python:
-
-```python
-from xproxy.xray_control import restore_backup
-restore_backup()
-```
-
-### Публикация config.json после standby failover
-
-Опционально xproxy может выкладывать новый боевой `config.json` на удалённый
-web-доступный путь после подтверждённого standby failover. Это нужно для
-клиентов xray, у которых нет локального watchdog: они смогут забрать свежий
-конфиг с web-сервера.
-
-Настройка локальная для конкретного хоста xproxy и не хранится в git:
-создайте `conf/sync.json` по примеру `conf/sync.example.json`:
-
-```json
-{
-  "host": "quietharbor.net",
-  "port": 57093,
-  "user": "sergey",
-  "path": "/var/www/quietharbor.net/config.json"
-}
-```
-
-Если `conf/sync.json` отсутствует, поведение полностью прежнее: xproxy ничего
-не публикует. Если файл есть, все четыре ключа обязательны:
-
-- `host` — SSH/SCP host;
-- `port` — SSH-порт;
-- `user` — SSH-пользователь;
-- `path` — полный удалённый путь, куда будет скопирован текущий xray config.
-
-Публикация выполняется командой `scp` без shell:
-
-```text
-scp -P <port> -o BatchMode=yes -o ConnectTimeout=10 \
-  /usr/local/etc/xray/config.json <user>@<host>:<path>
-```
-
-Если локальный OpenSSH падает до соединения с `Bad owner or permissions` в
-`ssh_config`, xproxy повторяет тот же SCP с `-F none`, чтобы не зависеть от
-сломанных system/user ssh config snippets.
-
-Фактический source path берётся из `PlatformInfo.xray_config`: на Linux это
-`/usr/local/etc/xray/config.json`, на macOS путь Homebrew. `BatchMode=yes`
-означает, что интерактивный ввод пароля невозможен: для пользователя, под
-которым работает `xproxy.service`, должен быть настроен SSH key и known_hosts.
-
-Sync запускается только после успешной standby promotion по причинам
-`proxy-failing` или `target-blocked`: старый active уже признан проблемным,
-standby config применён, xray перезапущен, `proxy_alive()` и `target_alive()`
-прошли. Для cold rotation, `xray-not-running`, dry-run и неуспешной promotion
-публикации нет. SCP выполняется в отдельном thread: failover уже завершён, а
-ошибка публикации не откатывает рабочий xray config. После фактического
-завершения sync отправляется Telegram-уведомление об успехе или ошибке, если
-notifier настроен.
-
-### Безопасное скачивание geo-файлов
-
-Custom `geosite.dat`/`geoip.dat` (с расширенным набором ru-категорий из `GeositeUrl`/`GeoipUrl` в `routing.json`) скачиваются в shared-каталог и читаются xray-ом через переменную `XRAY_LOCATION_ASSET`, которая прописывается один раз при установке (см. «Автозапуск»).
-
-Сетевой маршрут скачивания предсказуемый: сначала прямой HTTPS без учёта `HTTP_PROXY`/`HTTPS_PROXY` из окружения, затем явный fallback через локальный HTTP inbound xray (`http://127.0.0.1:10809`). Это помогает при проблемах с прямым доступом к GitHub `release-assets.githubusercontent.com`, но не создаёт скрытой зависимости от случайных proxy-переменных shell/systemd/launchd.
-
-Для стабильности xray мы **никогда** не заменяем боевой `.dat`, пока не убедились, что новый geo-набор полноценный и совместим с текущим routing/config:
-
-1. Скачивание идёт в staging-директорию `.geo-staging.*` внутри `GEO_DIR`. Файлы, которые не обновляются в этот проход, копируются туда из текущего live-набора, чтобы проверялся полный будущий `XRAY_LOCATION_ASSET`.
-2. После загрузки проверяется:
-   - `Content-Length` (если сервер его вернул) должен совпадать с реально прочитанным числом байт;
-   - размер файла не меньше 1 КБ (отсекает HTML-страницы ошибок от CDN, отдаваемые с HTTP 200);
-   - содержимое разбирается собственным protobuf-парсером v2ray-geodata, ожидается минимум одна запись. HTML/мусор не пройдёт проверку.
-3. Staging-набор проверяется strict-режимом: все `geosite:*`/`geoip:*`, которые нужны `routing.json`, `direct.lst` и синтетическим DNS-правилам, должны реально присутствовать. Отсутствующая категория блокирует публикацию всего набора.
-4. xproxy собирает config с категориями из staging-набора и прогоняет `xray -test` с `XRAY_LOCATION_ASSET=<staging-dir>`. Если нет ни активного сервера, ни кандидата из подписки для сборки тестового config — публикация geo-набора откладывается.
-5. Только после успешных проверок выполняется `os.replace(staged, target)` для live `.dat`. При ошибке публикации уже заменённые файлы откатываются из staging backup.
-6. При старте и на каждой итерации live-файл на диске проверяется тем же парсером: если уже лежит битый `.dat` (например, опубликованный старой версией кода до введения валидации), он принудительно перескачивается, не дожидаясь `GEO_REFRESH`.
-
-### Бэкофф и планирование
-
-Максимальный интервал между успешными скачиваниями — `GEO_REFRESH` (6 часов). При ошибках используется экспоненциальный бэкофф из `GEO_RETRY_SCHEDULE`: `10с → 1м → 5м → 30м → 1ч → 6ч`; после каждого успеха счётчик неудач сбрасывается. Состояние (`last_success`, `last_attempt`, `failures` по каждому файлу) сохраняется в `state/geo_state.json` и переживает рестарты.
-
-Планировщик в демоне перечитывает `.dat` ровно тогда, когда это нужно: первая успешная попытка после ошибки запланирована через очередной интервал из schedule, а не через 6 часов. Это даёт быстрое восстановление без лишних обращений к CDN.
-
-### Geo-aware routing: strip_missing_geo
-
-`routing.json` может содержать ссылки на категории (`geosite:vk`, `geoip:ru`, `geosite:category-ru` и т. п.), которых может не быть в конкретном `.dat`. Для публикации новых geo-файлов действует strict-режим: отсутствующая категория блокирует замену live `.dat`. Для уже опубликованных live-файлов `build_xray_sections()` умеет мягко деградировать:
-
-- парсит `.dat` и собирает множество реально доступных категорий по каждому kind'у;
-- проходит по всем группам правил (`BlockIp/Sites`, `DirectIp/Sites`, `ProxyIp/Sites`) и по DNS (`domains`, `expectIPs`), вырезая `geosite:*`/`geoip:*` ссылки на отсутствующие категории;
-- не-geo записи (CIDR, обычные домены) всегда сохраняются;
-- факт вырезаний логируется; **пользователь уведомляется один раз** на каждый уникальный набор выкинутых записей (`_last_removed_geo_sig`), без спама.
-
-### Различие «нет категории» и «файл нечитаем»
-
-Это два разных состояния с разной семантикой:
-
-- **Staged `.dat`, категория отсутствует** → новый geo-набор не публикуется.
-- **Live `.dat`, категория отсутствует** → ссылка вырезается из routing/DNS (runtime-деградация без падения `xray -test`).
-- **Файл отсутствует/битый/не парсится** → мы **не** вырезаем ссылки: текущая маршрутизация сохраняется as-is. Иначе временная проблема с FS или CDN превратилась бы в живую деградацию трафика.
-
-В этом случае `build_xray_sections()` возвращает `geo_readable=False` и `unreadable_needed=['geosite', ...]`, а демон **не трогает live-config xray**: ни post-download rebuild, ни startup rebuild, ни ротация не выполняются. xray продолжает работать с последним валидным конфигом.
-
-Гибкость: проверяется читаемость только тех kind'ов, на которые реально ссылается итоговый построенный `routing+dns`. Пример: если `geoip.dat` отсутствует, но в `routing.json` нет ни одной `geoip:*` ссылки и нет Domestic DNS с `expectIPs=[geoip:ru]` — rebuild разрешён, отсутствие `geoip.dat` не блокирует.
-
-### Тупиковая ситуация
-
-Если одновременно (а) нужно ротировать (xray упал или прокси не отвечает), и (б) нужные `.dat` нечитаемы, демон не может подменить сервер, не потеряв live-config. Это логируется как `STUCK: rotation blocked ... AND geo assets unreadable` и отправляется отдельное blocking-urgent уведомление. Дедуплицируется: следующее сообщение придёт, только когда geo-assets восстановятся и снова деградируют.
-
-Пути платформо-специфичные:
-
-- **Linux**: `/var/lib/xproxy/geo/` — каталог создаётся `deploy/install.sh` с правами `0755`, владелец — пользователь xproxy. xray-сервис (обычно от `nobody`) может читать эту директорию, потому что она не прячется внутри `$HOME`.
-- **macOS**: `~/.config/xproxy/geo/` — на macOS `brew services` запускает xray от текущего пользователя, home-директории по умолчанию world-executable, проблем с доступом нет.
-
-**Почему именно так, а не `~/.config/xproxy/geo/` на Linux:**
-
-`$HOME` на большинстве Linux-дистрибутивов имеет права `0750`, а `~/.config/` — `0700`. Пользователь `nobody`, под которым systemd обычно запускает xray-сервис, **не может войти** в эту цепочку директорий, даже если сами файлы world-readable — `open()` возвращает `permission denied`. Выносить geo-файлы в `/var/lib/xproxy/geo/` проще и безопаснее, чем менять права на `$HOME`.
-
-**Почему не `/usr/local/share/xray/`:**
-
-- Требует sudo и whitelist в sudoers для конкретных путей.
-- Ломается на системах с read-only системными каталогами (NixOS, immutable rootfs, squashfs-пакеты).
-
-Если `XRAY_LOCATION_ASSET` **не** задан у xray — xray возьмёт устаревшие geo-файлы, пришедшие с его пакетом, и правила маршрутизации `geosite:...`/`geoip:...` могут работать не так, как ожидается. Начиная с prod-env проверки такой конфиг не будет опубликован, если он не проходит `xray -test` в окружении самого xray-сервиса.
-
-## Автоматическое обновление из git
-
-Раз в `GIT_PULL_INTERVAL` (час по умолчанию) демон пробует обновить свой код:
-
-1. Проверяет, что это git-репо, working tree чист и есть настроенный upstream. Иначе skip.
-2. `git fetch`: сначала напрямую, при сетевой ошибке — через локальный HTTP-inbound xray (`127.0.0.1:10809`). Если новых коммитов нет — skip.
-3. `git pull --ff-only` (только fast-forward, никаких мёрджей): используется тот же маршрут, на котором прошёл fetch; если direct-fetch прошёл, но direct-pull упал, pull повторяется через xray.
-4. Если изменился `requirements.txt`, демон сам выполняет `python -m pip install -r requirements.txt` через тот же интерпретатор, под которым работает xproxy. Если установка зависимостей не прошла — новый код не запускается, git откатывается на прежний commit.
-5. Если изменились deploy-файлы (`deploy/sudoers.xproxy`, `deploy/xproxy.service`, `deploy/com.xproxy.daemon.plist`), логируем/уведомляем, но продолжаем self-update: runtime-код должен сохранять обратную совместимость с уже установленным окружением.
-6. Запускает в подпроцессе `python -c "import xproxy.daemon; ..."` — валидация нового кода. Если импорт падает → остаёмся на старом коде в памяти, логируем ERROR, не рестартим.
-7. Иначе — `os.execv(sys.executable, sys.argv)`. PID сохраняется, systemd/launchd не видят «падения», логи/порты продолжают работать.
-
-Защиты:
-
-- **`fast-forward only`** — никаких авто-мёрджей, никаких переписываний истории.
-- **Direct → xray fallback** — proxy-переменные окружения игнорируются; сначала выполняется одна прямая попытка, а при её ошибке сетевые git-команды повторяются через управляемый xproxy HTTP-inbound.
-- **Чистый tree** — локальные изменения никогда не затрагиваются.
-- **Валидация импорта** — сломанный код не ломает живой демон.
-- **Rate-limit рестартов** — если за `AUTOUPDATE_RESTARTS_WINDOW` (10 мин) случилось `AUTOUPDATE_RESTARTS_LIMIT` (3) перезапусков — автоапдейт приостанавливается до следующего окна, чтобы не уйти в pull-restart-pull-restart цикл.
-- **Выключается одной строкой**: `GIT_PULL_INTERVAL = 0` в `xproxy/settings.py`.
-
-После успешного рестарта демон пишет `process started after autoupdate restart (...)` в лог, так что в истории видно, когда именно он обновился.
-
-## Аварийный режим (SSH-туннель вместо VLESS-upstream)
-
-Если протокол VLESS блокируется провайдером целиком (xproxy не может подобрать
-ни одного рабочего upstream: TCP-проба проходит, но трафик через VLESS не
-течёт), предусмотрен аварийный режим — вся логика во внешних скриптах, код
-xproxy не изменяется:
-
-- `start-fr-tunnel.sh` — вход в аварийный режим:
-  1. останавливает xproxy (bounded: 25 с graceful → SIGKILL → reset-failed;
-     при заблокированном VLESS демон находится в cold-rotation и его
-     graceful-stop виснет до systemd `TimeoutStopSec`);
-  2. поднимает SSH-туннель до внешнего сервера с живым SSH:
-     локальные `127.0.0.1:20808/20809` → SOCKS/HTTP на удалённом хосте
-     (цикл авто-reconnect в `~/.fr-tunnel/ssh-tunnel-fr.sh`);
-  3. бэкапит текущий `config.json` в `~/.fr-tunnel/xray-config.pre-emergency.json`
-     (только если текущий конфиг не emergency — повторные запуски идемпотентны);
-  4. трансформирует живой конфиг: outbound `proxy` (vless) → `socks` на
-     `127.0.0.1:20808`; DNS-серверы DoU → DoH (UDP не ходит через `ssh -L`);
-     **routing / fakedns / sniffing / inbounds остаются бит-в-бит** — вся
-     логика «что в прокси, что напрямую» сохраняется;
-  5. прогоняет `xray -test` (с нейтрализацией log-путей, как делает xproxy),
-     атомарно записывает через `sudo tee` + `sudo mv` (паттерн sudoers xproxy),
-     рестартует xray и верифицирует egress + Telegram API.
-- `stop-fr-tunnel.sh` — возврат в штатный режим: restore бэкапа (xray -test
-  на копии с логами `"none"`) → тоннель вниз → рестарт xray → запуск xproxy
-  (при старте сам пересоберёт конфиг и проверит VLESS).
-
-Параметры тоннеля (хост, порты, локальные порты) — константы в начале
-`start-fr-tunnel.sh`. Вариант `--tunnel-only` поднимает тоннель, не трогая
-xray/xproxy.
-
-Ограничения режима:
-
-- **UDP не ходит** через `ssh -L` (только TCP): QUIC откатывается на TCP,
-  UDP-native приложения (Discord voice, игры) не работают. Через VLESS UDP
-  шёл через XUDP — при возврате восстановится.
-- **После ребута** тоннель нужно поднять повторным `bash start-fr-tunnel.sh`
-  (цикл живёт в `~/.fr-tunnel/`, не в systemd). Аварийный `config.json`
-  при этом останется на диске, но без тоннеля работать не будет.
-- xray в аварийном режиме работает без watchdog: падение тоннеля на время
-  reconnect-цикла (~30 с) оставляет прокси мёртвым до восстановления.
-- Аварийный конфиг — снапшот routing на момент перехода; изменения
-  `routing.json`/`direct.lst`/geo через git pull в него не попадут
-  (актуализируются при возврате через stop-скрипт — xproxy пересоберёт).
-
-Известные ловушки, учтённые в скриптах:
-
-- `curl --noproxy '*'` **отменяет** `--socks5-hostname` — проба уходит в обход
-  тоннеля напрямую (с локального IP). В скриптах socks-пробы делаются без
-  `--noproxy`.
-- Порт SSH-тоннеля указывается как `локальный:127.0.0.1:remote` — remote-порт
-  должен реально слушать на удалённом хосте.
-
-## Happ routing link
-
-Чтобы передать мобильному приложению VPN обновлённую маршрутизацию, можно собрать ссылку из базового `conf/routing.json` и дополнительных записей `conf/direct.lst`:
+Тесты запускаются в отдельной временной установке с запретом реальных сетевых обращений и запуска немокированных subprocess:
 
 ```bash
-python main.py --routing-link
+.venv/bin/python -B tests/run.py
 ```
 
-Инструмент разделяет строки `direct.lst` на IP/CIDR и домены: IP-сети добавляются в `DirectIp`, домены — в `DirectSites`. IP-адреса валидируются через стандартный парсер Python, дубли с базовым `routing.json` не добавляются. Итоговый JSON сериализуется компактно, кодируется в base64 и печатается как `happ://routing/onadd/<base64>`.
-
-## Логика healthcheck
-
-Каждые `HEALTH_INTERVAL` (15 с) демон проверяет, проходит ли трафик через xray.
-
-### Приоритизированный обход URL
-
-Пробы IP-чекеров идут **по порядку**, а не случайно. `IP_CHECK_URLS` в `settings.py` отсортирован от самых быстрых/надёжных к медленным/резервным:
-
-1. `icanhazip.com` — стабильно быстрый, почти не таймаутит через прокси
-2. `ifconfig.me/ip` — стабильно быстрый
-3. `api.ipify.org` — иногда медленный через CDN
-4. `ipecho.net/plain` — резерв, чаще таймаутит
-
-`_any_probe()` пробует URL по порядку, останавливаясь после первого успеха. Это минимизирует число ложных 1/3-фейлов, когда случайный shuffle подкидывает медленный чекер первым.
-
-### Таймаут пробы
-
-`HEALTH_TIMEOUT = 10` с — увеличен с 5 с, чтобы CDN-ноды с холодным коннектом успевали ответить. Ранее с 5 с таймаутом ~30% проб завершались `ReadTimeout`, генерируя ложные `probe failed (1/3)`.
-
-### Анти-флаппинг
-
-Единичный фейл пробы не триггерит ротацию — нужен набор из `FAIL_THRESHOLD` (3) подряд-фейлов. `ROTATION_COOLDOWN` (60 с) не даёт ротировать чаще раза в минуту.
-
-## Логика ротации (кратко)
-
-1. Каждые `HEALTH_INTERVAL` (15 с) — проверка здоровья.
-2. Если `xray` не запущен — сразу подбираем первый рабочий сервер (`reason=xray-not-running`).
-3. Если прямой интернет мёртв — пропускаем итерацию.
-4. Если прокси отвечает, но активный сервер неизвестен (`active=None`) — ротируем, чтобы взять управление (`reason=active-unknown`). Это происходит, когда xproxy стартует, а xray уже сконфигурирован вручную или `state/active.json` утерян.
-5. Если прокси отвечает и активный сервер известен — обнуляем счётчик фейлов.
-6. Если прокси не отвечает: растим счётчик. При `FAIL_THRESHOLD` (3) подряд-фейлах — ротация:
-   - текущий активный штрафуется на `SERVER_PENALTY_DURATION` (5 мин) и уходит в конец очереди;
-   - идём по `next_candidates()`: сначала «чистые» серверы, затем штрафники (с раньше истекающим штрафом — раньше); активный всегда в конце своей группы;
-   - для каждого кандидата — быстрый TCP-probe → рендер конфига → запись → рестарт → проверка прокси;
-   - если кандидат падает на любом шаге — тоже уходит в штрафной бокс;
-   - первый прошедший становится активным (его штраф сбрасывается при `set_active`).
-7. `ROTATION_COOLDOWN` (60 с) защищает от флаппинга.
-8. **Penalty box не блокирует навсегда**: если все серверы в штрафе — мы всё равно проходим по ним (второй шанс), что важно для коротких списков серверов в подписке.
-9. Если после полного прохода ни один сервер не работает — отправляется blocking-уведомление `🔴 no working server found`.
-10. **Geo-guard**: перед любым rebuild/rotation проверяется, что в построенном routing+dns не осталось ссылок на нечитаемые `.dat`. Если остались — rebuild/rotation пропускаются, live-config xray сохраняется (см. раздел «Fail-safe и geo-файлы» → «Различие "нет категории" и "файл нечитаем"»).
-
-Все тайминги — в `xproxy/settings.py`.
-
-## Целевая архитектура standby-режима
-
-Этот раздел описывает standby-режим: xproxy поддерживает два рабочих конфига —
-один применён в боевом xray, второй заранее проверен и готов к немедленному
-применению. Балансировка средствами xray (`routing.balancers`, `observatory`)
-намеренно не входит в этот этап: standby остаётся управляемым на стороне xproxy
-через подготовку конфига и быструю promotion-операцию.
-
-Текущий первый этап реализации хранит standby slot в памяти процесса. Persistent
-cache `state/standby.json` описан ниже как следующий шаг, но пока не является
-источником данных после рестарта демона.
-
-### Основные роли
-
-**Active Guard** — быстрый контур реакции. Он не подбирает серверы и не делает
-долгий перебор кандидатов. Его задача — быстро определить, что боевой xray
-перестал доставлять трафик к критичным внешним ресурсам при живом прямом
-интернете, и применить уже готовый standby.
-
-**Standby Worker** — медленный контур подготовки резерва. Он выбирает кандидата,
-собирает production-конфиг, тщательно проверяет его и поддерживает состояние
-`standby_slot` пригодным для promotion (`READY` или `PRE_STALE`). Этот процесс
-может занимать время и не должен блокировать быстрый healthcheck боевого xray.
-
-На уровне реализации это могут быть потоки/задачи внутри одного daemon-процесса,
-а не отдельные OS-процессы. Важнее не способ запуска, а разделение обязанностей
-и синхронизация доступа к общему состоянию.
-
-### Слоты конфигурации
-
-В нормальном состоянии демон стремится держать два рабочих слота:
-
-- `active_slot` — сервер и production-конфиг, который сейчас применён в xray.
-- `standby_slot` — другой сервер и production-конфиг, который прошёл проверку,
-  но ещё не применён.
-
-`standby_slot` хранит не только JSON-конфиг, но и метаданные:
-
-- ключ сервера (`server.key()`), страна, display name;
-- время подготовки (`created_at`) и последней успешной проверки (`last_ok_at`);
-- время перехода из `READY` в `PRE_STALE` (`pre_stale_at`) и окончательный
-  срок годности (`expires_at`);
-- hash/fingerprint входов, из которых собран конфиг: сервер, `routing.json`,
-  `direct.lst`, `config.tmpl`, geo-набор, service `XRAY_LOCATION_ASSET`;
-- статус слота: `EMPTY`, `READY`, `PRE_STALE`, `PROMOTING`, `STALE`.
-
-Если routing, geo-файлы, шаблон, подписка или service-env изменились так, что
-fingerprint больше не совпадает, standby нельзя использовать как fast path: он
-становится `STALE`, а Standby Worker должен подготовить новый.
-
-Для защиты от гонок у standby-подготовки есть generation/epoch. Любое изменение
-входов standby (`subscription`, geo/routing/template/service-env invalidation)
-инкрементит generation. Worker захватывает текущую generation перед долгой
-проверкой кандидата и публикует результат только если generation не изменилась.
-Сам `config_text` тоже защищён fixed-point проверкой fingerprint: fingerprint
-снимается до сборки/валидации и после end-to-end проверки, и кандидат
-отбрасывается, если входы изменились в середине подготовки. Отдельный
-waiting-generation защищает от поздней promotion: если active успел
-восстановиться и вышел из `WAITING_FOR_STANDBY`, результат worker'а остаётся
-готовым standby, но не применяется автоматически.
-
-`PREPARING` не является статусом опубликованного standby slot. Это внутреннее
-состояние Standby Worker: он может долго собирать и проверять нового кандидата,
-но уже опубликованный `READY`/`PRE_STALE` slot при этом остаётся доступным для
-Active Guard.
-
-Жизненный цикл пригодного слота разделён на два интервала:
-
-- `READY` — свежий standby, promotion разрешена, refresh ещё не нужен;
-- `PRE_STALE` — refresh уже нужен, но promotion всё ещё разрешена;
-- `STALE` — fast promotion запрещена, нужен новый проверенный standby.
-
-### Синхронизация и персистентность
-
-Общее состояние слотов должно обновляться под одним lock. Для связи между
-контурами достаточно `Condition`/`Event` внутри daemon-процесса:
-
-- Standby Worker публикует `standby_slot=READY` и отправляет `StandbyReady`;
-- Active Guard реагирует на `StandbyReady`, если всё ещё находится в
-  `WAITING_FOR_STANDBY`; параллельный cold fallback может восстановить active
-  раньше;
-- после promotion Active Guard очищает standby slot и отправляет worker'у
-  wakeup на подготовку следующего резерва;
-- refresh подписки bump'ит generation для in-flight worker'ов, но сохраняет
-  опубликованный standby, если endpoint остался в новом ranked и fingerprint
-  совпадает; geo-update и rebuild routing/template инвалидируют standby через
-  fingerprint и тоже будят Standby Worker.
-
-Персистентный `state/standby.json` полезен как cache между рестартами, но не
-должен быть безусловным источником истины. При старте демон может загрузить
-standby snapshot, проверить fingerprint/TTL и, если нужно, быстро перепроверить
-его end-to-end перед переводом в `READY`. Если проверка не пройдена — slot
-считается `EMPTY`, а Standby Worker начинает обычный подбор.
-
-### Проверка standby
-
-Standby Worker подготавливает кандидата по конвейеру. Если текущий slot перешёл
-в `PRE_STALE`, worker сначала перепроверяет именно сохранённый в slot сервер.
-Если он всё ещё проходит end-to-end проверку, slot возвращается в `READY`, а
-поиск нового сервера не запускается.
-
-1. Выбрать следующий сервер из `next_candidates()`, если slot `EMPTY`/`STALE`
-   или перепроверка `PRE_STALE` slot провалилась. Текущий active исключается.
-   Кандидаты из страны текущего active не запрещены, но понижаются в приоритете:
-   Standby Worker сначала пробует другие страны и только затем same-country
-   fallback.
-2. Выполнить быстрый `tcp_probe(candidate.address, candidate.port)`.
-3. Собрать production config тем же кодом, который будет использоваться при
-   promotion.
-4. Прогнать `xray -test` через `validate_config_for_service()`.
-5. Выполнить end-to-end проверку через временный xray:
-   - заменить inbounds на свободные локальные standby-порты, например
-     `127.0.0.1:11808` для SOCKS и `127.0.0.1:11809` для HTTP;
-   - заменить `log.access` и `log.error` на `"none"`;
-   - оставить outbound, routing, dns и geo окружение эквивалентными будущему
-     production-конфигу;
-   - запустить `xray` дочерним процессом с временным config.json;
-   - дождаться локального standby SOCKS listener;
-   - выполнить IP-check и `TARGET_CHECK_URLS` через standby SOCKS;
-   - остановить временный xray и убрать временный конфиг.
-6. Если все проверки прошли, атомарно опубликовать `standby_slot=READY` и
-   разбудить Active Guard событием `StandbyReady`.
-
-Временный xray нужен именно для end-to-end проверки: `xray -test` и TCP-проба
-не доказывают, что VLESS/TLS/Reality handshake проходит и критичные ресурсы
-доступны через конкретный сервер. Постоянно держать вторую копию xray не нужно:
-достаточно периодически запускать её на время проверки и обновлять TTL standby.
-
-Публикация нового standby больше не отправляет точечное Telegram-уведомление.
-Такие события остаются в логах, а Telegram получает только устойчивое изменение
-глобального статуса active/standby после нескольких замеров. Это отсекает
-короткие пары вроде `EMPTY → READY`, которые не влияют на долговременное
-состояние сервиса.
-
-### Быстрый контур Active Guard
-
-Active Guard делает только дешёвые проверки:
-
-1. Проверить прямой интернет без proxy/env-переменных. Если прямой интернет
-   недоступен, ничего не переключать: это не блокировка VPN-сервера.
-2. Проверить боевой xray через SOCKS (`proxy_alive`) и критичные ресурсы
-   (`target_alive`).
-3. Проба `proxy_alive()` уже делает несколько приоритизированных попыток по
-   IP-check URL. Отдельный confirm-probe можно добавить позже, если быстрый
-   standby threshold окажется слишком чувствительным к одиночным таймаутам.
-4. Если active действительно не работает, а `standby_slot=READY` или
-   `standby_slot=PRE_STALE`, выполнить promotion.
-5. Если standby ещё `EMPTY`/`STALE`, перейти в
-   `WAITING_FOR_STANDBY`, разбудить Standby Worker и запустить осторожный
-   cold-rotation fallback. В `--once` это единственный путь реальной замены,
-   потому что Standby Worker в этом режиме не живёт фоном.
-6. Если active сам восстановился (`proxy_alive` и `target_alive` снова OK),
-   сбросить `WAITING_FOR_STANDBY`, чтобы поздний `StandbyReady` не переключил
-   здоровый active.
-
-Если standby пригоден (`READY` или `PRE_STALE`), используется отдельный быстрый порог
-`STANDBY_FAIL_THRESHOLD` (по умолчанию 1 подряд-фейл) вместо обычного
-`FAIL_THRESHOLD`. Это уменьшает время реакции: дорогой перебор уже сделан
-Standby Worker'ом заранее. `ROTATION_COOLDOWN` не задерживает promotion уже
-проверенного standby; cooldown относится только к дорогостоящему cold fallback.
-Cooldown учитывает и последнюю успешную ротацию, и последнюю попытку cold
-fallback, даже если она закончилась `no working server found`.
-
-Promotion — это не буквальный swap файлов. Старый active после блокировки
-становится `penalized`/`suspect`, а standby однонаправленно продвигается в
-active:
-
-```text
-standby_slot READY/PRE_STALE -> active_slot
-standby_slot EMPTY
-old active -> penalty/suspect
-Standby Worker wakeup -> prepare next standby
-```
-
-Promotion должна быть атомарной с точки зрения shared-state и применения
-боевого xray config:
-
-1. Под lock пометить standby как `PROMOTING`, чтобы Standby Worker не заменил
-   его во время применения.
-2. Взять общий apply-lock, который также использует cold rotation, чтобы две
-   ветки не писали `config.json` и не рестартили xray одновременно.
-3. Записать standby production-config в боевой путь `config.json`.
-4. Перезапустить xray и дождаться listener `SOCKS_HOST:SOCKS_PORT`.
-5. Выполнить быстрый post-promotion healthcheck.
-6. При успехе сохранить новый active, очистить standby slot и разбудить Standby
-   Worker для подготовки следующего резерва.
-7. Если promotion была вызвана блокировкой active (`proxy-failing` или
-   `target-blocked`) и настроен `conf/sync.json`, асинхронно опубликовать
-   текущий xray config на удалённый web-доступный путь через SCP.
-8. Если config уже был применён, но xray не стартовал или post-promotion
-   healthcheck не прошёл, попытаться откатить `config.json` через последний
-   backup. Если rollback не удался, daemon явно помечает applied standby как
-   failed active, чтобы live-конфиг и состояние daemon не расходились молча.
-9. При ошибке promotion — штрафовать этот standby, очистить slot, вернуться в
-   `WAITING_FOR_STANDBY` или в аварийный cold-rotation fallback.
-
-### Сценарий ожидания standby
-
-Если основной сервер уже признан заблокированным, но standby ещё не готов,
-Active Guard фиксирует состояние `WAITING_FOR_STANDBY`, будит Standby Worker и
-параллельно использует cold-rotation fallback. Если worker раньше опубликует
-`READY`, Active Guard может забрать standby в promotion после повторной проверки
-active; если быстрее найдётся кандидат через cold rotation, active обновляется
-прежним осторожным путём.
-
-Когда Standby Worker публикует новый `READY` slot, он отправляет событие
-`StandbyReady`. Если Active Guard всё ещё находится в `WAITING_FOR_STANDBY`, он
-перепроверяет, что active всё ещё не доставляет трафик, и только затем забирает
-этот standby в promotion. Если active уже восстановился, waiting-state
-сбрасывается, а опубликованный standby остаётся готовым. Standby Worker после
-promotion продолжает работу и подбирает следующий резерв, пока снова не
-восстановится целевое состояние: `active_slot` работает, `standby_slot=READY`.
-Если в waiting-режиме кандидаты подряд проваливают подготовку, worker делает
-один проход по списку без повторов, затем ждёт `STANDBY_RETRY_INTERVAL` или
-нового wakeup-события.
-
-Telegram-уведомления standby намеренно отправляются только при полезном
-изменении server slot: появился standby endpoint, текущий endpoint был потерян
-или выбран другой endpoint. Внутренние события Standby Worker (`PREPARING`,
-`VALIDATING`, плановый refresh или пересборка того же endpoint) остаются в
-логах.
-
-### Инварианты
-
-- Active Guard применяет standby только если slot `READY` или `PRE_STALE`.
-- Standby Worker никогда не выбирает текущий active как standby.
-- При `PRE_STALE` Standby Worker сначала перепроверяет текущий standby slot и
-  возвращает его в `READY`, если он всё ещё работает.
-- Standby Worker понижает приоритет страны текущего active только при реальной
-  замене standby: другой endpoint в той же стране допустим как fallback.
-- Старый active после сбоя не становится standby автоматически.
-- `standby_slot=READY` всегда означает, что конфиг прошёл `xray -test` и
-  end-to-end проверку через временный xray.
-- `standby_slot=PRE_STALE` всё ещё можно promoted; это сигнал worker'у
-  подготовить свежую замену без потери fast path.
-- Любое изменение geo/routing/template/service-env инвалидирует standby через
-  fingerprint.
-- Refresh подписки сохраняет usable standby, если сервер всё ещё присутствует
-  в ranked и fingerprint совпадает; если сервер удалён из подписки, slot
-  инвалидируется.
-- Подготовка нового кандидата не очищает текущий usable standby slot.
-- Результат подготовки standby, начатой на старой generation, не публикуется и
-  не штрафует кандидата.
-- Promotion забирает standby под lock, явно помечает `PROMOTING` на всё время
-  применения и через общий apply-lock не допускает параллельной записи
-  `config.json` со стороны cold rotation.
-- Если promotion не удалась, кандидат штрафуется и не переиспользуется без
-  новой проверки.
-- Standby Worker не штрафует кандидата, если за время проверки он стал текущим
-  active.
-- При отсутствии готового standby сохраняется текущий fail-safe принцип:
-  не публиковать непроверенный конфиг только ради скорости.
-
-### Отношение к текущей cold rotation
-
-Текущая `_rotate_until_working()` остаётся полезной как fallback: при пустом
-standby, ошибке promotion или первом запуске без подготовленного резерва демон
-может использовать прежний осторожный перебор кандидатов. Однако штатный путь
-после внедрения standby должен быть таким:
-
-1. Standby Worker заранее держит `standby_slot=READY` или `PRE_STALE`.
-2. Active Guard при блокировке делает быструю promotion.
-3. Standby Worker сразу готовит новый standby.
-
-Так достигается целевая конфигурация: два рабочих конфига одновременно известны
-xproxy, один применён в xray, второй проверен и готов к применению.
-
-## Что дальше (возможные улучшения)
-
-- Поддержка VMess/Trojan/Shadowsocks в подписке (сейчас только VLESS — подписка их не даёт).
-- `If-Modified-Since` / ETag при скачивании geo-файлов (экономия трафика при неизменном upstream).
-- Автодеплой `geosite.dat`/`geoip.dat` в системную директорию xray через `sudo cp` вместо правки юнита.
-- Метрики/prometheus endpoint.
+Проверяются обычные ротации, полный аварийный цикл, приоритет SSH-хостов, отмена подключений, offline/resume, hot reload, журнал/rollback, уведомления и платформенные ветки. Проверки с mock подтверждают логику macOS/Linux, но не заменяют проверку конкретных launchd/systemd, прав и удалённого SOCKS при развёртывании.

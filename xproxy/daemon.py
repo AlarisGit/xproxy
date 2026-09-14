@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import random
+import json
 import signal
 import threading
 import time
+from dataclasses import dataclass
 from typing import Optional
+
+from .connectivity import Connectivity
+from .emergency import EmergencyController, candidate_key
+from .instance_lock import InstanceLock
 
 from .autoupdate import (
     FAILURE_REASONS,
@@ -22,8 +28,8 @@ from .geo import ensure_geo_assets
 from .routing import build_xray_sections
 from .healthcheck import internet_alive, proxy_alive, target_alive, public_ips
 from .logger import get_logger
-from .notifier import drain_queue, is_configured as tg_configured, notify, set_status_provider, start_queue
-from .platform_utils import PlatformInfo, detect_platform
+from .notifier import drain_queue, is_configured as tg_configured, notify, set_status_provider, set_network_provider, start_queue
+from .platform_utils import PlatformInfo, detect_platform, network_signature
 from .servers import Server, expand_servers, filter_and_sort, load_country_ranks, parse_subscription, tcp_probe
 from .settings import (
     FAIL_THRESHOLD,
@@ -41,9 +47,10 @@ from .settings import (
     STATUS_NOTIFY_STABLE_SAMPLES,
     STANDBY_FAIL_THRESHOLD,
     STANDBY_RETRY_INTERVAL,
+    VLESS_RECOVERY_INTERVAL,
     SUBSCR_REFRESH,
 )
-from .standby import PreparedStandby, StandbyError, prepare_standby, standby_fingerprint
+from .standby import PreparedStandby, StandbyError, StandbyLocalError, prepare_standby, standby_fingerprint, stop_probes
 from .state import DaemonState, load_active
 from .subscription import SubscriptionError, fetch_subscription_text
 from .xray_control import (
@@ -53,11 +60,21 @@ from .xray_control import (
     apply_server,
     is_running,
     restore_backup,
+    commit_config,
+    recover_interrupted_config,
 )
+from .xray_config import build_xray_config_text, build_ssh_config_text
+from .xray_config import build_xray_config
 
 log = get_logger("xproxy.daemon")
 
-_CONFIG_SYNC_PROMOTION_REASONS = {"proxy-failing", "target-blocked"}
+@dataclass(frozen=True)
+class _ConfigPublication:
+    reason: str
+    previous_label: str
+    promoted_label: str
+    upstream_key: str
+    config_text: str
 
 
 def _jittered(interval: float, ratio: float = SCHEDULE_JITTER_RATIO) -> float:
@@ -79,6 +96,23 @@ class Daemon:
         self.state = DaemonState()
         self._stop = False
         self._stop_signal: Optional[int] = None
+        self.network = Connectivity()
+        self._network_generation = 0
+        self._network_announced: bool | None = None
+        self._wake_event = threading.Event()
+        self._maintenance_wake = threading.Event()
+        self._maintenance_thread: threading.Thread | None = None
+        self._config_sync_cond = threading.Condition()
+        self._config_sync_thread: threading.Thread | None = None
+        self._config_sync_pending: _ConfigPublication | None = None
+        self._runtime_started = False
+        self._restart_requested = False
+        self._health_checked_at = 0.0
+        self._next_health_at = 0.0
+        self._rebuild_pending = True
+        self._scan_attempted: set[str] = set()
+        self._scan_retry_at = 0.0
+        self._scan_started_at = 0.0
         self._country_ranks = load_country_ranks()
         # --- Jitter / анти-стампед ---
         # Каждый инстанс получает СВОИ периоды для периодических задач.
@@ -131,26 +165,17 @@ class Daemon:
         self._notified_standby_slot_key: Optional[tuple[str, int]] = None
         self._active_channel_ok: Optional[bool] = None
         self._status_last_sample_at: float = 0.0
-        self._status_candidate_key: Optional[tuple[bool, bool, Optional[str]]] = None
+        self._status_candidate_key: tuple | None = None
         self._status_candidate_count: int = 0
-        self._status_stable_key: Optional[tuple[bool, bool, Optional[str]]] = None
+        self._status_stable_key: tuple | None = None
         self._last_cold_rotation_attempt: float = 0.0
+        self.emergency = EmergencyController(self)
         # Восстановить активный сервер, если был сохранён.
-        # Если сервер не имеет resolved_ip (старый формат или hostname),
-        # резолвим hostname в IP при запуске.
+        # DNS выполняется позже, только после подтверждения наличия интернета.
         prev = load_active()
         if prev is not None:
-            if prev.resolved_ip is None:
-                from .dns_resolver import resolve_host
-                ips = resolve_host(prev.host)
-                if ips:
-                    prev.resolved_ip = ips[0]
-                    log.info("resolved active server %s → %s",
-                             prev.host, prev.resolved_ip)
-                else:
-                    log.warning("DNS resolve failed for active server %s, "
-                                "using hostname as-is", prev.host)
             self.state.active = prev
+            self.state.last_vless = prev
             log.info("restored active server: %s", _fmt(prev))
         # Инициализировать время последнего live-фетча подписки из mtime кэша.
         # Если сервер был выключен >24ч и кэш устарел — staleness обнаружится
@@ -160,6 +185,139 @@ class Daemon:
                 self.state.last_live_fetch = SERVERS_CACHE.stat().st_mtime
             except OSError:
                 pass
+
+    def _load_cached_servers(self) -> None:
+        try:
+            body = SERVERS_CACHE.read_text(encoding="utf-8")
+            ranked = filter_and_sort(parse_subscription(body), self._country_ranks)
+        except (OSError, ValueError):
+            ranked = []
+        previous = self.state.last_vless or self.state.active
+        if previous is not None and not any(candidate_key(s) == candidate_key(previous) for s in ranked):
+            ranked.append(previous)
+        self.state.set_ranked(ranked)
+
+    def _repair_xray_listener(self) -> None:
+        with self._apply_lock:
+            # A maintenance restart may have completed while we waited.
+            if is_running() or (self._runtime_started and not self.network.online()):
+                return
+            self._repair_xray_listener_with_apply_lock()
+
+    def _repair_xray_listener_with_apply_lock(self) -> None:
+        now = time.monotonic()
+        if now < getattr(self, "_local_repair_at", 0):
+            return
+        self._local_repair_at = now + 60
+        if self._standby_ready_for_fast_path():
+            self._promote_standby("xray-not-running", require_active_failure=True)
+            return
+        from .xray_control import validate_config_for_service, wait_for_proxy_port
+        from .platform_utils import restart_xray
+        with self._apply_lock:
+            try:
+                text = self.platform.xray_config.read_text()
+                valid, detail = validate_config_for_service(text, self.platform)
+                if not valid:
+                    raise RuntimeError(detail)
+                restart_xray(self.platform)
+                if not wait_for_proxy_port():
+                    raise RuntimeError("xray listener did not start")
+                self._local_repair_at = 0
+            except Exception:
+                log.exception("local xray repair failed")
+                self.emergency.local_failure()
+                self.emergency.event("config", "🔴 Local xray startup failed; SSH hosts are not "
+                                     "contacted for this fault", urgent=True)
+        self._wake_standby_worker()
+
+    def _update_network(self, online: bool, signature: str | None = None) -> None:
+        snapshot = self.network.update(online, signature)
+        if snapshot.generation != self._network_generation:
+            self._network_generation = snapshot.generation
+            with self._standby_cond:
+                self._invalidate_standby_locked("network changed or resumed")
+                self._scan_attempted.clear()
+                self._scan_retry_at = 0
+                self._standby_waiting_attempted.clear()
+            self.emergency.reset_evidence()
+            self.state.note_proxy_ok()
+            self._health_checked_at = 0
+            self._active_channel_ok = None
+            self._next_health_at = 0
+        if self._network_announced is not None and online != self._network_announced:
+            self.emergency.event("network", "🟢 Internet restored; checking routes" if online else
+                                 "🟠 Internet unavailable; route checks and SSH reconnect paused")
+        self._network_announced = online
+        if online:
+            self._wake_standby_worker()
+
+    def _maintenance_loop(self) -> None:
+        # Startup jitter belongs to optional downloads, never to recovery.
+        self._maintenance_wake.wait(random.uniform(0, STARTUP_JITTER))
+        self._maintenance_wake.clear()
+        while not self._stop:
+            if self.network.online() and not self._restart_requested:
+                try:
+                    now = time.time()
+                    if now - self.state.last_subscription_refresh >= self._subscr_period:
+                        self.refresh_subscription()
+                        self._subscr_period = _jittered(SUBSCR_REFRESH)
+                    if not self._stop and self.network.online() and now >= self._next_geo_at:
+                        self.refresh_geo(force=False)
+                    if not self._stop and self.network.online() and self._rebuild_pending and self._active_channel_ok is True:
+                        self._rebuild_config_if_active()
+                    if not self._stop and self.network.online() and GIT_PULL_INTERVAL > 0 and \
+                            now - self.state.last_git_pull >= self._git_period:
+                        self.tick_autoupdate()
+                        self._git_period = _jittered(GIT_PULL_INTERVAL)
+                except Exception:
+                    log.exception("maintenance failed")
+            if self._restart_requested:
+                return
+            self._maintenance_wake.wait(HEALTH_INTERVAL)
+            self._maintenance_wake.clear()
+
+    def _apply_verified_config(self, text: str, label: str, *, guard=None) -> bool:
+        # Caller owns _apply_lock. No other writer may replace this snapshot.
+        if self.dry_run or self._stop:
+            return False
+        if guard is not None and not guard():
+            return False
+        generation = self.network.snapshot().generation
+        def current():
+            return not self._stop and self.network.online() and \
+                self.network.snapshot().generation == generation and (guard is None or guard())
+        try:
+            try:
+                apply_config_text(text, label=label, info=self.platform, should_continue=current)
+            except ConfigUnchanged:
+                pass
+            if not current():
+                raise RuntimeError("activation cancelled: network or demand changed")
+            if not proxy_alive() or not target_alive()[0]:
+                raise RuntimeError("post-activation traffic check failed")
+            if not current():
+                raise RuntimeError("activation cancelled after traffic check")
+            commit_config(self.platform)
+            return True
+        except Exception:
+            log.exception("config activation failed: %s", label)
+            from .xray_control import TRANSACTION_PATH
+            if TRANSACTION_PATH.exists():
+                try:
+                    restored = restore_backup(self.platform)
+                    healthy = restored and self.network.online() and proxy_alive() and target_alive()[0]
+                    self.emergency.reconcile()
+                    self._record_active_health(bool(healthy))
+                    self.emergency.event("config", f"⚠️ {label} rolled back: config_restored={restored}, "
+                                         f"traffic_healthy={bool(healthy)}", urgent=True)
+                except Exception:
+                    self.emergency.reconcile()
+                    self._record_active_health(False)
+                    self.emergency.event("config", f"🔴 {label}: rollback failed; see local log", urgent=True)
+                    log.exception("config rollback failed")
+            return False
 
     # ---------- lifecycle ----------
     def install_signal_handlers(self) -> None:
@@ -173,95 +331,95 @@ class Daemon:
         log.info("signal %d received, stopping", signum)
         self._stop_signal = signum
         self._stop = True
+        self._wake_event.set()
+        self._maintenance_wake.set()
 
     def run_forever(self) -> None:
-        self.install_signal_handlers()
-        post_restart_banner()
-        log.info("daemon start (dry_run=%s, platform=%s, active=%s)",
-                 self.dry_run, self.platform.name, _fmt(self.state.active))
-        if tg_configured():
-            log.info("telegram notifications enabled")
-        set_status_provider(self._build_status_suffix)
-        start_queue()
-        notify(f"🟢 xproxy started (active: {_fmt(self.state.active)})")
-        # Startup jitter: рандомная пауза перед первым обращением к внешним
-        # ресурсам, чтобы несколько хостов, перезапущенных одновременно
-        # (после ребута / сетевого сбоя / деплоя), не стучали в subscription/
-        # GitHub/Telegram в одну и ту же секунду. SIGTERM во время паузы
-        # прерывает её штатно.
-        if STARTUP_JITTER > 0 and not self.dry_run:
-            delay = random.uniform(0, STARTUP_JITTER)
-            log.info("startup jitter: sleeping %.1fs before first external fetch",
-                     delay)
-            _sleep_interruptible(delay, lambda: self._stop)
-        if self._stop:
+        if self.dry_run:
+            self.run_once()
             return
-        # Первый проход — немедленно (после startup jitter'а).
-        # Порядок важен:
-        #   1) autoupdate — если есть новый код, restart_self() сделает
-        #      os.execv и мы не вернёмся; на следующем витке новый процесс
-        #      снова зайдёт сюда и продолжит со свежим кодом. Любая ошибка
-        #      pull'а не критична (остаёмся на старом коде, tick_autoupdate
-        #      сам уведомит пользователя).
-        #   2) подписка и geo — уже в «новом» (или old-but-good) коде.
-        # Без этого блока первый git pull случался только через один
-        # HEALTH_INTERVAL (~15с), а geo — через startup jitter, но
-        # семантика «при рестарте берём самое свежее» была неявной.
-        if GIT_PULL_INTERVAL > 0 and not self.dry_run:
+        with InstanceLock():
+            self.install_signal_handlers()
+            post_restart_banner()
+            self._runtime_started = True
+            self._load_cached_servers()
+            self.emergency.reload()
+            self.emergency.reconcile()
+            set_status_provider(self._build_status_suffix)
+            set_network_provider(self.network.online)
+            start_queue()
+            notify(f"🟢 xproxy started (transport={self.state.transport}, active={_fmt(self.state.active)})",
+                      topic="lifecycle",
+                  )
             try:
-                self.tick_autoupdate()
-            except Exception:  # noqa: BLE001
-                log.exception("startup autoupdate failed (continuing on old code)")
-        self.refresh_subscription(force=True)
-        self.refresh_geo(force=False)
-        # Следующий geo-фетч планирует сама refresh_geo() (учитывает бэкофф).
-        # Пересобрать конфиг при старте, чтобы подхватить изменения routing/
-        # direct.lst/config.tmpl, полученные через git pull (или сделанные вручную).
-        # Без этого новые маршруты не попадут в xray до следующей ротации сервера.
-        self._rebuild_config_if_active()
-        self._start_standby_worker()
-        self.tick_health()
-
-        while not self._stop:
-            _sleep_interruptible(HEALTH_INTERVAL, lambda: self._stop)
-            if self._stop:
-                break
+                self.tick()  # establish network state before adopting SSH
+                self.emergency.manager.start()
+                self._start_standby_worker()
+                self._maintenance_thread = threading.Thread(
+                    target=self._maintenance_loop, name="xproxy-maintenance", daemon=True,
+                )
+                self._maintenance_thread.start()
+                while not self._stop and not self._restart_requested:
+                    try:
+                        self.tick()
+                    except Exception:
+                        log.exception("tick failed")
+                    self._wake_event.wait(HEALTH_INTERVAL)
+                    self._wake_event.clear()
+            finally:
+                self._stop = True
+                self._maintenance_wake.set()
+                self._stop_standby_worker()
+                # Keep the instance lease until all configuration writers exit.
+                if self._maintenance_thread:
+                    self._maintenance_thread.join()
+                self._finish_config_sync()
+                self.emergency.manager.close(preserve=self._restart_requested)
+                if not self._restart_requested:
+                    notify(f"🛑 xproxy stopped ({_signal_name(self._stop_signal) if self._stop_signal else 'manual'})",
+                              topic="lifecycle",
+                          )
+                drain_queue(timeout=3)
+                set_network_provider(None)
+                log.info("daemon stopped")
+        if self._restart_requested:
             try:
-                self.tick()
-            except Exception:  # noqa: BLE001
-                log.exception("tick failed")
-
-        self._stop_standby_worker()
-        log.info("daemon stopped")
-        # Оповестить о остановке и дождаться отправки всех отложенных
-        # уведомлений (включая это). drain_queue() внутри сделает
-        # финальную попытку отправить всё из очереди, а что не ушло —
-        # сохранит на диск для следующего запуска.
-        sig_name = _signal_name(self._stop_signal) if self._stop_signal else "manual"
-        try:
-            notify(f"🛑 xproxy stopped (signal {sig_name}, last active: {_fmt(self.state.active)})",
-                   urgent=True, blocking=True)
-        except Exception:  # noqa: BLE001
-            log.exception("shutdown notify failed")
-        # Drain: фоновый sender-тред получает stopping-флаг,
-        # делает финальные попытки, несённое — на диск.
-        drain_queue()
+                restart_self()
+            except Exception:
+                self.emergency.manager.close()
+                raise
 
     def run_once(self) -> None:
-        # В one-shot режиме sender-тред нужен для отправки уведомлений
-        # из refresh_subscription / refresh_geo / tick_health.
-        # Без него notify() только ставит в очередь, и всё теряется на выходе.
-        set_status_provider(self._build_status_suffix)
-        start_queue()
-        try:
-            self.refresh_subscription(force=True)
-            self.refresh_geo(force=False)
-            self._rebuild_config_if_active()
-            self.tick_health()
-        finally:
-            drain_queue()
+        # One-shot is deliberately VLESS-only: it must never leave an
+        # unsupervised SSH process. Dry-run is entirely local/read-only.
+        if self.dry_run:
+            self._load_cached_servers()
+            self.emergency.reload()
+            log.info("[dry-run] cached VLESS=%d, configured SSH=%d, error=%s; no network or writes",
+                     len(self.state.ranked), len(self.emergency.file.config.tunnels), self.emergency.file.error or "none")
+            return
+        with InstanceLock():
+            self._load_cached_servers()
+            self.emergency.reload()
+            self.emergency.reconcile()
+            set_network_provider(self.network.online)
+            set_status_provider(self._build_status_suffix)
+            start_queue()
+            try:
+                online = internet_alive()
+                self._update_network(online)
+                if online:
+                    if not self._recover_interrupted_config():
+                        return
+                    self.refresh_subscription(force=True)
+                    if self.state.transport != "ssh":
+                        self.tick_health(has_internet=True)
+                    else:
+                        log.info("SSH routing present: use --daemon for supervised recovery")
+            finally:
+                drain_queue(timeout=3)
+                set_network_provider(None)
 
-    # ---------- periodic tasks ----------
     def _build_status_suffix(self) -> Optional[str]:
         """Построить строку статуса для добавления к сообщению.
 
@@ -273,8 +431,11 @@ class Daemon:
         """
         if self.dry_run:
             return None
-        active_country = self.state.active.country if self.state.active else "-"
-        proxy_ok = self.state.consecutive_proxy_failures < FAIL_THRESHOLD
+        tunnel = self.emergency.manager.snapshot()
+        active_country = (f"SSH/{tunnel.endpoint.id if tunnel.endpoint else '-'}"
+                          if self.state.transport == "ssh" else
+                          self.state.active.country if self.state.active else "-")
+        proxy_ok = self._active_channel_ok is True
         uptime = _format_uptime(time.time() - self.state.start_time)
 
         from .sysinfo import system_report
@@ -288,31 +449,55 @@ class Daemon:
         )
 
     def tick(self) -> None:
-        now = time.time()
-        # Проверка доступности интернет-канала — один раз за tick.
-        # Если сети нет (хост в suspend / автономном режиме), все сетевые
-        # задачи теряют смысл: подписка, geo, autoupdate — пропускаем.
-        # Результат передаём в tick_health(), чтобы не делать повторный HTTP-
-        # запрос (internet_alive() уже выполнен здесь).
-        has_internet = internet_alive()
-        if not has_internet:
-            log.info("no direct internet — skipping subscription, geo, autoupdate")
+        self.emergency.reload()
+        now = time.monotonic()
+        if now < self._next_health_at:
+            self.emergency.tick()
+            return
+        signature = network_signature() if self._runtime_started else None
+        online = internet_alive()
+        # An existing working channel proves connectivity even if direct check
+        # sites are filtered. This never opens a connection to an unused SSH host.
+        if not online and is_running():
+            online = proxy_alive()
+        self._update_network(online, signature)
+        if online:
+            with self._apply_lock:
+                if not self._recover_interrupted_config():
+                    self._next_health_at = time.monotonic() + HEALTH_INTERVAL
+                    return
+            self.tick_health(has_internet=True)
+            self.emergency.tick()
+            self._maintenance_wake.set()
         else:
-            # Все периоды — jittered. После каждого срабатывания перерисовываем
-            # интервал, чтобы при множественной установке на нескольких хостах
-            # события не слипались в одну секунду.
-            if now - self.state.last_subscription_refresh >= self._subscr_period:
-                self.refresh_subscription()
-                self._subscr_period = _jittered(SUBSCR_REFRESH)
-            if now >= self._next_geo_at:
-                self.refresh_geo(force=False)
-            if GIT_PULL_INTERVAL > 0 and \
-                    now - self.state.last_git_pull >= self._git_period:
-                self.tick_autoupdate()
-                self._git_period = _jittered(GIT_PULL_INTERVAL)
-        self.tick_health(has_internet=has_internet)
-        self._sample_global_status(has_internet=has_internet)
+            self._health_checked_at = 0
+            self._active_channel_ok = None
+            self.state.note_proxy_ok()
+        self._sample_global_status(has_internet=online)
         self.tick_heartbeat()
+        self._next_health_at = time.monotonic() + HEALTH_INTERVAL
+
+    def _recover_interrupted_config(self) -> bool:
+        from .xray_control import TRANSACTION_PATH
+        with self._apply_lock:
+            pending = TRANSACTION_PATH.exists()
+            if not recover_interrupted_config(self.platform, online=self.network.online()):
+                return False
+            if pending:
+                # Recovery may have rolled back to the opposite transport.
+                # Reconcile before health, SSH release, or maintenance writers.
+                self.emergency.reconcile()
+                with self._standby_cond:
+                    self._invalidate_standby_locked("interrupted configuration recovered")
+                    self._clear_waiting_for_standby_locked("configuration recovered")
+                    self._scan_attempted.clear()
+                    self._scan_started_at = self._scan_retry_at = 0
+                self.emergency.reset_evidence()
+                self.state.note_proxy_ok()
+                self._active_channel_ok = None
+                self._health_checked_at = 0
+                self._rebuild_pending = True
+            return True
 
     def tick_heartbeat(self) -> None:
         """Один раз в сутки (локальное время >= HEARTBEAT_HOUR) посылаем статус.
@@ -333,10 +518,13 @@ class Daemon:
             return
 
         log.info("daily heartbeat triggered")
-        notify("💚 daily heartbeat", urgent=True)
+        notify("💚 daily heartbeat", urgent=True, topic="heartbeat")
         self.state.last_heartbeat_date = today
 
     def refresh_subscription(self, force: bool = False) -> None:
+        if self._stop or not self.network.online():
+            return
+        generation = self.network.snapshot().generation
         now = time.time()
         # Внутренний guard согласован с jittered-периодом из tick(): если
         # tick решил, что пора — мы здесь точно пропускаем проверку (period
@@ -352,10 +540,11 @@ class Daemon:
         if not force:
             self.state.last_subscription_refresh = now
         try:
-            source, body = fetch_subscription_text()
+            source, body = fetch_subscription_text(should_continue=lambda: not self._stop and
+                self.network.online() and self.network.snapshot().generation == generation)
         except SubscriptionError as exc:
             log.warning("subscription unavailable: %s", exc)
-            notify(f"⚠️ subscription unavailable: {exc}")
+            notify(f"⚠️ subscription unavailable: {exc}", topic="subscription")
             return
         # Фетч прошёл (live или cache) — обновляем timestamp для всех
         # путей, включая force=True, чтобы следующий плановый refresh
@@ -369,6 +558,7 @@ class Daemon:
                 notify(
                     f"🔴 subscription stale for {hours}h — live fetch keeps failing",
                     urgent=True,
+                    topic="subscription",
                 )
                 self.state._stale_notified = True
             else:
@@ -377,12 +567,16 @@ class Daemon:
             self.state.last_live_fetch = now
             self.state._stale_notified = False
         servers = parse_subscription(body)
+        if self._stop or not self.network.online():
+            return
         expanded = expand_servers(servers)
         ranked = filter_and_sort(expanded, self._country_ranks)
         if not ranked:
             log.warning("subscription returned 0 allowed servers")
             return
         with self._standby_cond:
+            if self._stop or not self.network.online() or self.network.snapshot().generation != generation:
+                return
             self.state.set_ranked(ranked)
             self._sync_standby_after_ranked_refresh_locked(ranked)
         log.info("subscription refreshed, %d eligible servers", len(ranked))
@@ -401,27 +595,32 @@ class Daemon:
             log.warning("autoupdate paused: too many recent restarts "
                         "(rate-limit); will retry next interval")
             notify("⚠️ autoupdate paused: too many recent restarts "
-                   "(rate-limit), will retry next interval", urgent=True)
+                   "(rate-limit), will retry next interval", urgent=True, topic="update")
             return
         try:
-            result = check_and_pull()
+            result = check_and_pull(should_continue=lambda: not self._stop and self.network.online())
         except Exception as exc:  # noqa: BLE001
             log.exception("autoupdate: check_and_pull failed")
             notify(f"⚠️ autoupdate failed (check_and_pull exception): "
-                   f"{type(exc).__name__}: {exc}", urgent=True)
+                   f"{type(exc).__name__}: {exc}", urgent=True, topic="update")
             return
         if not result.updated:
             if result.reason in FAILURE_REASONS:
                 log.warning("autoupdate failed: %s — %s",
                             result.reason, result.error)
                 notify(f"⚠️ autoupdate failed: {result.reason} — {result.error}",
-                       urgent=True)
+                       urgent=True, topic="update")
             else:
                 # up to date / tree not clean / no upstream / и т.п. — молча
                 log.debug("autoupdate: no-op (%s)", result.reason)
             return
 
         if result.requirements_changed:
+            if self._stop or not self.network.online():
+                rolled_back = rollback_to(result.old_head)
+                notify(f"⚠️ autoupdate dependencies deferred: network/shutdown; rollback={rolled_back}",
+                       urgent=True, topic="update")
+                return
             log.warning(
                 "autoupdate pulled new code and requirements.txt changed "
                 "(%s → %s). Installing dependencies before validation.",
@@ -432,6 +631,7 @@ class Daemon:
                 f"{result.new_head[:7]} with requirements.txt changes; "
                 f"installing dependencies before restart.",
                 urgent=True,
+                topic="update",
             )
             ok, err = install_requirements()
             if not ok:
@@ -446,12 +646,14 @@ class Daemon:
                         f"{result.new_head[:7]}, rolled back to "
                         f"{result.old_head[:7]}: {last}",
                         urgent=True,
+                        topic="update",
                     )
                 else:
                     notify(
                         f"🔴 autoupdate: requirements install failed for "
                         f"{result.new_head[:7]} and rollback FAILED: {last}",
                         urgent=True,
+                        topic="update",
                     )
                 return
 
@@ -467,6 +669,7 @@ class Daemon:
                 f"{result.new_head[:7]} with deploy file changes; continuing "
                 f"self-update after validation.",
                 urgent=True,
+                topic="update",
             )
 
         ok, err = validate_new_code()
@@ -481,12 +684,14 @@ class Daemon:
                     f"🔴 autoupdate: new code {result.new_head[:7]} failed "
                     f"import check, rolled back to {result.old_head[:7]}",
                     urgent=True,
+                    topic="update",
                 )
             else:
                 notify(
                     f"🔴 autoupdate: new code {result.new_head[:7]} failed "
                     f"import check, rollback FAILED — working tree stuck on bad commit!",
                     urgent=True,
+                    topic="update",
                 )
             return
 
@@ -496,14 +701,30 @@ class Daemon:
             f"🆙 xproxy updating {result.old_head[:7]} → "
             f"{result.new_head[:7]}, restarting",
             blocking=True,
+            topic="update",
         )
-        restart_self()  # не вернётся при успехе
+        if self._stop:
+            return
+        if self._runtime_started:
+            self._restart_requested = True
+            self._wake_event.set()
+        else:
+            restart_self()
 
     def refresh_geo(self, force: bool) -> None:
         # Файлы кладутся в GEO_DIR. xray видит их через XRAY_LOCATION_ASSET.
         # Замена файла только атомарна и только после полного скачивания —
         # при обрыве соединения остаётся работать старая копия.
         try:
+            def config_builder(categories):
+                if self.state.transport == "ssh":
+                    cfg = build_xray_config(None, ssh_port=self.emergency._applied_port,
+                                            categories=categories)
+                    return json.dumps(cfg, ensure_ascii=False, indent=2)
+                server = self.state.active or next(iter(self.state.ranked_snapshot()), None)
+                if server is None:
+                    raise RuntimeError("no VLESS candidate for staged geo validation")
+                return build_xray_config_text(server, categories=categories)
             validation_server = self.state.active
             if validation_server is None and self.state.ranked:
                 validation_server = self.state.ranked[0]
@@ -511,6 +732,9 @@ class Daemon:
                 force=force,
                 validation_server=validation_server,
                 platform_info=self.platform,
+                publish_lock=self._apply_lock,
+                should_continue=lambda: self.network.online() and not self._stop,
+                config_builder=config_builder,
             )
         except Exception:  # noqa: BLE001
             log.exception("geo refresh failed")
@@ -529,7 +753,7 @@ class Daemon:
             # отфильтрует одинаковые сообщения. Сообщаем факт ошибок.
             errs = ", ".join(f"{n}: {e}" for n, e in result.errors.items())
             notify(f"⚠️ geo download error ({errs}); working copy kept, "
-                   f"next retry in {int(delay)}s")
+                   f"next retry in {int(delay)}s", topic="geo")
 
         # После скачивания: проверим, какие geo-ссылки в routing.json теперь
         # не резолвятся, и, если набор изменился, уведомим пользователя.
@@ -552,7 +776,7 @@ class Daemon:
         # чтобы xray подхватил новые geo-данные без ожидания ротации.
         # geo_ready=True передаём, чтобы не парсить .dat второй раз: мы
         # только что валидировали их внутри _check_and_notify_removed_geo().
-        if result.freshly_downloaded and self.state.active is not None:
+        if result.freshly_downloaded and (self.state.active is not None or self.state.transport == "ssh"):
             self._invalidate_standby("geo files updated")
             log.info("geo files updated (%s) — rebuilding xray config",
                      ",".join(sorted(result.freshly_downloaded)))
@@ -605,6 +829,7 @@ class Daemon:
             "⚠️ routing: dropped entries referencing missing geo "
             f"categories ({len(removed)} total):\n" + "\n".join(lines),
             urgent=True,
+            topic="geo",
         )
         return True
 
@@ -635,40 +860,26 @@ class Daemon:
             return False
         return True
 
-    def _rebuild_config_if_active(
-        self,
-        context: str = "startup rebuild",
-        geo_ready: Optional[bool] = None,
-    ) -> None:
-        """Пересобрать xray config, если активный сервер известен.
-
-        Нужно при старте/после autoupdate/после успешного geo-refresh:
-        конфиг пересобирается из шаблона, routing.json, direct.lst и
-        параметров сервера. Если любой из этих файлов изменился (git pull,
-        ручная правка, свежий .dat), изменения попадут в xray. Если конфиг
-        не прошёл xray -test — боевой config.json не трогается.
-
-        `context` — короткая строка для логов (кто инициировал rebuild).
-        `geo_ready` — если вызывающий уже только что проверил geo-assets,
-        пусть передаст True, чтобы избежать повторного парсинга .dat.
-        """
-        if self.state.active is None:
+    def _rebuild_config_if_active(self, context: str = "configuration rebuild",
+                                  geo_ready: Optional[bool] = None) -> None:
+        if self.dry_run or self._stop or not self.network.online() or self._active_channel_ok is not True:
             return
-        if self.dry_run:
-            log.info("[dry-run] would rebuild config for %s", _fmt(self.state.active))
-            return
-        if geo_ready is not True and not self._geo_ready_for_rebuild(context):
-            return
-        try:
-            apply_server(self.state.active, dry_run=False, info=self.platform)
-            log.info("%s: config rebuilt for %s",
-                     context, _fmt(self.state.active))
-        except ConfigUnchanged:
-            log.info("%s: config unchanged, skip rebuild", context)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("%s: failed (keeping current config): %s", context, exc)
+        with self._apply_lock:
+            if geo_ready is not True and not self._geo_ready_for_rebuild(context):
+                return
+            if self.state.transport == "ssh":
+                port = self.emergency._applied_port
+                if port is None:
+                    return
+                text = build_ssh_config_text(port)
+            elif self.state.active is not None:
+                text = build_xray_config_text(self.state.active)
+            else:
+                return
+            transport = self.state.transport
+            if self._apply_verified_config(text, context, guard=lambda: self.state.transport == transport):
+                self._rebuild_pending = False
 
-    # ---------- standby ----------
     def _start_standby_worker(self) -> None:
         if self.dry_run:
             return
@@ -691,8 +902,9 @@ class Daemon:
             self._standby_stop = True
             self._standby_cond.notify_all()
             thread = self._standby_thread
+        stop_probes()
         if thread and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=3.0)
 
     def _wake_standby_worker(self) -> None:
         with self._standby_cond:
@@ -737,6 +949,13 @@ class Daemon:
 
     def _record_active_health(self, ok: bool) -> None:
         self._active_channel_ok = ok
+        self._health_checked_at = time.monotonic()
+        if ok:
+            with self._standby_cond:
+                active = self.state.active_snapshot()
+                if self._standby is not None and active is not None and \
+                        self._standby.server.key() == active.key():
+                    self._discard_current_standby_locked(active, "active endpoint recovered")
 
     def _sample_global_status(
         self,
@@ -776,26 +995,32 @@ class Daemon:
         if self._status_stable_key is None:
             self._status_stable_key = snapshot_key
             log.info("global status baseline established: %s", text)
+            if not snapshot_key[0]:
+                notify(text, urgent=True, topic="routes")
             return
 
         if snapshot_key == self._status_stable_key:
             return
 
         self._status_stable_key = snapshot_key
-        notify(text, urgent=not snapshot_key[0] or not snapshot_key[1])
+        notify(text, urgent=not snapshot_key[0] or not snapshot_key[1], topic="routes")
 
     def _global_status_snapshot(
         self,
-    ) -> tuple[tuple[bool, bool, Optional[str]], str]:
+    ) -> tuple[tuple, str]:
         active = self.state.active_snapshot()
-        active_ok = bool(self._active_channel_ok and active is not None)
+        active_ok = bool(self._active_channel_ok and (active is not None or self.state.transport == "ssh"))
         active_country = active.country if active_ok and active is not None else None
         with self._standby_cond:
             standby = self._standby
             standby_ok = standby is not None and standby.is_usable()
             standby_server = standby.server if standby is not None else None
 
-        key = (active_ok, standby_ok, active_country)
+        tunnel = self.emergency.manager.snapshot()
+        active_label = (f"SSH/{tunnel.endpoint.id if tunnel.endpoint else 'existing'}"
+                        if self.state.transport == "ssh" else _fmt(active))
+        key = (active_ok, standby_ok, active_country, _server_key(active),
+               _server_key(standby_server) if standby_ok else None, self.state.transport)
         if active_ok and standby_ok:
             emoji = "🟢"
             status = "READY"
@@ -813,7 +1038,7 @@ class Daemon:
         standby_state = "READY" if standby_ok else "EMPTY"
         text = (
             f"{emoji} xproxy status {status}: "
-            f"active={active_state} {_fmt(active)}; "
+            f"active={active_state} {active_label}; "
             f"standby={standby_state} {_fmt(standby_server)}"
         )
         return key, text
@@ -842,6 +1067,10 @@ class Daemon:
 
     def _invalidate_standby_locked(self, reason: str) -> None:
         self._standby_generation += 1
+        self._scan_attempted.clear()
+        self._scan_retry_at = 0
+        self._scan_started_at = 0
+        self.emergency.reset_evidence()
         previous = self._standby
         if previous is not None:
             log.info("standby invalidated: %s (%s)",
@@ -858,6 +1087,9 @@ class Daemon:
         ranked: list[Server],
     ) -> None:
         self._standby_generation += 1
+        self._scan_attempted.clear()
+        self._scan_retry_at = 0
+        self.emergency.reset_evidence()
         if self._standby is None:
             self._standby_refresh_candidate = None
             self._standby_cond.notify_all()
@@ -1027,6 +1259,11 @@ class Daemon:
             previous_key = _server_key(previous.server)
 
         self._standby = prepared
+        # A successful reserve closes this search episode. Failures from
+        # before it cannot complete a new all-reserves-failed pass later.
+        self._scan_attempted.clear()
+        self._scan_started_at = 0
+        self._scan_retry_at = 0
         self._standby_refresh_candidate = None
         detail = f"{prepared.ttl_detail()} slot={prepared.fingerprint[:8]}"
         same_usable_endpoint = (
@@ -1054,128 +1291,52 @@ class Daemon:
         return True
 
     def _standby_worker_loop(self) -> None:
-        while True:
+        while not self._standby_stop and not self._stop:
             with self._standby_cond:
-                if self._standby_stop:
-                    return
+                if not self.network.online():
+                    self._standby_cond.wait(timeout=HEALTH_INTERVAL)
+                    continue
                 candidate = self._select_standby_candidate_locked()
                 if candidate is None:
-                    self._standby_cond.wait(timeout=STANDBY_RETRY_INTERVAL)
+                    self._standby_cond.wait(timeout=VLESS_RECOVERY_INTERVAL)
                     continue
                 self._standby_preparing = True
-                prepare_is_refresh = self._standby_prepare_is_refresh
+                refreshing = self._standby_prepare_is_refresh
                 self._standby_last_attempt = time.time()
                 generation = self._standby_generation
-
-            log.info("standby prepare started: %s", _fmt(candidate))
+            def current():
+                return not self._standby_stop and not self._stop and self.network.online() and \
+                    generation == self._standby_generation
             try:
-                prepared = prepare_standby(candidate, info=self.platform)
-            except StandbyError as exc:
-                log.info("standby candidate failed %s: %s", _fmt(candidate), exc)
-                with self._standby_cond:
-                    generation_changed = generation != self._standby_generation
-                    active_waiting = self._active_waiting_for_standby
-                    if generation_changed:
-                        log.info("discard standby failure from stale generation: "
-                                 "%s (prepared=%d current=%d)",
-                                 _fmt(candidate), generation, self._standby_generation)
-                        discarded_current = False
-                    else:
-                        discarded_current = self._handle_prepare_failure_locked(
-                            candidate,
-                            "revalidation failed",
-                            prepare_is_refresh,
-                        )
-                if active_waiting and not generation_changed:
-                    self._notify_standby_state(
-                        "FAILED",
-                        server=candidate,
-                        detail=str(exc),
-                        urgent=True,
-                    )
-                if not generation_changed:
-                    self._penalize_if_not_active(candidate, "standby prepare failed")
+                prepared = prepare_standby(candidate, info=self.platform, should_continue=current)
+            except Exception as exc:
+                remote_failure = isinstance(exc, StandbyError) and not isinstance(exc, StandbyLocalError)
+                # Never count an interrupted network probe as route blocking.
+                if remote_failure and current():
+                    remote_failure = self.emergency.confirm_network() and current()
                 with self._standby_cond:
                     self._standby_preparing = False
-                    if generation_changed or discarded_current or \
-                            self._active_waiting_for_standby:
-                        self._standby_cond.notify_all()
-                    else:
-                        self._standby_cond.wait(timeout=STANDBY_RETRY_INTERVAL)
+                    if current():
+                        if remote_failure:
+                            self._handle_prepare_failure_locked(candidate, str(exc), refreshing)
+                            self.emergency.failed(candidate)
+                            self._penalize_if_not_active(candidate, "standby end-to-end failure")
+                        else:
+                            self.emergency.local_failure()
+                        log.info("standby preparation failed (%s): %s", _fmt(candidate), exc)
+                    self._standby_cond.notify_all()
+                self._wake_event.set()
                 continue
-            except Exception as exc:  # noqa: BLE001
-                log.exception("standby prepare crashed for %s: %s",
-                              _fmt(candidate), exc)
-                with self._standby_cond:
-                    generation_changed = generation != self._standby_generation
-                    active_waiting = self._active_waiting_for_standby
-                    if generation_changed:
-                        log.info("discard standby crash from stale generation: "
-                                 "%s (prepared=%d current=%d)",
-                                 _fmt(candidate), generation, self._standby_generation)
-                        discarded_current = False
-                    else:
-                        discarded_current = self._handle_prepare_failure_locked(
-                            candidate,
-                            f"revalidation crashed: {type(exc).__name__}",
-                            prepare_is_refresh,
-                        )
-                if active_waiting and not generation_changed:
-                    self._notify_standby_state(
-                        "FAILED",
-                        server=candidate,
-                        detail=f"{type(exc).__name__}: {exc}",
-                        urgent=True,
-                    )
-                if not generation_changed:
-                    self._penalize_if_not_active(candidate, "standby prepare crashed")
-                with self._standby_cond:
-                    self._standby_preparing = False
-                    if generation_changed or discarded_current or \
-                            self._active_waiting_for_standby:
-                        self._standby_cond.notify_all()
-                    else:
-                        self._standby_cond.wait(timeout=STANDBY_RETRY_INTERVAL)
-                continue
-
-            promote_now = False
-            promote_reason = ""
-            promote_wait_generation = 0
             with self._standby_cond:
                 self._standby_preparing = False
-                if generation != self._standby_generation:
-                    log.info("discard prepared standby from stale generation: %s "
-                             "(prepared=%d current=%d)",
-                             _fmt(prepared.server),
-                             generation,
-                             self._standby_generation)
+                if not current() or not self._eligible_preparation(prepared.server):
                     self._standby_cond.notify_all()
                     continue
-                active = self.state.active_snapshot()
-                if active is not None and active.key() == prepared.server.key():
-                    log.info("standby candidate became active while preparing; "
-                             "discarding %s", _fmt(prepared.server))
-                    self._standby_cond.notify_all()
-                    continue
-                promote_now = self._active_waiting_for_standby
-                promote_reason = self._active_waiting_reason or "standby-ready"
-                promote_wait_generation = self._active_waiting_generation
-                log.info("standby ready: %s %s",
-                         _fmt(prepared.server), prepared.ttl_detail())
-                if not self._publish_standby_locked(
-                    prepared,
-                    generation=generation,
-                ):
-                    self._standby_cond.notify_all()
-                    continue
+                if self._publish_standby_locked(prepared, generation=generation):
+                    self.emergency.prepared(prepared)
                 self._standby_cond.notify_all()
-
-            if promote_now:
-                self._promote_standby(
-                    promote_reason,
-                    expected_wait_generation=promote_wait_generation,
-                    require_active_failure=True,
-                )
+            # The main guard is the sole decision maker for promotions.
+            self._wake_event.set()
 
     def _select_standby_candidate_locked(self) -> Optional[Server]:
         if self._standby_preparing:
@@ -1197,6 +1358,8 @@ class Daemon:
                     return candidate
                 self._standby_refresh_candidate = None
             if state == "READY":
+                if self.emergency.needs_fresh_standby(self._standby):
+                    return self._standby.server
                 return None
             if state == "PRE_STALE":
                 if self._standby.status != "PRE_STALE":
@@ -1216,43 +1379,38 @@ class Daemon:
                     detail=f"state={state}",
                 )
         active = self.state.active_snapshot()
-        if not self.state.ranked_snapshot() or active is None:
+        if not self.state.ranked_snapshot():
             return None
-        if not self._active_waiting_for_standby and \
-                time.time() - self._standby_last_attempt < STANDBY_RETRY_INTERVAL:
+        now = time.monotonic()
+        if now < self._scan_retry_at:
             return None
-        active_waiting = self._active_waiting_for_standby
-        if active_waiting and \
-                self._standby_waiting_generation != self._active_waiting_generation:
-            self._standby_waiting_generation = self._active_waiting_generation
-            self._standby_waiting_attempted.clear()
-
-        active_key = active.key()
-        active_country = active.country
-        same_country_fallback: Optional[Server] = None
-        for candidate in self.state.next_candidates():
-            candidate_key = candidate.key()
-            if candidate_key == active_key:
+        candidates = [s for s in self.state.next_candidates() if self._eligible_preparation(s)]
+        if active is not None and active.country:
+            candidates.sort(key=lambda s: s.country == active.country)
+        for candidate in candidates:
+            token = candidate_key(candidate)
+            if token in self._scan_attempted:
                 continue
-            if active_waiting and candidate_key in self._standby_waiting_attempted:
-                continue
-            if active_country and candidate.country == active_country:
-                if same_country_fallback is None:
-                    same_country_fallback = candidate
-                continue
-            if active_waiting:
-                self._standby_waiting_attempted.add(candidate_key)
+            if not self._scan_attempted:
+                self._scan_started_at = now
+            self._scan_attempted.add(token)
             return candidate
-        if same_country_fallback is not None:
-            log.info("standby fallback uses active country %s: %s",
-                     active_country, _fmt(same_country_fallback))
-            if active_waiting:
-                self._standby_waiting_attempted.add(same_country_fallback.key())
-            return same_country_fallback
-        if active_waiting and self._standby_waiting_attempted:
-            log.info("standby waiting pass exhausted; backing off for %.0fs",
-                     STANDBY_RETRY_INTERVAL)
+        if self._scan_attempted:
+            self.emergency.complete_pass(candidates, self._scan_started_at)
+            log.info("standby pass exhausted; next pass in %ss", STANDBY_RETRY_INTERVAL)
+            self._scan_attempted.clear()
+            self._scan_started_at = 0
+            self._standby_waiting_attempted.clear()
+            self._scan_retry_at = now + STANDBY_RETRY_INTERVAL
         return None
+
+    def _eligible_preparation(self, candidate: Server) -> bool:
+        active = self.state.active_snapshot()
+        if active is None or candidate.key() != active.key():
+            return True
+        # A changed UUID/Reality configuration can repair a failed endpoint,
+        # but it is never an independent reserve for a healthy active route.
+        return self._active_channel_ok is False and candidate_key(candidate) != candidate_key(active)
 
     def _enter_waiting_for_standby(self, reason: str) -> None:
         with self._standby_cond:
@@ -1292,13 +1450,15 @@ class Daemon:
     def _active_still_needs_standby(self, reason: str) -> bool:
         if self.dry_run:
             return True
-        if not is_running():
-            return True
         try:
             if not internet_alive():
+                if self._runtime_started:
+                    self._update_network(False)
                 log.info("skip standby promotion for %s: direct internet unavailable",
                          reason)
                 return False
+            if not is_running():
+                return True
             if not proxy_alive():
                 return True
             target_ok, target_detail = target_alive()
@@ -1311,6 +1471,8 @@ class Daemon:
                         "(%s): %s", reason, exc)
             return True
         log.info("skip standby promotion for %s: active recovered", reason)
+        self.state.note_proxy_ok()
+        self._record_active_health(True)
         return False
 
     def _rollback_failed_promotion(
@@ -1333,6 +1495,8 @@ class Daemon:
             restored = False
 
         if restored:
+            healthy = self.network.online() and proxy_alive() and target_alive()[0]
+            self._record_active_health(bool(healthy))
             log.warning("rolled back failed standby promotion to %s "
                         "(failed=%s, standby=%s)",
                         _fmt(previous), failure, _fmt(prepared.server))
@@ -1340,7 +1504,7 @@ class Daemon:
                 f"🟠 standby promotion rolled back to {_fmt(previous)} "
                 f"after {failure} on {_fmt(prepared.server)}"
                 f"{f' — {detail}' if detail else ''}",
-                urgent=True,
+                urgent=True, topic="config",
             )
             self._notify_active_state(
                 "FAILED",
@@ -1354,8 +1518,10 @@ class Daemon:
         log.error("promotion rollback failed; live xray may still use failed "
                   "standby %s (previous active was %s)",
                   _fmt(prepared.server), _fmt(previous))
-        self.state.set_active(prepared.server)
-        self.state.penalize(prepared.server)
+        self.emergency.reconcile()
+        self._record_active_health(False)
+        self.emergency.event("config", "🔴 Config rollback failed; inspecting the actual active transport",
+                             urgent=True)
         self._notify_active_state(
             "FAILED",
             server=prepared.server,
@@ -1371,6 +1537,8 @@ class Daemon:
         expected_wait_generation: Optional[int] = None,
         require_active_failure: bool = False,
     ) -> bool:
+        if not self.dry_run and not self.network.online():
+            return False
         with self._apply_lock:
             return self._promote_standby_with_apply_lock(
                 reason,
@@ -1424,7 +1592,7 @@ class Daemon:
             except Exception as exc:  # noqa: BLE001
                 log.warning("standby fingerprint check failed: %s", exc)
                 current_fp = None
-            promotion_state = prepared.lifecycle_state(current_fp)
+            promotion_state = prepared.lifecycle_state(current_fp) if current_fp is not None else "STALE"
             if promotion_state not in ("READY", "PRE_STALE"):
                 log.warning("standby not ready for promotion: %s",
                             _fmt(prepared.server))
@@ -1445,8 +1613,8 @@ class Daemon:
 
         try:
             prev = self.state.active
-            if prev is not None:
-                self.state.penalize(prev)
+            previous_vless = prev or self.state.last_vless
+            network_generation = self.network.snapshot().generation
             log.warning("promoting standby %s (reason=%s)",
                         _fmt(prepared.server), reason)
             self._notify_standby_state(
@@ -1468,12 +1636,17 @@ class Daemon:
                 detail=f"next={_fmt(prepared.server)}",
             )
             applied = False
+            def current():
+                return self.dry_run or (not self._stop and self.network.online() and
+                    self.network.snapshot().generation == network_generation and
+                    standby_fingerprint(prepared.server, info=self.platform) == prepared.fingerprint)
             try:
                 apply_config_text(
                     prepared.config_text,
                     label=f"standby {_fmt(prepared.server)}",
                     dry_run=self.dry_run,
                     info=self.platform,
+                    should_continue=current,
                 )
                 applied = True
             except ConfigUnchanged:
@@ -1487,7 +1660,7 @@ class Daemon:
                     detail=str(exc),
                     urgent=True,
                 )
-                self.state.penalize(prepared.server)
+                self.emergency.local_failure()
                 self._rollback_failed_promotion(
                     prepared,
                     prev,
@@ -1508,11 +1681,19 @@ class Daemon:
                     detail=f"{type(exc).__name__}: {exc}",
                     urgent=True,
                 )
-                self.state.penalize(prepared.server)
+                self.emergency.local_failure()
+                from .xray_control import TRANSACTION_PATH
+                if TRANSACTION_PATH.exists():
+                    self._rollback_failed_promotion(prepared, prev, reason=reason,
+                                                    failure="promotion-write", detail=str(exc))
                 self._enter_waiting_for_standby(reason)
                 return False
 
             if not self.dry_run:
+                if not self.network.online() or self.network.snapshot().generation != network_generation:
+                    self._rollback_failed_promotion(prepared, prev, reason=reason,
+                                                    failure="network-changed", applied=applied)
+                    return False
                 if not proxy_alive():
                     log.warning("promoted standby failed proxy healthcheck: %s",
                                 _fmt(prepared.server))
@@ -1522,7 +1703,10 @@ class Daemon:
                         reason="post-promotion-proxy",
                         urgent=True,
                     )
-                    self.state.penalize(prepared.server)
+                    if self._runtime_started:
+                        self.emergency.confirm_network()
+                    if self.network.online() and self.network.snapshot().generation == network_generation:
+                        self.state.penalize(prepared.server)
                     self._rollback_failed_promotion(
                         prepared,
                         prev,
@@ -1543,7 +1727,10 @@ class Daemon:
                         detail=target_detail,
                         urgent=True,
                     )
-                    self.state.penalize(prepared.server)
+                    if self._runtime_started:
+                        self.emergency.confirm_network()
+                    if self.network.online() and self.network.snapshot().generation == network_generation:
+                        self.state.penalize(prepared.server)
                     self._rollback_failed_promotion(
                         prepared,
                         prev,
@@ -1555,8 +1742,29 @@ class Daemon:
                     self._enter_waiting_for_standby(reason)
                     return False
 
+            if not self.dry_run:
+                if not self.network.online() or self.network.snapshot().generation != network_generation:
+                    self._rollback_failed_promotion(prepared, prev, reason=reason,
+                                                    failure="network-changed", applied=applied)
+                    return False
+                try:
+                    if not current():
+                        raise RuntimeError("prepared configuration changed during promotion")
+                    commit_config(self.platform)
+                except Exception as exc:
+                    self._rollback_failed_promotion(prepared, prev, reason=reason,
+                                                    failure="commit", detail=str(exc), applied=applied)
+                    return False
             prev_country = prev.country if prev else "-"
+            if prev is not None:
+                self.state.penalize(prev)
             self.state.set_active(prepared.server)
+            self._record_active_health(True)
+            with self._standby_cond:
+                self._standby_generation += 1
+                self._scan_attempted.clear()
+                self._scan_retry_at = 0
+            self.emergency.reset_evidence()
             log.info("standby promoted %s -> %s reason=%s",
                      prev_country, _fmt(prepared.server), reason)
             self._notify_active_state(
@@ -1565,10 +1773,11 @@ class Daemon:
                 reason=f"promoted:{reason}",
             )
             self._xray_start_failure_notified = False
-            self._schedule_config_sync_after_promotion(
+            self._schedule_config_sync_after_vless_change(
                 reason=reason,
-                previous=prev,
+                previous=previous_vless,
                 promoted=prepared.server,
+                config_text=prepared.config_text,
             )
             self._wake_standby_worker()
             return True
@@ -1577,95 +1786,150 @@ class Daemon:
                 self._promotion_in_progress = False
                 self._standby_cond.notify_all()
 
-    def _schedule_config_sync_after_promotion(
+    def _schedule_config_sync_after_vless_change(
         self,
         *,
         reason: str,
         previous: Optional[Server],
         promoted: Server,
+        config_text: str | None = None,
     ) -> None:
-        if self.dry_run:
+        if self.dry_run or self._stop or promoted.protocol != "vless":
             return
-        if reason not in _CONFIG_SYNC_PROMOTION_REASONS:
-            log.debug("config sync skipped after promotion: reason=%s", reason)
+        if previous is not None and candidate_key(previous) == candidate_key(promoted):
+            log.debug("config sync skipped: VLESS upstream unchanged (%s)", reason)
             return
-
-        previous_label = _fmt(previous)
-        promoted_label = _fmt(promoted)
-        thread = threading.Thread(
-            target=self._run_config_sync_after_promotion,
-            name="xproxy-config-sync",
-            args=(reason, previous_label, promoted_label),
-            daemon=True,
-        )
-        thread.start()
-
-    def _run_config_sync_after_promotion(
-        self,
-        reason: str,
-        previous_label: str,
-        promoted_label: str,
-    ) -> None:
+        # Caller still owns the apply lock. Capture the committed VLESS config
+        # now; the sender must never reread a subsequently installed SSH config.
         try:
-            target = sync_current_config(info=self.platform)
+            text = config_text if config_text is not None else self.platform.xray_config.read_text(encoding="utf-8")
+        except OSError as exc:
+            log.warning("cannot capture VLESS config for sync: %s", exc)
+            notify(f"⚠️ cannot capture VLESS config for sync: {exc}", urgent=True, topic="sync")
+            return
+        publication = _ConfigPublication(
+            reason, _fmt(previous), _fmt(promoted), candidate_key(promoted), text,
+        )
+        if not self._runtime_started:
+            # --once must finish publication before exiting its instance lease.
+            self._run_config_sync(publication)
+            return
+        with self._config_sync_cond:
+            # One sender preserves publication order; only the latest waiting
+            # change matters to clients fetching the shared config.json.
+            self._config_sync_pending = publication
+            if self._config_sync_thread is None:
+                self._config_sync_thread = threading.Thread(
+                    target=self._config_sync_loop, args=(), name="xproxy-config-sync", daemon=True,
+                )
+                self._config_sync_thread.start()
+
+    def _config_sync_loop(self) -> None:
+        while True:
+            with self._config_sync_cond:
+                publication = self._config_sync_pending
+                self._config_sync_pending = None
+                if self._stop or publication is None:
+                    self._config_sync_thread = None
+                    return
+            self._run_config_sync(publication)
+
+    def _finish_config_sync(self) -> None:
+        with self._config_sync_cond:
+            self._config_sync_pending = None
+            thread = self._config_sync_thread
+        if thread is not None:
+            thread.join()  # SCP has a bounded timeout; no old sender after exec.
+
+    def _run_config_sync(self, publication: _ConfigPublication) -> None:
+        active = self.state.active_snapshot()
+        if self._stop or not self.network.online() or self.state.transport != "vless" or \
+                active is None or candidate_key(active) != publication.upstream_key:
+            return
+        reason = publication.reason
+        previous_label, promoted_label = publication.previous_label, publication.promoted_label
+        try:
+            target = sync_current_config(info=self.platform, config_text=publication.config_text)
         except ConfigSyncError as exc:
-            log.warning("config sync failed after standby promotion "
+            log.warning("config sync failed after VLESS upstream change "
                         "%s → %s reason=%s: %s",
                         previous_label, promoted_label, reason, exc)
             notify(
-                f"⚠️ config sync failed after standby promotion "
+                f"⚠️ config sync failed after VLESS upstream change "
                 f"{previous_label} → {promoted_label}: {exc}",
                 urgent=True,
+                topic="sync",
             )
             return
         except Exception as exc:  # noqa: BLE001
-            log.exception("config sync crashed after standby promotion "
+            log.exception("config sync crashed after VLESS upstream change "
                           "%s → %s reason=%s",
                           previous_label, promoted_label, reason)
             notify(
-                f"⚠️ config sync crashed after standby promotion "
+                f"⚠️ config sync crashed after VLESS upstream change "
                 f"{previous_label} → {promoted_label}: "
                 f"{type(exc).__name__}: {exc}",
                 urgent=True,
+                topic="sync",
             )
             return
 
         if target is None:
             return
-        log.info("config sync completed after standby promotion %s → %s "
+        log.info("config sync completed after VLESS upstream change %s → %s "
                  "reason=%s target=%s",
                  previous_label, promoted_label, reason, target.safe_label())
         notify(
-            f"🟢 config synced to {target.safe_label()} after standby promotion "
+            f"🟢 config synced to {target.safe_label()} after VLESS upstream change "
             f"{previous_label} → {promoted_label} reason={reason}"
-        )
+        , topic="sync")
 
     def _standby_ready_for_fast_path(self) -> bool:
         with self._standby_cond:
             return self._standby is not None and self._standby.is_usable()
 
     def _fail_threshold_for_current_state(self) -> int:
-        if self._standby_ready_for_fast_path():
+        if self._standby_ready_for_fast_path() or self.emergency.manager.snapshot().ready:
             return max(1, STANDBY_FAIL_THRESHOLD)
         return FAIL_THRESHOLD
 
     # ---------- health / rotation ----------
     def tick_health(self, *, has_internet: bool | None = None) -> None:
-        if not is_running():
-            self._record_active_health(False)
-            log.warning("xray is not running; trying to start with best server")
-            self._handle_rotation_needed(reason="xray-not-running")
-            return
+        # The sample and its routing decision belong to one loaded config.
+        # A maintenance restart cannot masquerade as an upstream failure.
+        with self._apply_lock:
+            self._tick_health_with_apply_lock(has_internet=has_internet)
 
-        # Переиспользуем результат internet_alive() из tick(), если он
-        # передан; иначе проверяем сами (для run_once / run_forever startup).
+    def _tick_health_with_apply_lock(self, *, has_internet: bool | None = None) -> None:
         if has_internet is None:
             has_internet = internet_alive()
         if not has_internet:
-            log.info("no direct internet — skipping proxy health check")
+            self._active_channel_ok = None
+            self._health_checked_at = 0
+            self.state.note_proxy_ok()
+            return
+        generation = self.network.snapshot().generation
+        def current():
+            return not self._runtime_started or (not self._stop and self.network.online() and
+                self.network.snapshot().generation == generation)
+        if not current():
+            return
+        running = is_running()
+        if not current():
+            return
+        if not running:
+            self._record_active_health(False)
+            # A local service failure is not evidence of a blocked VLESS route.
+            if self._runtime_started:
+                self._repair_xray_listener()
+            else:
+                self._handle_rotation_needed(reason="xray-not-running")
             return
 
-        if not proxy_alive():
+        proxy_ok = proxy_alive()
+        if not current():
+            return
+        if not proxy_ok:
             self._record_active_health(False)
             # --- Прокси совсем не работает (даже IP-чекеры не проходят) ---
             fails = self.state.note_proxy_fail()
@@ -1679,6 +1943,8 @@ class Daemon:
 
         # Прокси работает (IP-чекеры прошли). Проверяем целевые ресурсы.
         target_ok, target_detail = target_alive()
+        if not current():
+            return
         if not target_ok:
             self._record_active_health(False)
             # Целевой ресурс недоступен через этот прокси.
@@ -1713,15 +1979,23 @@ class Daemon:
                         "current xray config")
 
     def _handle_rotation_needed(self, reason: str) -> None:
+        if self.state.transport == "ssh":
+            self._wake_standby_worker()
+            return
         if self._promotion_running():
             log.info("rotation needed (%s) while standby promotion is in progress; "
                      "skip fallback", reason)
             return
-        if self._promote_standby(reason):
+        if self._promote_standby(reason, require_active_failure=self._runtime_started):
             return
         if self._rotation_request_is_stale(reason):
             return
         self._enter_waiting_for_standby(reason)
+        if self._runtime_started:
+            # Every daemon-mode candidate is tested in an isolated xray.
+            # The one-shot fallback below retains bounded VLESS-only behavior.
+            self._wake_standby_worker()
+            return
         if not self._cold_rotation_allowed(reason):
             return
 
@@ -1793,6 +2067,7 @@ class Daemon:
                     f"assets unreadable — cannot rebuild xray config. "
                     f"Manual intervention may be required.",
                     urgent=True, blocking=True,
+                    topic="config",
                 )
                 self._stuck_notified = True
             return
@@ -1809,6 +2084,8 @@ class Daemon:
 
         tried = 0
         for candidate in self.state.next_candidates():
+            if self._stop or not self.network.online():
+                return
             if candidate is self.state.active:
                 continue
             tried += 1
@@ -1821,6 +2098,9 @@ class Daemon:
             try:
                 apply_server(candidate, dry_run=self.dry_run, info=self.platform)
             except XrayStartError as exc:
+                from .xray_control import TRANSACTION_PATH
+                if TRANSACTION_PATH.exists():
+                    restore_backup(self.platform)
                 log.error("rotation aborted: xray failed to start after applying "
                           "%s: %s", _fmt(candidate), exc)
                 if not self._xray_start_failure_notified:
@@ -1830,23 +2110,22 @@ class Daemon:
                         f"Reason: {exc}",
                         urgent=True,
                         blocking=True,
+                        topic="config",
                     )
                     self._xray_start_failure_notified = True
                 return
+            except ConfigUnchanged:
+                pass
             except Exception as exc:  # noqa: BLE001
                 log.warning("apply_server failed: %s", exc)
-                self.state.penalize(candidate)
-                continue
+                from .xray_control import TRANSACTION_PATH
+                if TRANSACTION_PATH.exists():
+                    restore_backup(self.platform)
+                self.emergency.local_failure()
+                return
 
             if self.dry_run:
                 log.info("[dry-run] would switch to %s", _fmt(candidate))
-                self.state.set_active(candidate)
-                self._notify_active_state(
-                    "OK",
-                    server=candidate,
-                    reason=f"dry-run-switch:{reason}",
-                )
-                self._wake_standby_worker()
                 return
 
             if proxy_alive():
@@ -1856,10 +2135,14 @@ class Daemon:
                     log.info("candidate %s passes proxy probe but blocks %s",
                              _fmt(candidate), tgt_detail)
                     self.state.penalize(candidate)
+                    restore_backup(self.platform)
                     continue
 
+                commit_config(self.platform)
+                previous_vless = self.state.active or self.state.last_vless
                 prev_country = self.state.active.country if self.state.active else None
                 self.state.set_active(candidate)
+                self._record_active_health(True)
                 with self._standby_cond:
                     self._active_waiting_for_standby = False
                     self._active_waiting_reason = ""
@@ -1870,11 +2153,17 @@ class Daemon:
                     reason=f"switched:{reason}",
                 )
                 self._xray_start_failure_notified = False
+                self._schedule_config_sync_after_vless_change(
+                    reason=reason, previous=previous_vless, promoted=candidate,
+                )
                 self._wake_standby_worker()
                 return
             log.info("candidate %s did not pass proxy probe after restart",
                      _fmt(candidate))
             self.state.penalize(candidate)
+            if not restore_backup(self.platform):
+                self.emergency.reconcile()
+                return
 
         # Никто не прошёл. Это важное событие — используем blocking-отправку,
         # чтобы максимально увеличить шансы доставки (сообщение всё ещё может
@@ -1887,7 +2176,7 @@ class Daemon:
                 f"🔴 no working server found (tried {tried} of "
                 f"{len(self.state.ranked)}, {penalties} in penalty box, "
                 f"reason={reason})",
-                urgent=True, blocking=True,
+                urgent=True, topic="routes",
             )
         except Exception:  # noqa: BLE001
             log.exception("alert notify failed")

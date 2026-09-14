@@ -31,8 +31,11 @@ def secure_write(path: Path, content: str, *, encoding: str = "utf-8") -> None:
         suffix=".tmp",
     )
     try:
-        os.write(fd, content.encode(encoding))
+        with os.fdopen(fd, "w", encoding=encoding) as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(path))
     finally:
-        os.close(fd)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, str(path))
+        Path(tmp).unlink(missing_ok=True)

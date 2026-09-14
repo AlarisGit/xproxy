@@ -111,8 +111,20 @@ def _validate_ip_network(entry: str, *, lineno: int) -> str:
 
 def build_xray_sections(
     categories: dict[str, set[str] | None] | None = None,
+    *, tcp_dns: bool = False,
 ) -> dict:
     cfg = load_routing()
+    if tcp_dns:
+        cfg = dict(cfg)
+        for prefix in ("Remote", "Domestic"):
+            kind = str(cfg.get(f"{prefix}DNSType") or "DoU").upper()
+            if kind in ("DOU", "DOQ"):
+                if cfg.get(f"{prefix}DNSDomain"):
+                    cfg[f"{prefix}DNSType"] = "DoH"
+                else:
+                    address = cfg.get(f"{prefix}DNSIp") or "1.1.1.1"
+                    cfg[f"{prefix}DNSType"] = "DoU"
+                    cfg[f"{prefix}DNSIp"] = address if str(address).startswith("tcp://") else f"tcp://{address}"
     direct_extras = load_direct_extras()
     # Загружаем доступные категории из .dat-файлов. Ленивый импорт,
     # чтобы избежать циклической зависимости routing ↔ geo.

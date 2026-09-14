@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import socket
@@ -39,6 +40,8 @@ def _fmt_server(server: Server) -> str:
     return f"{server.host}:{server.port}"
 
 BACKUP_PATH: Path = STATE_DIR / "xray_config.backup.json"
+TRANSACTION_PATH: Path = STATE_DIR / "config-transition.json"
+VLESS_BACKUP_PATH: Path = STATE_DIR / "vless.last-good.json"
 _TEST_TIMEOUT = 20
 
 
@@ -76,6 +79,7 @@ def apply_config_text(
     label: str = "prepared config",
     dry_run: bool = False,
     info: PlatformInfo | None = None,
+    should_continue=None,
 ) -> None:
     """Провалидировать, записать готовый config.json и перезапустить xray.
 
@@ -97,11 +101,14 @@ def apply_config_text(
             f"xray -test failed for {label}: {short}"
         )
 
+    if should_continue is not None and not should_continue():
+        raise XrayConfigError("configuration activation cancelled before write")
+
     # 2. Diff: если конфиг не изменился — не трогаем xray.
     # Diff намеренно после xray -test: уже опубликованный конфиг мог стать
     # невалидным для текущего service-env, и ConfigUnchanged не должен это
     # маскировать.
-    if not dry_run and _config_matches_current(cfg_text, info):
+    if not dry_run and _config_matches_current(cfg_text, info) and is_running():
         log.info("config unchanged, skip write+restart (%s)",
                  label)
         raise ConfigUnchanged(
@@ -113,11 +120,8 @@ def apply_config_text(
                  len(cfg_text), info.xray_config)
         return
 
-    # 3. Бэкап текущего конфига (best-effort).
-    try:
-        _backup_current_config(info)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("config backup skipped: %s", exc)
+    # A write without a rollback snapshot is not safe.
+    _backup_current_config(info, cfg_text)
 
     log.info("write xray config → %s (%s)", info.xray_config, label)
     write_xray_config(cfg_text, info)
@@ -347,10 +351,18 @@ def _neutralize_log_paths(cfg_text: str) -> str:
 def restore_backup(info: PlatformInfo | None = None) -> bool:
     """Восстановить бэкап config.json, если он есть. Возвращает True при успехе."""
     info = info or detect_platform()
-    if not BACKUP_PATH.exists():
+    if TRANSACTION_PATH.exists():
+        pending = json.loads(TRANSACTION_PATH.read_text())
+        text = pending.get("previous")
+        if text is None:
+            log.error("interrupted first activation has no previous config")
+            TRANSACTION_PATH.unlink(missing_ok=True)
+            return False
+    elif BACKUP_PATH.exists():
+        text = BACKUP_PATH.read_text(encoding="utf-8")
+    else:
         log.warning("no backup at %s", BACKUP_PATH)
         return False
-    text = BACKUP_PATH.read_text(encoding="utf-8")
     ok, err = validate_config_for_service(text, info)
     if not ok:
         log.error("backup at %s is not valid (%s) — refusing to restore",
@@ -358,7 +370,72 @@ def restore_backup(info: PlatformInfo | None = None) -> bool:
         return False
     write_xray_config(text, info)
     _platform_restart(info)
-    return wait_for_proxy_port()
+    restored = wait_for_proxy_port()
+    if restored:
+        TRANSACTION_PATH.unlink(missing_ok=True)
+    return restored
+
+
+def commit_config(info: PlatformInfo) -> None:
+    """Call only after traffic verification. Config and process may outlive us."""
+    if not TRANSACTION_PATH.exists():
+        return
+    text = info.xray_config.read_text(encoding="utf-8")
+    if TRANSACTION_PATH.exists():
+        pending = json.loads(TRANSACTION_PATH.read_text())
+        if hashlib.sha256(text.encode()).hexdigest() != pending["desired_hash"]:
+            raise XrayConfigError("config changed before transition commit")
+    cfg = json.loads(text)
+    if any(o.get("tag") == "proxy" and o.get("protocol") == "vless"
+           for o in cfg.get("outbounds", [])):
+        secure_write(VLESS_BACKUP_PATH, text)
+    TRANSACTION_PATH.unlink(missing_ok=True)
+
+
+def recover_interrupted_config(info: PlatformInfo, *, online: bool) -> bool:
+    """Resolve a crash by explicitly loading the persisted config into xray.
+
+    A healthy listener may still serve the config from before the write. Even
+    current == previous is ambiguous: a rollback may have crashed before its
+    restart. Conservatively restart in both cases, only after network recovery.
+    """
+    if not TRANSACTION_PATH.exists():
+        return True
+    pending = json.loads(TRANSACTION_PATH.read_text())
+    current = info.xray_config.read_text() if info.xray_config.exists() else None
+    previous_on_disk = current == pending.get("previous")
+    if not previous_on_disk and current is not None and hashlib.sha256(current.encode()).hexdigest() != pending["desired_hash"]:
+        raise XrayConfigError("live config differs from interrupted transition; preserving external change")
+    if not online:
+        return False
+    if previous_on_disk and current is None:
+        # First activation crashed before writing any config. There is no
+        # persisted runtime target to reload; allow a new validated activation.
+        TRANSACTION_PATH.unlink(missing_ok=True)
+        return True
+    from .healthcheck import proxy_alive, target_alive
+    loaded = False
+    if current is not None:
+        valid, _ = validate_config_for_service(current, info)
+        if valid:
+            try:
+                _platform_restart(info)
+                loaded = wait_for_proxy_port()
+            except Exception:
+                log.exception("could not reload interrupted config")
+    if previous_on_disk:
+        if loaded:
+            TRANSACTION_PATH.unlink(missing_ok=True)
+        return loaded
+    if loaded and proxy_alive() and target_alive()[0]:
+        commit_config(info)
+        return True
+    if restore_backup(info):
+        # Config restoration and channel health are separate facts.
+        healthy = proxy_alive() and target_alive()[0]
+        log.warning("interrupted transition rolled back; traffic healthy=%s", healthy)
+        return True
+    return False
 
 
 def wait_for_proxy_port(
@@ -376,7 +453,8 @@ def wait_for_proxy_port(
 
 
 def is_running() -> bool:
-    return xray_is_running()
+    # Temporary standby xray processes must not impersonate the service.
+    return _port_open(SOCKS_HOST, SOCKS_PORT)
 
 
 # ---------- internals ----------
@@ -393,12 +471,18 @@ def _config_matches_current(new_text: str, info: PlatformInfo) -> bool:
     return current == new_text
 
 
-def _backup_current_config(info: PlatformInfo) -> None:
+def _backup_current_config(info: PlatformInfo, desired: str | None = None) -> None:
     src = info.xray_config
-    if not src.exists():
-        return
-    content = src.read_text(encoding="utf-8")
-    secure_write(BACKUP_PATH, content)
+    content = src.read_text(encoding="utf-8") if src.exists() else None
+    if desired is not None and TRANSACTION_PATH.exists():
+        raise XrayConfigError("previous config transition has not been resolved")
+    if content is not None:
+        secure_write(BACKUP_PATH, content)
+    if desired is not None:
+        secure_write(TRANSACTION_PATH, json.dumps({
+            "version": 1, "previous": content,
+            "desired_hash": hashlib.sha256(desired.encode()).hexdigest(),
+        }))
     log.debug("backed up %s → %s", src, BACKUP_PATH)
 
 

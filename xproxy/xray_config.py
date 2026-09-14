@@ -18,13 +18,14 @@ def load_base_template() -> dict:
 
 
 def build_xray_config(
-    server: Server,
+    server: Server | None,
     *,
     categories: dict[str, set[str] | None] | None = None,
+    ssh_port: int | None = None,
 ) -> dict:
     """Собрать полный xray config.json под выбранный сервер."""
     base = deepcopy(load_base_template())
-    sections = build_xray_sections(categories=categories)
+    sections = build_xray_sections(categories=categories, tcp_dns=ssh_port is not None)
 
     # Sniffing (если есть fakedns — destOverride должен включать 'fakedns').
     sniffing = {
@@ -41,7 +42,9 @@ def build_xray_config(
 
     # Outbounds: proxy (выбранный сервер) + direct + block.
     base["outbounds"] = [
-        _build_proxy_outbound(server),
+        ({"tag": "proxy", "protocol": "socks", "settings": {
+            "servers": [{"address": "127.0.0.1", "port": ssh_port}]
+        }} if ssh_port is not None else _build_proxy_outbound(server)),
         {"tag": "direct", "protocol": "freedom", "settings": {}},
         {"tag": "block", "protocol": "blackhole", "settings": {}},
     ]
@@ -53,6 +56,12 @@ def build_xray_config(
         base["fakedns"] = sections["fakedns"]
 
     return base
+
+
+def build_ssh_config_text(port: int) -> str:
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("invalid SSH SOCKS port")
+    return json.dumps(build_xray_config(None, ssh_port=port), ensure_ascii=False, indent=2)
 
 
 def build_xray_config_text(

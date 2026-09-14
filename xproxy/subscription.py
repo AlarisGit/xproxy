@@ -75,12 +75,15 @@ def _fetch(url: str, proxies: Optional[dict]) -> str:
     session.headers.update({"User-Agent": USER_AGENT})
     if proxies:
         session.proxies.update(proxies)
-    resp = session.get(url, timeout=_HTTP_TIMEOUT)
-    resp.raise_for_status()
-    return resp.text
+    try:
+        resp = session.get(url, timeout=_HTTP_TIMEOUT)
+        resp.raise_for_status()
+        return resp.text
+    finally:
+        session.close()
 
 
-def fetch_subscription_text() -> tuple[str, str]:
+def fetch_subscription_text(*, should_continue=None) -> tuple[str, str]:
     """Скачать подписку. Возвращает (source, decoded_text).
 
     source: "proxy" | "direct" | "cache"
@@ -95,11 +98,15 @@ def fetch_subscription_text() -> tuple[str, str]:
     )
     last_err: Exception | None = None
     for label, proxies in attempts:
+        if should_continue is not None and not should_continue():
+            break
         try:
             body = _fetch(url, proxies)
             decoded = _decode_base64(body)
             if not decoded.strip():
                 raise SubscriptionError("empty subscription body")
+            if should_continue is not None and not should_continue():
+                break
             _save_cache(decoded)
             log.info("subscription fetched via %s (%d bytes decoded)", label, len(decoded))
             return label, decoded

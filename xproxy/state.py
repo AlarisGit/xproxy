@@ -28,6 +28,8 @@ def _key(server: Server) -> ServerKey:
 class DaemonState:
     ranked: List[Server] = field(default_factory=list)
     active: Optional[Server] = None
+    transport: str = "vless"
+    last_vless: Optional[Server] = None
     last_subscription_refresh: float = 0.0
     last_rotation: float = 0.0
     last_git_pull: float = 0.0
@@ -53,6 +55,8 @@ class DaemonState:
         with self._lock:
             prev = self.active
             self.active = server
+            self.transport = "vless"
+            self.last_vless = server
             self.consecutive_proxy_failures = 0
             self.last_rotation = time.time()
             # Активный сервер получил шанс работать — снимаем с него штраф, если был.

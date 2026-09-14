@@ -106,7 +106,7 @@ def restart_xray(info: PlatformInfo | None = None) -> None:
     if info.name == "linux":
         subprocess.run(
             ["sudo", "-n", "systemctl", "reset-failed", "xray"],
-            capture_output=True,
+            capture_output=True, timeout=10,
         )
     if info.name == "macos":
         # Убедиться, что xray-сервис увидит geo-файлы xproxy. Без этого
@@ -114,7 +114,7 @@ def restart_xray(info: PlatformInfo | None = None) -> None:
         # из homebrew, где нет кастомных категорий (category-medicine-ru
         # и т.п.) — xray падает при парсинге конфига, написанного xproxy.
         _ensure_launchd_asset_env(GEO_DIR)
-    proc = subprocess.run(info.restart_cmd, capture_output=True)
+    proc = subprocess.run(info.restart_cmd, capture_output=True, timeout=30)
     if proc.returncode != 0:
         raise RuntimeError(
             f"restart xray failed ({' '.join(info.restart_cmd)}): "
@@ -139,6 +139,23 @@ def xray_is_running() -> bool:
             if comm == "xray":
                 return True
     return False
+
+
+def network_signature() -> str | None:
+    """Local route metadata only; no packets to any probe or SSH destination."""
+    try:
+        if platform.system().lower() == "darwin":
+            result = subprocess.run(["/sbin/route", "-n", "get", "default"],
+                                    capture_output=True, text=True, timeout=3)
+            return "|".join(line.strip() for line in result.stdout.splitlines()
+                            if line.strip().startswith(("gateway:", "interface:"))) or "no-default-route"
+        if shutil.which("ip"):
+            result = subprocess.run(["ip", "-j", "route", "show", "default"],
+                                    capture_output=True, text=True, timeout=3)
+            return result.stdout.strip()
+        return Path("/proc/net/route").read_text()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
 
 def detect_xray_asset_env(info: PlatformInfo | None = None) -> tuple[str | None, str]:

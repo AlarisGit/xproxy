@@ -44,6 +44,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 1200,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
         d._standby = prepared
         d._record_active_health(True)
@@ -378,6 +379,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy.autoupdate import UpdateResult
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         result = UpdateResult(
             updated=True,
             old_head="1111111111111111111111111111111111111111",
@@ -402,6 +404,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy.autoupdate import UpdateResult
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         result = UpdateResult(
             updated=True,
             old_head="1111111111111111111111111111111111111111",
@@ -429,6 +432,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy.autoupdate import UpdateResult
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         result = UpdateResult(
             updated=True,
             old_head="1111111111111111111111111111111111111111",
@@ -465,6 +469,7 @@ class FailSafeTests(unittest.TestCase):
             country="Test",
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.ranked = [srv]
 
         with mock.patch.object(d, "_geo_ready_for_rebuild", return_value=True), \
@@ -667,6 +672,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
         d.state.ranked = [active, standby_srv, replacement]
         d._standby = prepared
@@ -703,6 +709,7 @@ class FailSafeTests(unittest.TestCase):
             status="PRE_STALE",
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
         d._standby_last_attempt = time.time()
 
@@ -739,6 +746,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 120,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby_generation = 2
 
         with mock.patch.object(daemon, "notify") as notify_mock:
@@ -761,6 +769,7 @@ class FailSafeTests(unittest.TestCase):
             country="Active",
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
 
         penalized = d._penalize_if_not_active(active, "test")
@@ -796,6 +805,7 @@ class FailSafeTests(unittest.TestCase):
             country="Austria",
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
         d.state.ranked = [same_country, other_country]
         d._standby_last_attempt = 0
@@ -825,6 +835,7 @@ class FailSafeTests(unittest.TestCase):
             country="Germany",
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
         d.state.ranked = [same_country]
         d._standby_last_attempt = 0
@@ -867,6 +878,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 120,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = previous
 
         with mock.patch.object(daemon, "notify") as notify_mock:
@@ -909,6 +921,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 120,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = previous
         d._notified_standby_slot_key = srv.key()
 
@@ -961,6 +974,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 120,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = previous
 
         with mock.patch.object(daemon, "notify") as notify_mock:
@@ -1000,6 +1014,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
         d._standby = prepared
         d._notified_standby_slot_key = standby_srv.key()
@@ -1049,6 +1064,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
         d._standby = prepared
 
@@ -1069,6 +1085,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy.settings import STANDBY_FAIL_THRESHOLD
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.last_rotation = time.time()
 
         with mock.patch.object(daemon, "is_running", return_value=True), \
@@ -1086,6 +1103,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy import daemon
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.last_rotation = time.time()
         d._last_cold_rotation_attempt = time.time()
 
@@ -1094,7 +1112,7 @@ class FailSafeTests(unittest.TestCase):
                 mock.patch.object(d, "_rotate_until_working") as rotate_mock:
             d._handle_rotation_needed("proxy-failing")
 
-        promote_mock.assert_called_once_with("proxy-failing")
+        promote_mock.assert_called_once_with("proxy-failing", require_active_failure=False)
         waiting_mock.assert_not_called()
         rotate_mock.assert_not_called()
 
@@ -1102,6 +1120,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy import daemon
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.consecutive_proxy_failures = 5
 
         with mock.patch.object(d, "_promote_standby", return_value=False), \
@@ -1116,6 +1135,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy import daemon
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = Server(
             uri="active",
             protocol="vless",
@@ -1139,6 +1159,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy import daemon
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = Server(
             uri="active",
             protocol="vless",
@@ -1162,10 +1183,12 @@ class FailSafeTests(unittest.TestCase):
         from xproxy import daemon
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._last_cold_rotation_attempt = time.time()
         d.state.last_rotation = time.time()
 
-        with mock.patch.object(d, "_promote_standby", return_value=False), \
+        with mock.patch.object(daemon, "is_running", return_value=False), \
+                mock.patch.object(d, "_promote_standby", return_value=False), \
                 mock.patch.object(d, "_enter_waiting_for_standby") as waiting_mock, \
                 mock.patch.object(d, "_rotate_until_working") as rotate_mock:
             d._handle_rotation_needed("xray-not-running")
@@ -1177,6 +1200,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy import daemon
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.consecutive_proxy_failures = 3
         with d._standby_cond:
             d._active_waiting_for_standby = True
@@ -1217,6 +1241,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
         d._active_waiting_for_standby = False
         d._active_waiting_generation = 2
@@ -1255,6 +1280,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
         d._active_waiting_for_standby = True
         d._active_waiting_reason = "proxy-failing"
@@ -1280,6 +1306,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy import daemon
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._promotion_in_progress = True
 
         with mock.patch.object(d, "_promote_standby") as promote_mock, \
@@ -1295,9 +1322,10 @@ class FailSafeTests(unittest.TestCase):
         from xproxy import daemon
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.consecutive_proxy_failures = 5
 
-        def promote_side_effect(_reason: str) -> bool:
+        def promote_side_effect(_reason: str, **_kwargs) -> bool:
             d.state.note_proxy_ok()
             return False
 
@@ -1314,6 +1342,7 @@ class FailSafeTests(unittest.TestCase):
         from xproxy import daemon
 
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
 
         with mock.patch.object(d, "_promote_standby", return_value=False), \
                 mock.patch.object(daemon, "is_running", return_value=True), \
@@ -1355,6 +1384,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
         d._standby = prepared
 
@@ -1369,7 +1399,7 @@ class FailSafeTests(unittest.TestCase):
                                   side_effect=apply_side_effect), \
                 mock.patch.object(daemon, "proxy_alive", return_value=True), \
                 mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
-                mock.patch.object(d, "_schedule_config_sync_after_promotion"), \
+                mock.patch.object(d, "_schedule_config_sync_after_vless_change"), \
                 mock.patch.object(daemon, "notify"), \
                 mock.patch("xproxy.state._save_active"):
             promoted = d._promote_standby("proxy-failing")
@@ -1405,6 +1435,7 @@ class FailSafeTests(unittest.TestCase):
             country="Two",
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.set_ranked([active, one, two])
         d.state.active = active
         d._active_waiting_for_standby = True
@@ -1439,6 +1470,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
         d._standby_generation = 4
 
@@ -1482,6 +1514,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
 
         def fake_fingerprint(server: Server, **_: object) -> str:
@@ -1531,6 +1564,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
         d._notified_standby_slot_key = standby_srv.key()
 
@@ -1582,6 +1616,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
         d._standby_refresh_candidate = changed_same_endpoint
 
@@ -1628,6 +1663,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now - 1,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
         d._standby_refresh_candidate = changed_same_endpoint
         d._standby_last_attempt = time.time()
@@ -1685,6 +1721,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
         d._standby_refresh_candidate = changed_same_endpoint
 
@@ -1727,6 +1764,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d._standby = prepared
 
         with d._standby_cond:
@@ -1765,6 +1803,7 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
         d._standby = prepared
 
@@ -1814,12 +1853,15 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
         d.state.active = active
         d._standby = prepared
 
         with mock.patch.object(daemon, "standby_fingerprint", return_value="fp"), \
                 mock.patch.object(daemon, "apply_config_text",
                                   side_effect=XrayStartError("restart boom")), \
+                mock.patch.object(daemon, "proxy_alive", return_value=True), \
+                mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
                 mock.patch.object(daemon, "restore_backup",
                                   return_value=True) as restore_mock, \
                 mock.patch.object(daemon, "notify"), \
@@ -1871,7 +1913,7 @@ class FailSafeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)
             source = tmp / "config.json"
-            source.write_text("{}", encoding="utf-8")
+            source.write_text('{"outbounds":[{"tag":"proxy","protocol":"vless"}]}', encoding="utf-8")
             sync = tmp / "sync.json"
             sync.write_text(
                 '{"host":"quietharbor.net","port":57093,'
@@ -1904,7 +1946,7 @@ class FailSafeTests(unittest.TestCase):
         self.assertEqual(target.user, "sergey")
         self.assertEqual(target.path, "/var/www/quietharbor.net/config.json")
         cmd = run_mock.call_args.args[0]
-        self.assertEqual(cmd[:8], [
+        self.assertEqual(cmd[:7], [
             "scp",
             "-P",
             "57093",
@@ -1912,8 +1954,9 @@ class FailSafeTests(unittest.TestCase):
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=10",
-            str(source),
         ])
+        self.assertNotEqual(cmd[7], str(source))
+        self.assertEqual(Path(cmd[7]).name, "config.json")
         self.assertEqual(
             cmd[-1],
             "sergey@quietharbor.net:/var/www/quietharbor.net/config.json",
@@ -1947,7 +1990,7 @@ class FailSafeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)
             source = tmp / "config.json"
-            source.write_text("{}", encoding="utf-8")
+            source.write_text('{"outbounds":[{"tag":"proxy","protocol":"vless"}]}', encoding="utf-8")
             sync = tmp / "sync.json"
             sync.write_text(
                 '{"host":"quietharbor.net","port":57093,'
@@ -2036,6 +2079,8 @@ class FailSafeTests(unittest.TestCase):
             expires_at=now + 60,
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
+        d._runtime_started = True
         d.state.active = active
         d._standby = prepared
 
@@ -2069,17 +2114,17 @@ class FailSafeTests(unittest.TestCase):
         self.assertTrue(promoted)
         thread_mock.assert_called_once()
         self.assertEqual(thread_mock.call_args.kwargs["name"], "xproxy-config-sync")
-        sync_mock.assert_called_once_with(info=d.platform)
+        sync_mock.assert_called_once_with(info=d.platform, config_text=prepared.config_text)
         messages = [call.args[0] for call in notify_mock.call_args_list]
         self.assertIn(
             "🟢 config synced to "
             "sergey@quietharbor.net:/var/www/quietharbor.net/config.json "
-            "after standby promotion Active (active.example.com:443) → "
+            "after VLESS upstream change Active (active.example.com:443) → "
             "Standby (standby.example.com:443) reason=target-blocked",
             messages,
         )
 
-    def test_config_sync_not_scheduled_for_xray_not_running_promotion(self) -> None:
+    def test_config_sync_not_scheduled_for_restart_with_unchanged_vless(self) -> None:
         from xproxy import daemon
 
         srv = Server(
@@ -2091,11 +2136,12 @@ class FailSafeTests(unittest.TestCase):
             country="Standby",
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
 
         with mock.patch.object(daemon.threading, "Thread") as thread_mock:
-            d._schedule_config_sync_after_promotion(
+            d._schedule_config_sync_after_vless_change(
                 reason="xray-not-running",
-                previous=None,
+                previous=srv,
                 promoted=srv,
             )
 
@@ -2113,6 +2159,7 @@ class FailSafeTests(unittest.TestCase):
             country="Standby",
         )
         d = daemon.Daemon(dry_run=False)
+        d.network.update(True)
 
         with mock.patch.object(daemon, "notify") as notify_mock:
             d._notify_standby_state("READY", server=srv, detail="ttl=60s")
@@ -2143,7 +2190,7 @@ class FailSafeTests(unittest.TestCase):
             notify_mock.assert_called_once_with(
                 "🟠 xproxy status DEGRADED: "
                 "active=OK Active (active.example.com:443); standby=EMPTY -",
-                urgent=True,
+                urgent=True, topic="routes",
             )
 
             with d._standby_cond:
@@ -2158,7 +2205,7 @@ class FailSafeTests(unittest.TestCase):
                 "🟢 xproxy status READY: "
                 "active=OK Active (active.example.com:443); "
                 "standby=READY Standby (standby.example.com:443)",
-                urgent=False,
+                urgent=False, topic="routes",
             )
 
     def test_global_status_sampling_resets_when_direct_internet_is_down(self) -> None:
@@ -2182,7 +2229,7 @@ class FailSafeTests(unittest.TestCase):
             notify_mock.assert_called_once_with(
                 "🟠 xproxy status DEGRADED: "
                 "active=OK Active (active.example.com:443); standby=EMPTY -",
-                urgent=True,
+                urgent=True, topic="routes",
             )
 
     def test_global_status_notifies_after_stable_active_failure_and_restore(self) -> None:
@@ -2203,7 +2250,7 @@ class FailSafeTests(unittest.TestCase):
                 "🔴 xproxy status ACTIVE_FAILED: "
                 "active=FAILED Active (active.example.com:443); "
                 "standby=READY Standby (standby.example.com:443)",
-                urgent=True,
+                urgent=True, topic="routes",
             )
 
             d._record_active_health(True)
@@ -2217,7 +2264,7 @@ class FailSafeTests(unittest.TestCase):
                 "🟢 xproxy status READY: "
                 "active=OK Active (active.example.com:443); "
                 "standby=READY Standby (standby.example.com:443)",
-                urgent=False,
+                urgent=False, topic="routes",
             )
 
     def test_global_status_notifies_after_stable_active_country_change(self) -> None:
@@ -2246,7 +2293,7 @@ class FailSafeTests(unittest.TestCase):
                 "🟢 xproxy status READY: "
                 "active=OK Austria (replacement.example.com:443); "
                 "standby=READY Standby (standby.example.com:443)",
-                urgent=False,
+                urgent=False, topic="routes",
             )
 
 

@@ -3,7 +3,7 @@
 Режимы запуска:
     python main.py --daemon     # долгоживущий цикл (основной режим)
     python main.py --once       # одна итерация обновления + проверки
-    python main.py --dry-run    # ничего не пишет/не рестартит, только диагностика
+    python main.py --once --dry-run  # локальная диагностика без сети и записи
     python main.py --routing-link  # happ://routing/onadd ссылка из routing.json + direct.lst
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--routing-link", action="store_true",
                       help="собрать happ://routing/onadd ссылку из routing.json + direct.lst")
     p.add_argument("--dry-run", action="store_true",
-                   help="не писать xray-конфиг и не рестартить сервис")
+                   help="только локальная диагностика, без сети, процессов и записи")
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG-логирование")
     return p.parse_args(argv)
 
@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     setup_logging(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        with_file=not args.routing_link,
+        with_file=not args.routing_link and not args.dry_run,
     )
     log = get_logger("xproxy.main")
 

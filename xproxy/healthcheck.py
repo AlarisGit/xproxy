@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import random
 from typing import Iterable, Optional
 
@@ -39,18 +40,22 @@ def _make_session(proxies: Optional[dict]) -> requests.Session:
 
 def _probe(session: requests.Session, url: str, via: str) -> Optional[str]:
     try:
-        resp = session.get(url, timeout=HEALTH_TIMEOUT)
+        resp = session.get(url, timeout=HEALTH_TIMEOUT, allow_redirects=False)
     except requests.RequestException as exc:
         log.warning("probe %s fail (%s): %s", url, via, exc)
         return None
     if resp.status_code != 200:
         log.info("probe %s (%s) status=%s", url, via, resp.status_code)
         return None
-    return resp.text.strip()
+    try:
+        return str(ipaddress.ip_address(resp.text.strip()))
+    except ValueError:
+        log.info("probe %s (%s) returned an invalid IP response", url, via)
+        return None
 
 
 def _any_probe(urls: Iterable[str], proxies: Optional[dict],
-               attempts: int = 2) -> Optional[str]:
+               attempts: int = 2, should_continue=None) -> Optional[str]:
     """Приоритизированный обход — быстрые URL пробуются первыми.
 
     Порядок в IP_CHECK_URLS важен: стабильные/быстрые источники в начале,
@@ -62,14 +67,19 @@ def _any_probe(urls: Iterable[str], proxies: Optional[dict],
     via = "proxy" if proxies else "direct"
     session = _make_session(proxies)
     tried = 0
-    for url in pool:
-        if tried >= attempts:
-            break
-        tried += 1
-        body = _probe(session, url, via)
-        if body:
-            return body
-    return None
+    try:
+        for url in pool:
+            if should_continue is not None and not should_continue():
+                return None
+            if tried >= attempts:
+                break
+            tried += 1
+            body = _probe(session, url, via)
+            if body:
+                return body
+        return None
+    finally:
+        session.close()
 
 
 def _socks_proxies(host: str = SOCKS_HOST, port: int = SOCKS_PORT) -> dict:
@@ -91,11 +101,13 @@ def proxy_alive(
     *,
     socks_host: str = SOCKS_HOST,
     socks_port: int = SOCKS_PORT,
+    should_continue=None,
 ) -> bool:
     """Живой ли xray-прокси."""
     return _any_probe(
         IP_CHECK_URLS,
         proxies=_socks_proxies(socks_host, socks_port),
+        should_continue=should_continue,
     ) is not None
 
 
@@ -119,15 +131,18 @@ def direct_public_ip() -> Optional[str]:
     session = _make_session(None)
     results: list[str] = []
     counts: dict[str, int] = {}
-    for url in pool[:3]:
-        body = _probe(session, url, "direct")
-        if not body:
-            continue
-        results.append(body)
-        counts[body] = counts.get(body, 0) + 1
-        if counts[body] >= 2:
-            return body
-    return results[0] if results else None
+    try:
+        for url in pool[:3]:
+            body = _probe(session, url, "direct")
+            if not body:
+                continue
+            results.append(body)
+            counts[body] = counts.get(body, 0) + 1
+            if counts[body] >= 2:
+                return body
+        return results[0] if results else None
+    finally:
+        session.close()
 
 
 def _target_probe(session: requests.Session, url: str) -> Optional[str]:
@@ -139,19 +154,22 @@ def _target_probe(session: requests.Session, url: str) -> Optional[str]:
     Возвращает краткое описание результата или None при провале.
     """
     try:
-        resp = session.get(url, timeout=TARGET_CHECK_TIMEOUT)
+        resp = session.get(url, timeout=TARGET_CHECK_TIMEOUT, allow_redirects=False, stream=True)
     except requests.RequestException as exc:
         log.debug("target probe %s fail: %s", url, exc)
         return None
     # Любой HTTP-ответ (даже 401) = целевой ресурс доступен
     log.debug("target probe %s → %s", url, resp.status_code)
-    return f"{resp.status_code}"
+    status = str(resp.status_code)
+    resp.close()
+    return status
 
 
 def target_alive(
     *,
     socks_host: str = SOCKS_HOST,
     socks_port: int = SOCKS_PORT,
+    should_continue=None,
 ) -> tuple[bool, str]:
     """Проверка доступности целевых ресурсов через прокси.
 
@@ -166,8 +184,13 @@ def target_alive(
 
     proxies = _socks_proxies(socks_host, socks_port)
     session = _make_session(proxies)
-    for url in TARGET_CHECK_URLS:
-        result = _target_probe(session, url)
-        if result is None:
-            return False, url
-    return True, ""
+    try:
+        for url in TARGET_CHECK_URLS:
+            if should_continue is not None and not should_continue():
+                return False, "cancelled"
+            result = _target_probe(session, url)
+            if result is None:
+                return False, url
+        return True, ""
+    finally:
+        session.close()
