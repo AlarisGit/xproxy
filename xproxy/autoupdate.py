@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from .env_config import get as env_get
 from .fs_utils import secure_write
 from .logger import get_logger
 from .settings import (
@@ -215,8 +216,15 @@ class UpdateResult:
 FAILURE_REASONS = frozenset({"fetch failed", "pull failed"})
 
 
+def autoupdate_enabled() -> bool:
+    """Host-local opt-out for development installations; read once per process."""
+    return env_get("XPROXY_AUTOUPDATE", "1") != "0"
+
+
 def check_and_pull(*, should_continue=None) -> UpdateResult:
     """Попытаться обновиться. Возвращает UpdateResult с деталями."""
+    if not autoupdate_enabled():
+        return UpdateResult(False, reason="disabled by XPROXY_AUTOUPDATE")
     if not _is_git_repo():
         return UpdateResult(False, reason="not a git repo")
     if not _tree_clean():

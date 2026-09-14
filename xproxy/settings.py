@@ -134,6 +134,20 @@ STARTUP_JITTER = 30
 HEARTBEAT_JITTER_MIN = 60
 
 # ---------- Источники для проверок ----------
+# Базовый интернет не зависит от xray, IP-checker или доступности VLESS/SSH.
+# Ping обращается к IP без DNS; если ICMP запрещён/недоступен, пробуем HTTPS.
+# Первый успешный ответ завершает проверку, остальные адреса не опрашиваются.
+INTERNET_PING_IPS = ("8.8.8.8", "1.1.1.1", "9.9.9.9")
+INTERNET_PING_TIMEOUT = 2  # общий timeout одного процесса ping, macOS и Linux
+INTERNET_HTTP_URLS = (
+    "https://ya.ru/",
+    "https://www.apple.com/library/test/success.html",
+    "https://www.gstatic.com/generate_204",
+)
+INTERNET_HTTP_TIMEOUT = (2, 3)  # connect/read; не общий deadline с учётом DNS
+
+# Эти источники используются для проверки трафика прокси и определения IP,
+# но не для решения о наличии базового интернета.
 # ВНИМАНИЕ: ipinfo.io/ip исключён намеренно — он возвращает IP upstream-провайдера
 # по peering/anycast таблицам, а не реальный source-IP соединения. На сетях с CGNAT
 # или Tier-2 ISP это приводит к расхождению с остальными IP-чекерами.

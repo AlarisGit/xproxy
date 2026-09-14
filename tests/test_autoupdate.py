@@ -2,10 +2,47 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from xproxy import autoupdate
+from xproxy import autoupdate, env_config, settings
+
+
+class LocalAutoupdateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = Path(self.tmp.name) / ".env"
+        patcher = mock.patch.object(settings, "ENV_FILE", self.env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env_config.reset_cache()
+        self.addCleanup(env_config.reset_cache)
+
+    def test_local_opt_out_prevents_all_git_operations(self):
+        self.env.write_text('XPROXY_AUTOUPDATE="0" # development machine\n')
+        with mock.patch.object(autoupdate, "_git") as git:
+            result = autoupdate.check_and_pull()
+        self.assertFalse(result.updated)
+        self.assertEqual(result.reason, "disabled by XPROXY_AUTOUPDATE")
+        git.assert_not_called()
+
+    def test_missing_file_or_setting_keeps_updates_enabled(self):
+        self.assertTrue(autoupdate.autoupdate_enabled())
+        for text in ("", "XPROXY_AUTOUPDATE=1\n"):
+            self.env.write_text(text)
+            env_config.reset_cache()
+            self.assertTrue(autoupdate.autoupdate_enabled())
+
+    def test_local_change_is_applied_after_config_cache_reload(self):
+        self.env.write_text("XPROXY_AUTOUPDATE=1\n")
+        self.assertTrue(autoupdate.autoupdate_enabled())
+        self.env.write_text("XPROXY_AUTOUPDATE=0\n")
+        self.assertTrue(autoupdate.autoupdate_enabled())
+        env_config.reset_cache()
+        self.assertFalse(autoupdate.autoupdate_enabled())
 
 
 class AutoupdateProxyFallbackTests(unittest.TestCase):

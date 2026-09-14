@@ -1,14 +1,18 @@
 """Проверки здоровья: живой ли интернет, проходит ли трафик через прокси.
 
-ВАЖНО: и direct-, и proxy-пробы делаются через `requests.Session(trust_env=False)`,
+HTTP-пробы делаются через `requests.Session(trust_env=False)`,
 чтобы env-переменные HTTP_PROXY/HTTPS_PROXY/ALL_PROXY в шелле пользователя
 НЕ утекали в наши вызовы. Иначе «direct» пошёл бы через xray и при любой
-заминке xray мы получали бы ложное «no direct internet».
+заминке xray мы получали бы ложное «no direct internet». Базовая проверка
+сначала использует ICMP по публичным IP, без DNS и зависимости от xray.
 """
 from __future__ import annotations
 
 import ipaddress
+import os
 import random
+import shutil
+import subprocess
 from typing import Iterable, Optional
 
 import requests
@@ -16,6 +20,10 @@ import requests
 from .logger import get_logger
 from .settings import (
     HEALTH_TIMEOUT,
+    INTERNET_HTTP_TIMEOUT,
+    INTERNET_HTTP_URLS,
+    INTERNET_PING_IPS,
+    INTERNET_PING_TIMEOUT,
     IP_CHECK_URLS,
     SOCKS_HOST,
     SOCKS_PORT,
@@ -88,13 +96,55 @@ def _socks_proxies(host: str = SOCKS_HOST, port: int = SOCKS_PORT) -> dict:
 
 
 def internet_alive() -> bool:
-    """Живой ли прямой интернет-канал (в обход env-прокси).
+    """Базовый прямой интернет: ICMP по IP, затем HTTPS без прокси.
 
-    Пробуем ВСЕ URL из IP_CHECK_URLS (attempts=len), а не только первые 2:
-    если первые 2 недоступны (кратковременный сбой CDN/DNS после пробуждения),
-    оставшиеся могут ответить и предотвратить ложное «no direct internet».
+    Успех любого адреса достаточен. Отказ ICMP не означает offline: ping
+    может отсутствовать или быть запрещён сетью/правами процесса. HTTPS
+    проверяет получение заголовков, не скачивает тело и не требует ответа
+    с внешним IP. Эта проверка не обращается к VLESS/SSH или локальному xray.
     """
-    return _any_probe(IP_CHECK_URLS, proxies=None, attempts=len(IP_CHECK_URLS)) is not None
+    # launchd PATH обычно не содержит /sbin, где macOS устанавливает ping.
+    search_path = os.pathsep.join((os.environ.get("PATH", ""), "/sbin", "/usr/sbin"))
+    ping = shutil.which("ping", path=search_path)
+    if ping:
+        for address in INTERNET_PING_IPS:
+            if _internet_ping(ping, address):
+                return True
+    session = _make_session(None)
+    try:
+        for url in INTERNET_HTTP_URLS:
+            if _internet_http_probe(session, url):
+                return True
+        return False
+    finally:
+        session.close()
+
+
+def _internet_ping(binary: str, address: str) -> bool:
+    try:
+        # -n / -c совместимы с macOS и Linux. -W у них имеет разные единицы;
+        # общий timeout задаёт Python, который завершает и забирает процесс.
+        result = subprocess.run(
+            [binary, "-n", "-c", "1", address],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=INTERNET_PING_TIMEOUT,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.debug("internet ping %s unavailable: %s", address, type(exc).__name__)
+        return False
+
+
+def _internet_http_probe(session: requests.Session, url: str) -> bool:
+    try:
+        with session.get(url, timeout=INTERNET_HTTP_TIMEOUT, allow_redirects=False,
+                         stream=True, verify=True) as response:
+            # Даже 403/500 подтверждает DNS → TCP → TLS → HTTP. Работоспособность
+            # сайта или прокси проверяется отдельно; переходить по redirect не надо.
+            return 200 <= response.status_code < 600
+    except requests.RequestException as exc:
+        log.debug("internet HTTPS %s unavailable: %s", url, type(exc).__name__)
+        return False
 
 
 def proxy_alive(

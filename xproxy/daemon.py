@@ -15,6 +15,7 @@ from .instance_lock import InstanceLock
 
 from .autoupdate import (
     FAILURE_REASONS,
+    autoupdate_enabled,
     check_and_pull,
     install_requirements,
     post_restart_banner,
@@ -267,7 +268,7 @@ class Daemon:
                         self.refresh_geo(force=False)
                     if not self._stop and self.network.online() and self._rebuild_pending and self._active_channel_ok is True:
                         self._rebuild_config_if_active()
-                    if not self._stop and self.network.online() and GIT_PULL_INTERVAL > 0 and \
+                    if not self._stop and self.network.online() and GIT_PULL_INTERVAL > 0 and autoupdate_enabled() and \
                             now - self.state.last_git_pull >= self._git_period:
                         self.tick_autoupdate()
                         self._git_period = _jittered(GIT_PULL_INTERVAL)
@@ -341,6 +342,8 @@ class Daemon:
         with InstanceLock():
             self.install_signal_handlers()
             post_restart_banner()
+            if not autoupdate_enabled():
+                log.info("automatic code updates disabled by local XPROXY_AUTOUPDATE=0")
             self._runtime_started = True
             self._load_cached_servers()
             self.emergency.reload()
@@ -456,10 +459,8 @@ class Daemon:
             return
         signature = network_signature() if self._runtime_started else None
         online = internet_alive()
-        # An existing working channel proves connectivity even if direct check
-        # sites are filtered. This never opens a connection to an unused SSH host.
-        if not online and is_running():
-            online = proxy_alive()
+        # The same independent base-internet probe gates routine work and
+        # emergency rechecks. Proxy health never overrides this network state.
         self._update_network(online, signature)
         if online:
             with self._apply_lock:
