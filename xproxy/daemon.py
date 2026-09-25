@@ -29,7 +29,8 @@ from .geo import ensure_geo_assets
 from .routing import build_xray_sections
 from .healthcheck import internet_alive, proxy_alive, target_alive, public_ips
 from .logger import get_logger
-from .notifier import drain_queue, is_configured as tg_configured, notify, set_status_provider, set_network_provider, start_queue
+from .notifier import notify, send_summary, is_configured as tg_configured
+from .status_journal import Status, StatusJournal, format_summary
 from .platform_utils import PlatformInfo, detect_platform, network_signature
 from .servers import Server, expand_servers, filter_and_sort, load_country_ranks, parse_subscription, tcp_probe
 from .settings import (
@@ -44,8 +45,6 @@ from .settings import (
     STALE_SUBSCRIPTION_SEC,
     SCHEDULE_JITTER_RATIO,
     STARTUP_JITTER,
-    STATUS_NOTIFY_SAMPLE_INTERVAL,
-    STATUS_NOTIFY_STABLE_SAMPLES,
     STANDBY_FAIL_THRESHOLD,
     STANDBY_RETRY_INTERVAL,
     VLESS_RECOVERY_INTERVAL,
@@ -165,10 +164,8 @@ class Daemon:
         self._standby_waiting_attempted: set[tuple[str, int]] = set()
         self._notified_standby_slot_key: Optional[tuple[str, int]] = None
         self._active_channel_ok: Optional[bool] = None
-        self._status_last_sample_at: float = 0.0
-        self._status_candidate_key: tuple | None = None
-        self._status_candidate_count: int = 0
-        self._status_stable_key: tuple | None = None
+        self._journal: StatusJournal | None = None
+        self._summary_retry_at = 0.0
         self._last_cold_rotation_attempt: float = 0.0
         self.emergency = EmergencyController(self)
         # Восстановить активный сервер, если был сохранён.
@@ -348,12 +345,9 @@ class Daemon:
             self._load_cached_servers()
             self.emergency.reload()
             self.emergency.reconcile()
-            set_status_provider(self._build_status_suffix)
-            set_network_provider(self.network.online)
-            start_queue()
-            notify(f"🟢 xproxy started (transport={self.state.transport}, active={_fmt(self.state.active)})",
-                      topic="lifecycle",
-                  )
+            self._journal = StatusJournal()
+            self._journal.mark_start()
+            log.info("xproxy started (transport=%s, active=%s)", self.state.transport, _fmt(self.state.active))
             try:
                 self.tick()  # establish network state before adopting SSH
                 self.emergency.manager.start()
@@ -378,12 +372,9 @@ class Daemon:
                     self._maintenance_thread.join()
                 self._finish_config_sync()
                 self.emergency.manager.close(preserve=self._restart_requested)
-                if not self._restart_requested:
-                    notify(f"🛑 xproxy stopped ({_signal_name(self._stop_signal) if self._stop_signal else 'manual'})",
-                              topic="lifecycle",
-                          )
-                drain_queue(timeout=3)
-                set_network_provider(None)
+                log.info("xproxy stopped (%s)", _signal_name(self._stop_signal) if self._stop_signal else "manual")
+                self._journal.close()
+                self._journal = None
                 log.info("daemon stopped")
         if self._restart_requested:
             try:
@@ -405,51 +396,25 @@ class Daemon:
             self._load_cached_servers()
             self.emergency.reload()
             self.emergency.reconcile()
-            set_network_provider(self.network.online)
-            set_status_provider(self._build_status_suffix)
-            start_queue()
+            self._journal = StatusJournal()
+            self._journal.mark_start()
             try:
                 online = internet_alive()
                 self._update_network(online)
                 if online:
                     if not self._recover_interrupted_config():
+                        self._active_channel_ok = None
+                        self._record_status(True)
                         return
                     self.refresh_subscription(force=True)
                     if self.state.transport != "ssh":
                         self.tick_health(has_internet=True)
                     else:
                         log.info("SSH routing present: use --daemon for supervised recovery")
+                self._record_status(online)
             finally:
-                drain_queue(timeout=3)
-                set_network_provider(None)
-
-    def _build_status_suffix(self) -> Optional[str]:
-        """Построить строку статуса для добавления к сообщению.
-
-        Вызывается notifier'ом при каждой отправке (в sender-треде).
-        Daemon-состояние всегда свежее, hardware-метрики — через
-        hardware_status() с 5-минутным кэшем. HTTP-пробы не делаются:
-        proxy_ok берётся из daemon-состояния, public_ip не нужен
-        (include_identity=False).
-        """
-        if self.dry_run:
-            return None
-        tunnel = self.emergency.manager.snapshot()
-        active_country = (f"SSH/{tunnel.endpoint.id if tunnel.endpoint else '-'}"
-                          if self.state.transport == "ssh" else
-                          self.state.active.country if self.state.active else "-")
-        proxy_ok = self._active_channel_ok is True
-        uptime = _format_uptime(time.time() - self.state.start_time)
-
-        from .sysinfo import system_report
-        return system_report(
-            public_ip=None,
-            active_server=active_country,
-            proxy_ok=proxy_ok,
-            uptime=uptime,
-            rotations_today=self.state.rotations_today,
-            include_identity=False,
-        )
+                self._journal.close()
+                self._journal = None
 
     def tick(self) -> None:
         self.emergency.reload()
@@ -465,6 +430,8 @@ class Daemon:
         if online:
             with self._apply_lock:
                 if not self._recover_interrupted_config():
+                    self._active_channel_ok = None
+                    self._record_status(True)
                     self._next_health_at = time.monotonic() + HEALTH_INTERVAL
                     return
             self.tick_health(has_internet=True)
@@ -474,7 +441,7 @@ class Daemon:
             self._health_checked_at = 0
             self._active_channel_ok = None
             self.state.note_proxy_ok()
-        self._sample_global_status(has_internet=online)
+        self._record_status(online)
         self.tick_heartbeat()
         self._next_health_at = time.monotonic() + HEALTH_INTERVAL
 
@@ -501,26 +468,31 @@ class Daemon:
             return True
 
     def tick_heartbeat(self) -> None:
-        """Один раз в сутки (локальное время >= HEARTBEAT_HOUR) посылаем статус.
-
-        Статус системы добавляется автоматически через notifier (суффикс
-        обновляется в _refresh_status_suffix каждый tick).
-        """
+        """Отправить суточную сводку после локального полудня со сдвигом."""
         if self.dry_run:
             return
         now_struct = time.localtime()
         today = time.strftime("%Y-%m-%d", now_struct)
-        if now_struct.tm_hour < HEARTBEAT_HOUR:
-            return
-        if now_struct.tm_hour == HEARTBEAT_HOUR and \
-                now_struct.tm_min < self._heartbeat_minute_offset:
+        if not self._daily_due(now_struct):
             return
         if self.state.last_heartbeat_date == today:
             return
 
-        log.info("daily heartbeat triggered")
-        notify("💚 daily heartbeat", urgent=True, topic="heartbeat")
-        self.state.last_heartbeat_date = today
+        if self._journal is None or self._journal.daily_sent(today) or \
+                time.monotonic() < self._summary_retry_at:
+            return
+        status = self._journal.latest()
+        if status is None or not status.working or not tg_configured():
+            return
+        if send_summary(format_summary(status, reason="Ежедневная сводка")):
+            self._journal.mark_daily_sent(today)
+            self.state.last_heartbeat_date = today
+        else:
+            self._summary_retry_at = time.monotonic() + 300
+
+    def _daily_due(self, now: time.struct_time) -> bool:
+        return now.tm_hour > HEARTBEAT_HOUR or (now.tm_hour == HEARTBEAT_HOUR and
+               now.tm_min >= self._heartbeat_minute_offset)
 
     def refresh_subscription(self, force: bool = False) -> None:
         if self._stop or not self.network.online():
@@ -958,91 +930,46 @@ class Daemon:
                         self._standby.server.key() == active.key():
                     self._discard_current_standby_locked(active, "active endpoint recovered")
 
-    def _sample_global_status(
-        self,
-        *,
-        has_internet: bool,
-        now: float | None = None,
-    ) -> None:
-        if self.dry_run or not has_internet:
-            if not self.dry_run and not has_internet:
-                self._status_last_sample_at = 0.0
-                self._status_candidate_key = None
-                self._status_candidate_count = 0
+    def _record_status(self, direct: bool) -> None:
+        if self._journal is None or self.dry_run:
             return
-        if self._active_channel_ok is None:
-            return
-
-        ts = time.time() if now is None else now
-        interval = max(0.0, STATUS_NOTIFY_SAMPLE_INTERVAL)
-        if self._status_last_sample_at and \
-                ts - self._status_last_sample_at < interval:
-            return
-        self._status_last_sample_at = ts
-
-        snapshot_key, text = self._global_status_snapshot()
-        if snapshot_key == self._status_candidate_key:
-            self._status_candidate_count += 1
-        else:
-            self._status_candidate_key = snapshot_key
-            self._status_candidate_count = 1
-
-        required = max(1, STATUS_NOTIFY_STABLE_SAMPLES)
-        if self._status_candidate_count < required:
-            log.debug("global status candidate %s sample %d/%d",
-                      snapshot_key, self._status_candidate_count, required)
-            return
-
-        if self._status_stable_key is None:
-            self._status_stable_key = snapshot_key
-            log.info("global status baseline established: %s", text)
-            if not snapshot_key[0]:
-                notify(text, urgent=True, topic="routes")
-            return
-
-        if snapshot_key == self._status_stable_key:
-            return
-
-        self._status_stable_key = snapshot_key
-        notify(text, urgent=not snapshot_key[0] or not snapshot_key[1], topic="routes")
-
-    def _global_status_snapshot(
-        self,
-    ) -> tuple[tuple, str]:
         active = self.state.active_snapshot()
-        active_ok = bool(self._active_channel_ok and (active is not None or self.state.transport == "ssh"))
-        active_country = active.country if active_ok and active is not None else None
         with self._standby_cond:
             standby = self._standby
             standby_ok = standby is not None and standby.is_usable()
-            standby_server = standby.server if standby is not None else None
-
         tunnel = self.emergency.manager.snapshot()
-        active_label = (f"SSH/{tunnel.endpoint.id if tunnel.endpoint else 'existing'}"
-                        if self.state.transport == "ssh" else _fmt(active))
-        key = (active_ok, standby_ok, active_country, _server_key(active),
-               _server_key(standby_server) if standby_ok else None, self.state.transport)
-        if active_ok and standby_ok:
-            emoji = "🟢"
-            status = "READY"
-        elif active_ok:
-            emoji = "🟠"
-            status = "DEGRADED"
-        elif standby_ok:
-            emoji = "🔴"
-            status = "ACTIVE_FAILED"
+        if not direct:
+            status = Status("DOWN", "DOWN", "N/A", "N/A", "N/A")
         else:
-            emoji = "🔴"
-            status = "DOWN"
-
-        active_state = "OK" if active_ok else "FAILED"
-        standby_state = "READY" if standby_ok else "EMPTY"
-        text = (
-            f"{emoji} xproxy status {status}: "
-            f"active={active_state} {active_label}; "
-            f"standby={standby_state} {_fmt(standby_server)}"
-        )
-        return key, text
+            proxy_ok = self._active_channel_ok is True
+            primary = active if self.state.transport == "vless" else self.state.last_vless
+            primary_label = _fmt(primary)
+            primary_state = ("UP" if proxy_ok and self.state.transport == "vless" else
+                             "DOWN" if self.state.transport == "vless" else "INACTIVE")
+            secondary = f"{'READY' if standby_ok else 'UNAVAILABLE'} {_fmt(standby.server if standby else None)}"
+            ssh_label = tunnel.endpoint.id if tunnel.endpoint else "-"
+            status = Status(
+                "UP", "UP" if proxy_ok else "DOWN",
+                f"{primary_state} {primary_label}", secondary,
+                f"{tunnel.status} {ssh_label}",
+            )
+        try:
+            self._journal.record(status)
+            if not status.working:
+                self._summary_retry_at = 0.0
+            if status.working and self._journal.recovery_pending() and tg_configured() and \
+                    time.monotonic() >= self._summary_retry_at:
+                if send_summary(format_summary(status, reason="Proxy восстановлен")):
+                    self._journal.mark_recovery_sent()
+                    now = time.localtime()
+                    if self._daily_due(now):
+                        today = time.strftime("%Y-%m-%d", now)
+                        self._journal.mark_daily_sent(today)
+                        self.state.last_heartbeat_date = today
+                else:
+                    self._summary_retry_at = time.monotonic() + 300
+        except Exception:
+            log.exception("status journal update failed")
 
     def _notify_standby_empty_locked(
         self,
@@ -2198,24 +2125,6 @@ def _server_key(server: Optional[Server]) -> tuple[str, int] | None:
     if server is None:
         return None
     return server.key()
-
-
-def _format_uptime(seconds: float) -> str:
-    """Компактная запись аптайма: '2d 3h 14m' / '45m 12s' / '8s'."""
-    s = int(max(0, seconds))
-    days, s = divmod(s, 86400)
-    hours, s = divmod(s, 3600)
-    minutes, s = divmod(s, 60)
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    if minutes and not days:
-        parts.append(f"{minutes}m")
-    if not parts:
-        parts.append(f"{s}s")
-    return " ".join(parts)
 
 
 def _signal_name(signum: Optional[int]) -> str:

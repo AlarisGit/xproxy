@@ -140,7 +140,7 @@ class InternetGateTests(unittest.TestCase):
         self.d = daemon.Daemon(dry_run=False)
         self.d._runtime_started = True
         for obj, name in ((daemon, "network_signature"), (emergency, "notify"),
-                          (self.d, "_sample_global_status"), (self.d, "tick_heartbeat"),
+                          (self.d, "_record_status"), (self.d, "tick_heartbeat"),
                           (self.d.emergency, "reload"), (self.d.emergency, "tick")):
             patcher = mock.patch.object(obj, name)
             patcher.start()

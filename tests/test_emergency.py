@@ -437,17 +437,6 @@ class EmergencyPolicyTests(unittest.TestCase):
 
 
 class NotificationTests(unittest.TestCase):
-    def test_pending_tunnel_status_is_replaced_without_losing_another_topic(self):
-        queue = notifier._NotificationQueue()
-        with mock.patch.object(notifier, "is_configured", return_value=True), \
-                mock.patch.object(queue, "_save_to_disk"):
-            queue.enqueue("failed", topic="tunnel", urgent=True)
-            old = queue._queue[0]
-            queue.enqueue("offline", topic="network", urgent=True)
-            queue.enqueue("ready", topic="tunnel", urgent=True)
-            queue._remove(old)  # an in-flight old send must not pop the new event
-            self.assertEqual([it.text for it in queue._queue], ["offline", "ready"])
-
     def test_connecting_and_single_suspect_sample_do_not_spam_telegram(self):
         with mock.patch.object(daemon, "load_active", return_value=None):
             d = daemon.Daemon()
@@ -460,26 +449,11 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(event.call_count, 1)
         d.emergency.manager._pool.shutdown(wait=False)
 
-    def test_recovery_within_throttle_window_replaces_pending_failure(self):
-        queue = notifier._NotificationQueue()
-        with mock.patch.object(notifier, "is_configured", return_value=True), \
-                mock.patch.object(queue, "_save_to_disk"), \
-                mock.patch.object(notifier, "_is_throttled", return_value=True):
-            queue.enqueue("ready", topic="tunnel")
-            queue.enqueue("failed", topic="tunnel")
-            queue.enqueue("ready", topic="tunnel")
-            self.assertEqual([event.text for event in queue._queue], ["ready"])
+    def test_events_are_logged_without_telegram_delivery(self):
+        with mock.patch.object(notifier, "log") as log:
+            notifier.notify("offline", topic="network", urgent=True)
+            log.warning.assert_called_once()
 
-    def test_expired_events_and_queue_size_are_bounded(self):
-        queue = notifier._NotificationQueue()
-        queue._queue.clear()
-        queue._queue.append(notifier._PendingNotify("old", time.time() - 86401))
-        with mock.patch.object(notifier, "is_configured", return_value=True), \
-                mock.patch.object(queue, "_save_to_disk"):
-            for n in range(300):
-                queue.enqueue(str(n), topic=f"item-{n}")
-            self.assertEqual(len(queue._queue), 256)
-            self.assertNotIn("old", [event.text for event in queue._queue])
 
 
 class ConfigTransactionTests(unittest.TestCase):

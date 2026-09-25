@@ -328,7 +328,7 @@ class RecoveryRegressions(ReviewFixture):
                 patches.enter_context(mock.patch.object(daemon, "target_alive", return_value=(True, "")))
                 patches.enter_context(mock.patch.object(d.emergency, "reload"))
                 patches.enter_context(mock.patch.object(d, "tick_heartbeat"))
-                patches.enter_context(mock.patch.object(d, "_sample_global_status"))
+                patches.enter_context(mock.patch.object(d, "_record_status"))
                 d.tick()
                 self.assertEqual(d.state.transport, transport)
                 self.assertEqual(self.config.read_text(), previous)
@@ -416,29 +416,11 @@ class MaintenanceAndQueueRegressions(ReviewFixture):
         self.assertFalse(t.is_alive())
         repair.assert_not_called()
 
-    def test_startup_config_alert_preserves_persisted_topics_before_sender_start(self):
+    def test_startup_config_alert_is_log_only(self):
         d = self.d
-        path = self.root / "queue.json"
-        path.write_text(json.dumps([
-            notifier._PendingNotify("pending update", time.time(), topic="update").to_dict(),
-            notifier._PendingNotify("old config event", time.time(), topic="configuration").to_dict(),
-        ]))
         tunnels_path = self.root / "tunnels.json"
         tunnels_path.write_text('{"tunnels":')
         d.emergency.file = TunnelConfigFile(tunnels_path)
-        queue = notifier._NotificationQueue()
-        self.patch(notifier, "_QUEUE_FILE", new=path)
-        self.patch(notifier, "_queue", new=queue)
-        self.patch(notifier, "is_configured", return_value=True)
-        self.patch(daemon, "InstanceLock", return_value=nullcontext())
-        self.patch(d, "_load_cached_servers")
-        self.patch(daemon, "internet_alive", return_value=False)
-        self.patch(daemon, "start_queue", side_effect=queue._load_from_disk)
-        self.patch(daemon, "drain_queue")
-        self.patch(daemon, "set_network_provider")
-        self.patch(daemon, "set_status_provider")
-        d.run_once()
-        events = {item["topic"]: item["text"] for item in json.loads(path.read_text())}
-        self.assertEqual(events["update"], "pending update")
-        self.assertIn("configuration rejected", events["configuration"])
-        self.assertEqual(set(events), {"update", "configuration", "network"})
+        with mock.patch.object(notifier, "send_summary") as send:
+            d.emergency.reload()
+            send.assert_not_called()

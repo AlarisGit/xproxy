@@ -2171,130 +2171,32 @@ class FailSafeTests(unittest.TestCase):
 
         notify_mock.assert_not_called()
 
-    def test_global_status_notifies_after_stable_standby_loss_and_restore(self) -> None:
-        daemon, d, prepared, now = self._daemon_with_active_and_standby()
+    def test_status_journal_recovery_and_route_changes(self) -> None:
+        from xproxy import daemon
+        from xproxy.status_journal import StatusJournal
 
-        with mock.patch.object(daemon, "notify") as notify_mock:
-            d._sample_global_status(has_internet=True, now=now)
-            d._sample_global_status(has_internet=True, now=now + 30)
-            d._sample_global_status(has_internet=True, now=now + 60)
-            notify_mock.assert_not_called()
-
-            with d._standby_cond:
-                d._standby = None
-            d._sample_global_status(has_internet=True, now=now + 90)
-            d._sample_global_status(has_internet=True, now=now + 120)
-            notify_mock.assert_not_called()
-            d._sample_global_status(has_internet=True, now=now + 150)
-
-            notify_mock.assert_called_once_with(
-                "🟠 xproxy status DEGRADED: "
-                "active=OK Active (active.example.com:443); standby=EMPTY -",
-                urgent=True, topic="routes",
-            )
-
-            with d._standby_cond:
+        _, d, prepared, _ = self._daemon_with_active_and_standby()
+        with tempfile.TemporaryDirectory() as tmp:
+            d._journal = StatusJournal(Path(tmp) / "status.sqlite3")
+            d._journal.mark_start()
+            with mock.patch.object(daemon, "tg_configured", return_value=True), \
+                    mock.patch.object(daemon, "send_summary", return_value=True) as send:
+                d._record_status(True)
+                self.assertEqual(send.call_count, 1)
+                self.assertIn("Proxy восстановлен", send.call_args.args[0])
+                self.assertEqual(d._journal.latest().proxy, "UP")
+                with d._standby_cond:
+                    d._standby = None
+                d._record_status(True)
+                send.assert_called_once()
+                self.assertIn("UNAVAILABLE", d._journal.latest().vless_secondary)
+                d._record_status(False)
+                self.assertEqual(d._journal.latest().direct, "DOWN")
+                self.assertEqual(d._journal.latest().vless_primary, "N/A")
                 d._standby = prepared
-            d._sample_global_status(has_internet=True, now=now + 180)
-            d._sample_global_status(has_internet=True, now=now + 210)
-            self.assertEqual(notify_mock.call_count, 1)
-            d._sample_global_status(has_internet=True, now=now + 240)
-
-            self.assertEqual(notify_mock.call_count, 2)
-            notify_mock.assert_called_with(
-                "🟢 xproxy status READY: "
-                "active=OK Active (active.example.com:443); "
-                "standby=READY Standby (standby.example.com:443)",
-                urgent=False, topic="routes",
-            )
-
-    def test_global_status_sampling_resets_when_direct_internet_is_down(self) -> None:
-        daemon, d, _prepared, now = self._daemon_with_active_and_standby()
-
-        with mock.patch.object(daemon, "notify") as notify_mock:
-            d._sample_global_status(has_internet=True, now=now)
-            d._sample_global_status(has_internet=True, now=now + 30)
-            d._sample_global_status(has_internet=True, now=now + 60)
-
-            with d._standby_cond:
-                d._standby = None
-            d._sample_global_status(has_internet=True, now=now + 90)
-            d._sample_global_status(has_internet=True, now=now + 120)
-            d._sample_global_status(has_internet=False, now=now + 150)
-            d._sample_global_status(has_internet=True, now=now + 180)
-            d._sample_global_status(has_internet=True, now=now + 210)
-            notify_mock.assert_not_called()
-            d._sample_global_status(has_internet=True, now=now + 240)
-
-            notify_mock.assert_called_once_with(
-                "🟠 xproxy status DEGRADED: "
-                "active=OK Active (active.example.com:443); standby=EMPTY -",
-                urgent=True, topic="routes",
-            )
-
-    def test_global_status_notifies_after_stable_active_failure_and_restore(self) -> None:
-        daemon, d, _prepared, now = self._daemon_with_active_and_standby()
-
-        with mock.patch.object(daemon, "notify") as notify_mock:
-            d._sample_global_status(has_internet=True, now=now)
-            d._sample_global_status(has_internet=True, now=now + 30)
-            d._sample_global_status(has_internet=True, now=now + 60)
-
-            d._record_active_health(False)
-            d._sample_global_status(has_internet=True, now=now + 90)
-            d._sample_global_status(has_internet=True, now=now + 120)
-            notify_mock.assert_not_called()
-            d._sample_global_status(has_internet=True, now=now + 150)
-
-            notify_mock.assert_called_once_with(
-                "🔴 xproxy status ACTIVE_FAILED: "
-                "active=FAILED Active (active.example.com:443); "
-                "standby=READY Standby (standby.example.com:443)",
-                urgent=True, topic="routes",
-            )
-
-            d._record_active_health(True)
-            d._sample_global_status(has_internet=True, now=now + 180)
-            d._sample_global_status(has_internet=True, now=now + 210)
-            self.assertEqual(notify_mock.call_count, 1)
-            d._sample_global_status(has_internet=True, now=now + 240)
-
-            self.assertEqual(notify_mock.call_count, 2)
-            notify_mock.assert_called_with(
-                "🟢 xproxy status READY: "
-                "active=OK Active (active.example.com:443); "
-                "standby=READY Standby (standby.example.com:443)",
-                urgent=False, topic="routes",
-            )
-
-    def test_global_status_notifies_after_stable_active_country_change(self) -> None:
-        daemon, d, _prepared, now = self._daemon_with_active_and_standby()
-        replacement = Server(
-            uri="replacement",
-            protocol="vless",
-            uuid="33333333-3333-3333-3333-333333333333",
-            host="replacement.example.com",
-            port=443,
-            country="Austria",
-        )
-
-        with mock.patch.object(daemon, "notify") as notify_mock:
-            d._sample_global_status(has_internet=True, now=now)
-            d._sample_global_status(has_internet=True, now=now + 30)
-            d._sample_global_status(has_internet=True, now=now + 60)
-
-            d.state.active = replacement
-            d._sample_global_status(has_internet=True, now=now + 90)
-            d._sample_global_status(has_internet=True, now=now + 120)
-            notify_mock.assert_not_called()
-            d._sample_global_status(has_internet=True, now=now + 150)
-
-            notify_mock.assert_called_once_with(
-                "🟢 xproxy status READY: "
-                "active=OK Austria (replacement.example.com:443); "
-                "standby=READY Standby (standby.example.com:443)",
-                urgent=False, topic="routes",
-            )
+                d._record_status(True)
+                self.assertEqual(send.call_count, 2)
+            d._journal.close()
 
 
 if __name__ == "__main__":
