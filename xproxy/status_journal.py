@@ -77,8 +77,31 @@ class StatusJournal:
 
     def mark_start(self) -> None:
         # A process restart, including after sleep or power off, starts with
-        # unverified connectivity. The first verified UP is a recovery.
+        # unverified connectivity. last_downtimes() treats this marker as
+        # an outage beginning at the last successful probe before shutdown.
         self.record(Status("UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN"))
+
+    def last_downtimes(self) -> dict[str, tuple[float, float] | None]:
+        """Return (duration, recovery timestamp) for the latest closed outage."""
+        rows = self.db.execute("SELECT ts,direct,proxy FROM states ORDER BY rowid").fetchall()
+        result: dict[str, tuple[float, float] | None] = {"direct": None, "proxy": None}
+        starts: dict[str, float | None] = {"direct": None, "proxy": None}
+        last_up: dict[str, float | None] = {"direct": None, "proxy": None}
+        for ts, direct, proxy in rows:
+            for component, value in (("direct", direct), ("proxy", proxy)):
+                if value == "UP":
+                    start = starts[component]
+                    if start is not None:
+                        result[component] = (max(0.0, ts - start), ts)
+                        starts[component] = None
+                    last_up[component] = ts
+                elif starts[component] is None:
+                    # UNKNOWN at process start means the machine may have
+                    # been offline since its last successful observation.
+                    starts[component] = (last_up[component]
+                                         if value == "UNKNOWN" and last_up[component] is not None
+                                         else ts)
+        return result
 
     def recovery_pending(self) -> bool:
         return self._get("recovery_pending") == "1"
@@ -93,16 +116,50 @@ class StatusJournal:
         self._set("daily_sent", date)
 
 
-def format_summary(status: Status, *, reason: str, ts: float | None = None) -> str:
+def format_summary(
+    status: Status,
+    *,
+    reason: str,
+    downtimes: dict[str, tuple[float, float] | None] | None = None,
+    ts: float | None = None,
+) -> str:
     stamp = datetime.fromtimestamp(time.time() if ts is None else ts).strftime("%d.%m.%Y %H:%M:%S")
+    downtime_rows = []
+    for key, label in (("direct", "Интернет"), ("proxy", "Proxy")):
+        outage = (downtimes or {}).get(key)
+        if outage is None:
+            value = "не зафиксирован"
+        else:
+            duration, ended = outage
+            value = f"{_format_duration(duration)} · до {datetime.fromtimestamp(ended).strftime('%H:%M')}"
+        downtime_rows.append((label, value))
     rows = (
-        ("Direct", status.direct), ("Proxy", status.proxy),
+        *downtime_rows,
         ("VLESS primary", status.vless_primary),
         ("VLESS secondary", status.vless_secondary), ("SSH", status.ssh),
     )
     # Keep the transport labels readable while escaping endpoint names.
     lines = ["Контур           Состояние", "─" * 36]
-    lines.extend(f"{name:<16} {value}" for name, value in rows)
+    lines.extend(f"{name:<18} {value}" for name, value in rows)
     return (f"📊 <b>xproxy · {html.escape(reason)}</b>\n"
             f"<code>{html.escape(stamp)}</code>\n"
             f"<pre>{html.escape(chr(10).join(lines))}</pre>")
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    days, total = divmod(total, 86400)
+    hours, total = divmod(total, 3600)
+    minutes, secs = divmod(total, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} д")
+    if hours:
+        parts.append(f"{hours} ч")
+    if minutes or (days or hours):
+        parts.append(f"{minutes} мин")
+    elif secs:
+        parts.append(f"{secs} сек")
+    else:
+        parts.append("менее минуты")
+    return " ".join(parts)

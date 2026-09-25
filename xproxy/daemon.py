@@ -484,7 +484,9 @@ class Daemon:
         status = self._journal.latest()
         if status is None or not status.working or not tg_configured():
             return
-        if send_summary(format_summary(status, reason="Ежедневная сводка")):
+        if send_summary(format_summary(
+                status, reason="Ежедневная сводка",
+                downtimes=self._journal.last_downtimes())):
             self._journal.mark_daily_sent(today)
             self.state.last_heartbeat_date = today
         else:
@@ -959,7 +961,9 @@ class Daemon:
                 self._summary_retry_at = 0.0
             if status.working and self._journal.recovery_pending() and tg_configured() and \
                     time.monotonic() >= self._summary_retry_at:
-                if send_summary(format_summary(status, reason="Proxy восстановлен")):
+                if send_summary(format_summary(
+                        status, reason="Proxy восстановлен",
+                        downtimes=self._journal.last_downtimes())):
                     self._journal.mark_recovery_sent()
                     now = time.localtime()
                     if self._daily_due(now):
