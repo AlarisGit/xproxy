@@ -2185,7 +2185,7 @@ class FailSafeTests(unittest.TestCase):
                     mock.patch.object(daemon, "send_summary", return_value=True) as send:
                 d._record_status(True)
                 self.assertEqual(send.call_count, 1)
-                self.assertIn("Proxy восстановлен", send.call_args.args[0])
+                self.assertIn("Запуск xproxy", send.call_args.args[0])
                 self.assertEqual(d._journal.latest().proxy, "UP")
                 with d._standby_cond:
                     d._standby = None
@@ -2193,6 +2193,7 @@ class FailSafeTests(unittest.TestCase):
                 send.assert_called_once()
                 self.assertIn("UNAVAILABLE", d._journal.latest().vless_secondary)
                 d._record_status(False)
+                d._record_status(False)  # confirmed internet outage
                 self.assertEqual(d._journal.latest().direct, "DOWN")
                 self.assertEqual(d._journal.latest().vless_primary, "N/A")
                 d._standby = prepared

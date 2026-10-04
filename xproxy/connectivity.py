@@ -22,10 +22,37 @@ class Connectivity:
         self._wall_at: float | None = None
         self._generation = 0
         self._signature: str | None = None
+        self._suspended = False
 
-    def update(self, online: bool, signature: str | None = None) -> NetworkSnapshot:
+    def suspend(self) -> None:
+        with self._lock:
+            self._suspended = True
+            self._invalidate()
+
+    def resume(self, *, expected_generation: int | None = None) -> None:
+        with self._lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                return
+            self._suspended = False
+            self._invalidate()
+
+    def _invalidate(self) -> None:
+        self._generation += 1
+        self._online = False
+        self._checked_at = self._wall_at = None
+
+    def suspended(self) -> bool:
+        with self._lock:
+            return self._suspended
+
+    def update(self, online: bool, signature: str | None = None, *,
+               expected_generation: int | None = None) -> NetworkSnapshot:
         now, wall = time.monotonic(), time.time()
         with self._lock:
+            if self._suspended or (expected_generation is not None and
+                                   expected_generation != self._generation):
+                return NetworkSnapshot(self._online and not self._suspended and self._fresh(now, wall),
+                                       self._generation)
             # Expired evidence must never become current again in the same
             # generation (mach_absolute_time may pause while macOS sleeps).
             gap = self._checked_at is not None and not self._fresh(now, wall)

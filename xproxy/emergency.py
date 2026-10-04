@@ -127,20 +127,23 @@ class EmergencyController:
 
     def intent(self) -> TunnelIntent:
         d = self.daemon
-        online = d.network.online() and not d._stop
+        network = d.network.snapshot()
+        online = network.online and not d._stop
         # An invalid/removed configuration forbids reconnects, while a current
         # traffic-carrying SSH may drain until a verified VLESS is available.
         connect = self.enabled and not d.dry_run and not d._stop
         keep = not d.dry_run and (self.enabled or d.state.transport == "ssh")
         urgent = d._active_channel_ok is False and d._failure_confirmed()
-        return TunnelIntent(online, connect and online, keep, urgent)
+        return TunnelIntent(online, connect and online, keep, urgent, network.generation)
 
     def confirm_network(self) -> bool:
-        if self.daemon._stop:
+        if self.daemon._stop or self.daemon.network.suspended():
             return False
+        generation = self.daemon.network.snapshot().generation
         online = internet_alive()
-        self.daemon._update_network(online)
-        return online
+        if self.daemon.network.snapshot().generation != generation:
+            return False
+        return self.daemon._update_network(online, expected_generation=generation)
 
     def tunnel_changed(self, snapshot: TunnelSnapshot) -> None:
         d = self.daemon

@@ -7,3 +7,4 @@ __pycache__/
 .env
 conf/sync.json
 conf/tunnels.json
+conf/l2tp/secrets.env

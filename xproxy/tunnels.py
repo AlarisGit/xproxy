@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum, auto
 from pathlib import Path
 from typing import Callable
@@ -56,6 +56,7 @@ class TunnelEndpoint:
     remote_socks_port: int = 10808
     identity_file: str | None = None
     known_hosts_file: str | None = None
+    country: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -116,9 +117,13 @@ def parse_tunnels(text: str) -> TunnelConfig:
                 if not path.is_absolute():
                     raise TunnelConfigError(f"{ident}: {key} must be absolute or start with ~/")
                 paths[key] = str(path)
+        country = row.get("country")
+        if country is not None and (not isinstance(country, str) or not country.strip() or
+                                    len(country) > 80 or any(ord(c) < 32 for c in country)):
+            raise TunnelConfigError(f"{ident}: invalid country")
         endpoints.append(TunnelEndpoint(
             ident, host, _port(row.get("port", 22), "port"), user,
-            _port(row.get("remote_socks_port", 10808), "remote_socks_port"), **paths,
+            _port(row.get("remote_socks_port", 10808), "remote_socks_port"), country=country, **paths,
         ))
     return TunnelConfig(tuple(endpoints), port)
 
@@ -160,6 +165,7 @@ class TunnelIntent:
     connect: bool = False
     keep: bool = False
     urgent: bool = False
+    generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,6 +175,7 @@ class TunnelSnapshot:
     local_port: int = SSH_LOCAL_PORT
     last_ok: float = 0.0
     detail: str = ""
+    generation: int = 0
 
     @property
     def ready(self) -> bool:
@@ -296,6 +303,7 @@ class TunnelManager:
         self._failures = 0
         self._next_check = 0.0
         self._was_urgent = False
+        self._network_generation: int | None = None
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ssh-probe")
         self._probe: Future | None = None
 
@@ -314,15 +322,21 @@ class TunnelManager:
         return ([preferred] if preferred else []) + [e for e in self.config.tunnels if e != preferred]
 
     def snapshot(self) -> TunnelSnapshot:
+        generation = self.intent().generation
         with self._lock:
+            if self._snapshot.status == "READY" and self._snapshot.generation != generation:
+                return replace(self._snapshot, status="CHECKING", detail="network evidence expired")
             return self._snapshot
 
-    def _publish(self, status: str, detail: str = "", *, ok: bool = False) -> None:
+    def _publish(self, status: str, detail: str = "", *, ok: bool = False,
+                 generation: int | None = None) -> None:
+        if generation is None:
+            generation = self.intent().generation
         with self._lock:
             old = self._snapshot
             self._snapshot = TunnelSnapshot(
                 status, self._endpoint, self._port,
-                time.monotonic() if ok else old.last_ok, detail,
+                time.monotonic() if ok else old.last_ok, detail, generation,
             )
             current = self._snapshot
         if (old.status, old.endpoint, old.detail) != (status, current.endpoint, detail):
@@ -508,9 +522,11 @@ class TunnelManager:
     def _check(self, deadline: float, *, connecting: bool = False) -> bool:
         if self._probe is not None and not self._probe.done():
             return False
+        generation = self.intent().generation
         def current():
             request = self.intent()
             return not self._stop.is_set() and request.online and request.keep and \
+                request.generation == generation and \
                 (not connecting or self._allowed(self._endpoint))
         if not current():
             return False
@@ -518,12 +534,14 @@ class TunnelManager:
         while not self._probe.done():
             request = self.intent()
             if self._stop.wait(0.1) or not request.online or not request.keep or \
+                    request.generation != generation or \
                     (connecting and not self._allowed(self._endpoint)) or \
                     time.monotonic() >= deadline:
                 return False
-        return bool(self._probe.result()) and self._alive()
+        return bool(self._probe.result()) and current() and self._alive()
 
     def _attempt(self, endpoint: TunnelEndpoint, port: int) -> AttemptResult:
+        generation = self.intent().generation
         self._endpoint, self._port = endpoint, port
         self._publish("CONNECTING")
         if not self._allowed(endpoint):
@@ -531,16 +549,18 @@ class TunnelManager:
         if not self._spawn(endpoint, port):
             return AttemptResult.CANCELLED
         deadline = time.monotonic() + SSH_START_TIMEOUT
-        while self._alive() and time.monotonic() < deadline and self._allowed(endpoint):
+        while (self._alive() and time.monotonic() < deadline and self._allowed(endpoint) and
+               self.intent().generation == generation):
             if _listener(port):
-                if self._check(deadline, connecting=True) and self._allowed(endpoint):
+                if (self._check(deadline, connecting=True) and self._allowed(endpoint) and
+                        self.intent().generation == generation):
                     self._failures = self._retry_round = 0
                     self._next_check = time.monotonic() + SSH_HEALTH_INTERVAL
-                    self._publish("READY", ok=True)
+                    self._publish("READY", ok=True, generation=generation)
                     return AttemptResult.READY
                 break
             self._stop.wait(0.2)
-        failed = self._allowed(endpoint)
+        failed = self._allowed(endpoint) and self.intent().generation == generation
         self._terminate()
         return AttemptResult.FAILED if failed else AttemptResult.CANCELLED
 
@@ -552,6 +572,10 @@ class TunnelManager:
 
     def step(self) -> None:
         request = self.intent()
+        if request.generation != self._network_generation:
+            self._network_generation = request.generation
+            self._next_check = 0
+            self._failures = 0
         if request.urgent and not self._was_urgent:
             self._retry_at = min(self._retry_at, time.monotonic() + 1)
             self._next_check = 0
@@ -573,16 +597,18 @@ class TunnelManager:
             self._publish("SUSPENDED" if request.keep and not request.online else "IDLE")
             return
         if self._pid is not None:
+            if self._probe is not None and not self._probe.done():
+                return
             alive = self._alive()
             if alive and time.monotonic() < self._next_check:
                 return
             healthy = alive and self._check(time.monotonic() + SSH_START_TIMEOUT)
-            if self._stop.is_set():
+            if self._stop.is_set() or self.intent().generation != request.generation:
                 return
             self._next_check = time.monotonic() + SSH_HEALTH_INTERVAL
             if healthy:
                 self._failures = 0
-                self._publish("READY", ok=True)
+                self._publish("READY", ok=True, generation=request.generation)
                 return
             if not self.intent().online:
                 return

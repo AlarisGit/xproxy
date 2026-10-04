@@ -4,8 +4,10 @@ from __future__ import annotations
 import random
 import json
 import signal
+import sys
 import threading
 import time
+from queue import SimpleQueue, Empty
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -33,7 +35,8 @@ from .routing import build_xray_sections
 from .healthcheck import internet_alive, proxy_alive, target_alive, public_ips
 from .logger import get_logger
 from .notifier import notify, send_summary, is_configured as tg_configured
-from .status_journal import Status, StatusJournal, format_summary
+from .status_journal import Status, StatusJournal, Route, format_summary
+from .power import PowerMonitor
 from .platform_utils import PlatformInfo, detect_platform, network_signature
 from .servers import Server, expand_servers, filter_and_sort, load_country_ranks, parse_subscription, tcp_probe
 from .settings import (
@@ -168,6 +171,11 @@ class Daemon:
         self._active_channel_ok: Optional[bool] = None
         self._journal: StatusJournal | None = None
         self._summary_retry_at = 0.0
+        self._power_events = SimpleQueue()
+        self._power_pending = threading.Event()
+        self._power_monitor = PowerMonitor(self.platform.name, self._on_power_event)
+        self._resume_grace_until = 0.0
+        self._last_tick_wall: float | None = None
         self._last_cold_rotation_attempt: float = 0.0
         self.emergency = EmergencyController(self)
         # Восстановить активный сервер, если был сохранён.
@@ -231,8 +239,10 @@ class Daemon:
                                      "contacted for this fault", urgent=True)
         self._wake_standby_worker()
 
-    def _update_network(self, online: bool, signature: str | None = None) -> None:
-        snapshot = self.network.update(online, signature)
+    def _update_network(self, online: bool, signature: str | None = None, *,
+                        expected_generation: int | None = None) -> bool:
+        snapshot = self.network.update(online, signature, expected_generation=expected_generation)
+        online = snapshot.online
         if snapshot.generation != self._network_generation:
             self._network_generation = snapshot.generation
             with self._standby_cond:
@@ -248,6 +258,37 @@ class Daemon:
         self._network_announced = online
         if online:
             self._wake_standby_worker()
+        return online
+
+    def _on_power_event(self, kind: str) -> None:
+        # Native callback: no database access, network I/O, or daemon locks.
+        self._power_pending.set()
+        self.network.suspend()
+        self._power_events.put((kind, time.time(), self.network.snapshot().generation))
+        self._wake_event.set()
+        self._maintenance_wake.set()
+
+    def _drain_power_events(self) -> None:
+        self._power_pending.clear()
+        while True:
+            try:
+                kind, stamp, generation = self._power_events.get_nowait()
+            except Empty:
+                break
+            if self._journal is not None:
+                self._journal.lifecycle(kind, ts=stamp)
+            with self._standby_cond:
+                self._invalidate_standby_locked(kind)
+            self._network_generation = self.network.snapshot().generation
+            self._network_announced = None
+            self._active_channel_ok = None
+            self._health_checked_at = 0
+            self.state.note_proxy_ok()
+            self._next_health_at = 0
+            self._resume_grace_until = time.monotonic() + 20 if kind != "sleep" else 0
+            if kind != "sleep":
+                self.network.resume(expected_generation=generation)
+            log.info("observations invalidated: %s", kind)
 
     def _maintenance_loop(self) -> None:
         # Startup jitter belongs to optional downloads, never to recovery.
@@ -346,6 +387,7 @@ class Daemon:
             self.emergency.reconcile()
             self._journal = StatusJournal()
             self._journal.mark_start()
+            self._power_monitor.start()
             log.info("xproxy started (transport=%s, active=%s)", self.state.transport, _fmt(self.state.active))
             try:
                 self.tick()  # establish network state before adopting SSH
@@ -365,6 +407,8 @@ class Daemon:
                     self._wake_event.clear()
             finally:
                 self._stop = True
+                self._power_monitor.close()
+                self._drain_power_events()
                 self._maintenance_wake.set()
                 self._stop_standby_worker()
                 # Keep the instance lease until all configuration writers exit.
@@ -373,6 +417,8 @@ class Daemon:
                 self._finish_config_sync()
                 self.emergency.manager.close(preserve=self._restart_requested)
                 log.info("xproxy stopped (%s)", _signal_name(self._stop_signal) if self._stop_signal else "manual")
+                if sys.exc_info()[0] is None:
+                    self._journal.lifecycle("stop")
                 self._journal.close()
                 self._journal = None
                 log.info("daemon stopped")
@@ -413,10 +459,22 @@ class Daemon:
                         log.info("SSH routing present: use --daemon for supervised recovery")
                 self._record_status(online)
             finally:
+                if sys.exc_info()[0] is None:
+                    self._journal.lifecycle("stop")
                 self._journal.close()
                 self._journal = None
 
     def tick(self) -> None:
+        wall = time.time()
+        if (self._last_tick_wall is not None and wall - self._last_tick_wall > 60 and
+                not self._power_pending.is_set() and not self.network.suspended()):
+            # A scheduling gap is not proof of either sleep or an outage.
+            self._on_power_event("gap")
+        self._last_tick_wall = wall
+        self._drain_power_events()
+        if self.network.suspended():
+            self._next_health_at = time.monotonic() + HEALTH_INTERVAL
+            return
         self.emergency.reload()
         now = time.monotonic()
         if now < self._next_health_at:
@@ -425,10 +483,15 @@ class Daemon:
             self.emergency.tick()
             return
         signature = network_signature() if self._runtime_started else None
+        generation = self.network.snapshot().generation
         online = internet_alive()
         # The same independent base-internet probe gates routine work and
         # emergency rechecks. Proxy health never overrides this network state.
-        self._update_network(online, signature)
+        if self._power_pending.is_set() or self.network.snapshot().generation != generation:
+            return
+        online = self._update_network(online, signature, expected_generation=generation)
+        if self._power_pending.is_set() or self.network.suspended():
+            return
         if online:
             with self._apply_lock:
                 if not self._recover_interrupted_config():
@@ -485,10 +548,9 @@ class Daemon:
         status = self._journal.latest()
         if status is None or not status.working or not tg_configured():
             return
-        if send_summary(format_summary(
-                status, reason="Ежедневная сводка",
-                transition_times=self._journal.last_transition_times())):
+        if self._send_status_summary(status, "Ежедневная сводка"):
             self._journal.mark_daily_sent(today)
+            self._journal.mark_recovery_sent()
             self.state.last_heartbeat_date = today
         else:
             self._summary_retry_at = time.monotonic() + 300
@@ -937,8 +999,43 @@ class Daemon:
                         self._standby.server.key() == active.key():
                     self._discard_current_standby_locked(active, "active endpoint recovered")
 
-    def _record_status(self, direct: bool) -> None:
-        if self._journal is None or self.dry_run:
+    def _summary_route(self) -> Route:
+        with self._standby_cond:
+            standby = self._standby
+            ttl = VLESS_STANDBY_FRESH_SECONDS if self.state.transport == "ssh" else STANDBY_READY_TTL
+            standby_label = (_fmt(standby.server) if standby is not None and standby.is_usable() and
+                             0 <= time.time() - standby.last_ok_at <= ttl else "не готов")
+            ages = {}
+            for record in self._reserves.values():
+                if record.fresh() and record.since is not None:
+                    endpoint = record.slot.server.key()
+                    ages[endpoint] = max(ages.get(endpoint, 0), time.monotonic() - record.since)
+        if self.state.transport == "ssh":
+            tunnel = self.emergency.manager.snapshot()
+            ep = tunnel.endpoint
+            if ep is not None:
+                ep = next((candidate for candidate in self.emergency.file.config.tunnels if candidate == ep), ep)
+            server = ((f"{ep.country} · " if ep.country else "") + f"{ep.id} ({ep.host})"
+                      if ep else "сервер не определён")
+            elapsed = sorted(ages.values(), reverse=True)[1] if len(ages) >= 2 else 0
+            return Route("SSH", server, standby_label, (elapsed, self.emergency.recovery_seconds()),
+                         key=f"ssh:{ep.host}:{ep.port}" if ep else "ssh:unknown")
+        active = self.state.active_snapshot()
+        return Route("VLESS" if self.state.transport == "vless" else "не определён",
+                     _fmt(active), standby_label,
+                     key=f"vless:{active.address}:{active.port}" if active else "unknown")
+
+    def _send_status_summary(self, status: Status, reason: str) -> bool:
+        if self._power_pending.is_set() or self.network.suspended():
+            return False
+        if self._runtime_started and (not self.network.online() or self._active_channel_ok is not True or
+                                     time.monotonic() - self._health_checked_at > HEALTH_INTERVAL * 3):
+            return False
+        return send_summary(format_summary(status, reason=reason, route=self._summary_route(),
+                                           events=self._journal.events()))
+
+    def _record_status(self, direct: bool, *, proxy_confirmed: bool | None = None) -> None:
+        if self._journal is None or self.dry_run or self._power_pending.is_set() or self.network.suspended():
             return
         active = self.state.active_snapshot()
         with self._standby_cond:
@@ -948,7 +1045,7 @@ class Daemon:
                           0 <= time.time() - standby.last_ok_at <= ttl)
         tunnel = self.emergency.manager.snapshot()
         if not direct:
-            status = Status("DOWN", "DOWN", "N/A", "N/A", "N/A")
+            status = Status("DOWN", "N/A", "N/A", "N/A", "N/A")
         else:
             proxy_ok = self._active_channel_ok is True
             primary = active if self.state.transport == "vless" else self.state.last_vless
@@ -958,19 +1055,19 @@ class Daemon:
             secondary = f"{'READY' if standby_ok else 'UNAVAILABLE'} {_fmt(standby.server if standby else None)}"
             ssh_label = tunnel.endpoint.id if tunnel.endpoint else "-"
             status = Status(
-                "UP", "UP" if proxy_ok else "DOWN",
+                "UP", "UP" if proxy_ok else "DOWN" if self._active_channel_ok is False else "UNKNOWN",
                 f"{primary_state} {primary_label}", secondary,
                 f"{tunnel.status} {ssh_label}",
             )
         try:
-            self._journal.record(status)
-            if not status.working:
-                self._summary_retry_at = 0.0
+            self._journal.record(status, route=self._summary_route(),
+                                 proxy_confirmed=self._failure_confirmed() if proxy_confirmed is None else proxy_confirmed,
+                                 allow_failure=time.monotonic() >= self._resume_grace_until)
+            if status.working:
+                self._resume_grace_until = 0
             if status.working and self._journal.recovery_pending() and tg_configured() and \
                     time.monotonic() >= self._summary_retry_at:
-                if send_summary(format_summary(
-                        status, reason="Proxy восстановлен",
-                        transition_times=self._journal.last_transition_times())):
+                if self._send_status_summary(status, self._journal.summary_reason()):
                     self._journal.mark_recovery_sent()
                     now = time.localtime()
                     if self._daily_due(now):
@@ -1891,6 +1988,7 @@ class Daemon:
             return
         if not running:
             self._record_active_health(False)
+            self._record_status(True, proxy_confirmed=True)
             # A local service failure is not evidence of a blocked VLESS route.
             if self._runtime_started:
                 self._repair_xray_listener()
@@ -1911,6 +2009,7 @@ class Daemon:
             if not self._failure_confirmed():
                 return
 
+            self._record_status(True)
             self._handle_rotation_needed(reason="proxy-failing")
             return
 
@@ -1932,6 +2031,7 @@ class Daemon:
             if not self._failure_confirmed():
                 return
 
+            self._record_status(True)
             self._handle_rotation_needed(reason="target-blocked")
             return
 
