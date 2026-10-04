@@ -8,7 +8,7 @@ from typing import Any
 from .logger import get_logger
 from .routing import build_xray_sections
 from .servers import Server
-from .settings import CONFIG_TMPL
+from .settings import CONFIG_TMPL, UPSTREAM_PROBE_PORT
 
 log = get_logger("xproxy.xray_config")
 
@@ -51,6 +51,17 @@ def build_xray_config(
 
     # Routing / DNS / FakeDNS.
     base["routing"] = sections["routing"]
+    # Only local health traffic uses this listener. Direct rules must not hide
+    # a blocked upstream from the daemon's production checks.
+    base["inbounds"] = [i for i in base.get("inbounds", []) if i.get("tag") != "xproxy-upstream-probe"]
+    base["inbounds"].append({
+        "tag": "xproxy-upstream-probe", "listen": "127.0.0.1",
+        "port": UPSTREAM_PROBE_PORT, "protocol": "socks",
+        "settings": {"auth": "noauth", "udp": False},
+    })
+    base["routing"].setdefault("rules", []).insert(0, {
+        "type": "field", "inboundTag": ["xproxy-upstream-probe"], "outboundTag": "proxy",
+    })
     base["dns"] = sections["dns"]
     if sections["fakedns"] is not None:
         base["fakedns"] = sections["fakedns"]

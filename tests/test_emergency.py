@@ -242,198 +242,96 @@ class EmergencyPolicyTests(unittest.TestCase):
         self.d._record_active_health(True)
         self.addCleanup(self.d.emergency.manager._pool.shutdown, wait=False)
 
-    def test_empty_slot_is_not_evidence_until_all_alternatives_fail(self):
+    def test_ssh_is_warm_with_healthy_active_and_standby(self):
+        self.d._standby = slot(server(2))
+        self.assertTrue(self.d.emergency.intent().connect)
+        self.assertTrue(self.d.emergency.intent().keep)
         self.assertFalse(self.d.emergency.needed())
-        self.d.emergency.failed(server(2))
+        with mock.patch.object(self.d.emergency, "_activate") as activate:
+            self.d.emergency.tick()
+            activate.assert_not_called()
+
+    def test_no_configuration_or_offline_prevents_new_ssh(self):
+        self.d.emergency.file.config = TunnelConfig(())
+        self.assertFalse(self.d.emergency.intent().connect)
+        self.d.emergency.file.config = TunnelConfig((A,))
+        self.d.network.update(False)
+        self.assertFalse(self.d.emergency.intent().connect)
+        self.assertTrue(self.d.emergency.intent().keep)
+
+    def test_confirmed_failure_needs_no_full_subscription_scan(self):
+        self.d._record_active_health(False)
+        self.d.state.consecutive_proxy_failures = 1
         self.assertFalse(self.d.emergency.needed())
-        self.d.emergency.failed(server(3))
+        self.d.state.consecutive_proxy_failures = 2
         self.assertTrue(self.d.emergency.needed())
         self.d._standby = slot(server(2))
         self.assertFalse(self.d.emergency.needed())
 
-    def test_missing_alternatives_or_local_failure_does_not_expose_hosts(self):
-        self.d.state.ranked = [server(1)]
-        self.assertFalse(self.d.emergency.needed())
-        self.d._record_active_health(False)
-        self.d.state.consecutive_proxy_failures = 5
-        self.d.emergency.local_failure()
-        self.assertFalse(self.d.emergency.needed())
-
-    def test_confirmed_active_failure_can_start_emergency_without_waiting_for_full_scan(self):
-        self.d._record_active_health(False)
-        self.d.state.consecutive_proxy_failures = 4
-        self.assertFalse(self.d.emergency.needed())
-        self.d.state.consecutive_proxy_failures = 5
-        self.assertTrue(self.d.emergency.needed())
-
-    def test_saved_ssh_mode_does_not_authorize_reconnection_without_fresh_vless_failure(self):
+    def test_saved_ssh_mode_can_reconnect_without_new_vless_failures(self):
         self.d.state.transport = "ssh"
         self.d.state.active = None
-        self.assertFalse(self.d.emergency.needed())
-        self.d.emergency.failed(server(1))
-        self.assertTrue(self.d.emergency.needed())
-
-    def test_previous_active_is_included_in_ssh_recovery_scan(self):
-        self.d.state.transport = "ssh"
-        self.d.state.active = None
-        self.d.state.ranked = [server(1)]
-        with self.d._standby_cond:
-            self.assertEqual(self.d._select_standby_candidate_locked().key(), server(1).key())
-
-    def test_failed_pass_restarts_after_backoff(self):
-        self.d.state.ranked = [server(1), server(2)]
-        with self.d._standby_cond, mock.patch.object(daemon.time, "monotonic", return_value=100):
-            self.assertIsNotNone(self.d._select_standby_candidate_locked())
-            self.assertIsNone(self.d._select_standby_candidate_locked())
-        with self.d._standby_cond, mock.patch.object(daemon.time, "monotonic", return_value=161):
-            self.assertIsNotNone(self.d._select_standby_candidate_locked())
+        self.assertTrue(self.d.emergency.intent().connect)
 
     def test_offline_does_not_repair_xray_or_increment_failures(self):
-        with mock.patch.object(daemon, "is_running") as running, \
-                mock.patch.object(self.d, "_handle_rotation_needed") as rotate:
+        with mock.patch.object(daemon, "is_running") as running:
             self.d.tick_health(has_internet=False)
             running.assert_not_called()
-            rotate.assert_not_called()
             self.assertEqual(self.d.state.consecutive_proxy_failures, 0)
 
-    def test_shutdown_requires_stable_vless_and_fresh_standby(self):
-        clock = [1000.0]
-        with mock.patch("time.time", side_effect=lambda: clock[0]), \
-                mock.patch("time.monotonic", side_effect=lambda: clock[0]), \
-                mock.patch.object(self.d.emergency, "event"):
-            self.d._standby = slot(server(2))
-            snapshot = TunnelSnapshot("READY", A, 20808, 1000)
-            with mock.patch.object(self.d.emergency.manager, "snapshot", return_value=snapshot):
-                for ts in range(1000, 1121, 15):
-                    clock[0] = ts
-                    self.d.network.update(True)
-                    self.d._record_active_health(True)
-                    self.d.emergency.tick()
-                self.assertFalse(self.d.emergency._release)  # standby is stale for teardown
-                self.d._standby.last_ok_at = clock[0]
-                self.d.emergency.tick()
-                self.assertTrue(self.d.emergency._release)
-                self.assertFalse(self.d.emergency.intent().keep)
-
-    def test_new_standby_releases_ssh_without_repeating_active_stabilization(self):
-        clock = [1000.0]
-        with mock.patch("time.time", side_effect=lambda: clock[0]), \
-                mock.patch("time.monotonic", side_effect=lambda: clock[0]), \
-                mock.patch.object(self.d.emergency, "event"), \
-                mock.patch.object(self.d.emergency.manager, "snapshot", return_value=TunnelSnapshot("READY", A, 20808, 1000)):
-            for ts in range(1000, 1121, 15):
-                clock[0] = ts
-                self.d.network.update(True)
-                self.d._record_active_health(True)
-                self.d.emergency.tick()
-            self.assertFalse(self.d.emergency._release)
-            self.d._standby = slot(server(2))
-            self.d.emergency.tick()
-            self.assertTrue(self.d.emergency._release)
-
-    def test_live_ssh_config_is_preserved_on_startup_even_with_saved_vless(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "config.json"
-            config.write_text(json.dumps({"outbounds": [{"tag": "proxy", "protocol": "socks",
-                "settings": {"servers": [{"address": "127.0.0.1", "port": 20808}]}}]}))
-            self.d.platform = PlatformInfo("macos", config, [], False)
-            self.d.emergency.reconcile()
-            self.assertEqual(self.d.state.transport, "ssh")
-            self.assertIsNone(self.d.state.active)
-            self.assertEqual(self.d.state.last_vless.key(), server(1).key())
-            self.assertFalse(self.d.emergency.needed())
-
-    def test_missing_live_outbound_does_not_trust_saved_active_as_vless_evidence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "config.json"
-            config.write_text('{}')
-            self.d.platform = PlatformInfo("linux", config, [], False)
-            self.d.emergency.reconcile()
-            self.d._record_active_health(False)
-            self.d.state.consecutive_proxy_failures = 5
-            self.assertEqual(self.d.state.transport, "unknown")
-            self.assertFalse(self.d.emergency.needed())
-
-    def test_offline_keeps_prepared_process_without_probes_on_repeated_steps(self):
+    def test_offline_preserves_existing_process(self):
         manager = self.d.emergency.manager
         manager._endpoint, manager._pid = A, 123
-        manager._publish("READY", ok=True)
         self.d.network.update(False)
         with mock.patch.object(manager, "_terminate") as terminate, \
                 mock.patch.object(manager, "_check") as check, \
                 mock.patch.object(manager, "_attempt") as attempt:
-            for _ in range(3):
-                manager.step()
+            manager.step()
             terminate.assert_not_called()
             check.assert_not_called()
             attempt.assert_not_called()
         manager._pid = None
 
-    def test_route_change_and_wakeup_discard_old_failure_evidence(self):
-        self.d._update_network(True, "wifi-a")
-        self.d._record_active_health(True)
-        self.d.emergency.failed(server(2))
-        self.d.emergency.failed(server(3))
-        self.assertTrue(self.d.emergency.needed())
-        self.d._update_network(True, "wifi-b")
-        self.assertFalse(self.d.emergency.needed())
-        start = time.time()
-        with mock.patch("time.time", return_value=start + 300):
-            self.assertFalse(self.d.network.online())
-
-    def test_full_emergency_cycle_requires_recovery_and_independent_standby(self):
+    def test_full_cycle_keeps_ssh_and_requires_two_stable_vless(self):
+        from xproxy.reserves import Reserve
         clock = [1000.0]
         manager = self.d.emergency.manager
         with mock.patch("time.time", side_effect=lambda: clock[0]), \
                 mock.patch("time.monotonic", side_effect=lambda: clock[0]), \
-                mock.patch.object(self.d.emergency, "event") as event, \
+                mock.patch.object(self.d.emergency, "event"), \
                 mock.patch.object(emergency, "build_ssh_config_text", return_value="{}"), \
                 mock.patch.object(self.d, "_apply_verified_config", return_value=True), \
                 mock.patch.object(daemon, "standby_fingerprint", return_value="fp"), \
+                mock.patch("xproxy.standby.standby_fingerprint", return_value="fp"), \
                 mock.patch.object(daemon, "apply_config_text"), \
                 mock.patch.object(daemon, "commit_config"), \
                 mock.patch.object(daemon, "proxy_alive", return_value=True), \
                 mock.patch.object(daemon, "target_alive", return_value=(True, "")), \
                 mock.patch("xproxy.state._save_active"):
             self.d.network.update(True)
-            self.d._record_active_health(True)
-            self.d.emergency.failed(server(2))
-            self.d.emergency.failed(server(3))
-            self.assertTrue(self.d.emergency.intent().connect)
+            self.d._record_active_health(False)
+            self.d.state.consecutive_proxy_failures = 2
             manager._endpoint = A
             manager._publish("READY", ok=True)
             self.d.emergency.tick()
-            self.assertEqual(self.d.state.transport, "vless")
-            self.d._record_active_health(False)
-            self.d.state.consecutive_proxy_failures = 1
-            self.d.emergency.tick()
             self.assertEqual(self.d.state.transport, "ssh")
-            self.assertEqual(self.d.state.last_vless.key(), server(1).key())
-            self.d._standby = slot(server(2))
-            self.d.emergency.prepared(self.d._standby)
-            self.d.emergency.tick()
-            self.assertEqual(self.d.state.transport, "ssh")  # one sample is insufficient
-            clock[0] += 16
-            self.d.emergency.prepared(self.d._standby)
-            self.d.emergency.tick()
-            self.assertEqual(self.d.state.transport, "vless")
-            self.assertEqual(self.d.state.active.key(), server(2).key())
-            self.assertTrue(self.d.emergency.intent().keep)
-            self.assertFalse(self.d.emergency.intent().connect)
-            self.d._standby = slot(server(3))
-            for _ in range(9):
+            for ts in range(1000, 1601, 15):
+                clock[0] = ts
                 self.d.network.update(True)
                 self.d._record_active_health(True)
-                self.d._standby.last_ok_at = clock[0]
+                for n in (2, 3):
+                    prepared = slot(server(n))
+                    prepared.transfer_ok = True
+                    record = self.d._reserves.setdefault(emergency.candidate_key(prepared.server), Reserve())
+                    record.success(prepared)
+                    if n == 2:
+                        self.d._standby = prepared
                 self.d.emergency.tick()
-                clock[0] += 15
-            self.assertFalse(self.d.emergency.intent().keep)
-            with mock.patch.object(manager, "_attempt") as attempt:
-                manager.step()
-                attempt.assert_not_called()
-            self.assertEqual(manager.snapshot().status, "IDLE")
-            transport_events = [c.args[1] for c in event.call_args_list if c.args[0] == "transport"]
-            self.assertEqual(len(transport_events), 3)
+                self.assertEqual(self.d.state.transport, "vless" if ts == 1600 else "ssh")
+            self.assertEqual(self.d.state.active.key(), server(2).key())
+            self.assertEqual(self.d._standby.server.key(), server(3).key())
+            self.assertTrue(self.d.emergency.intent().keep)
+            self.assertTrue(self.d.emergency.intent().connect)
 
 
 class NotificationTests(unittest.TestCase):

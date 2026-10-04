@@ -1,4 +1,4 @@
-"""Demand-driven OpenSSH supervision. Unselected hosts are never probed."""
+"""Warm OpenSSH supervision. Unselected hosts are never probed."""
 from __future__ import annotations
 
 import hashlib
@@ -26,6 +26,7 @@ from .logger import get_logger
 from .settings import (
     SSH_CONNECT_TIMEOUT, SSH_HEALTH_FAILURES, SSH_HEALTH_INTERVAL,
     SSH_LOCAL_PORT, SSH_READY_TTL, SSH_RETRY_SCHEDULE, SSH_START_TIMEOUT,
+    SSH_WARM_RETRY_SCHEDULE,
     STATE_DIR, TUNNELS_CONFIG,
 )
 
@@ -82,7 +83,7 @@ def parse_tunnels(text: str) -> TunnelConfig:
     if not isinstance(rows, list):
         raise TunnelConfigError("tunnels must be an array")
     port = _port(data.get("local_port", SSH_LOCAL_PORT), "local_port")
-    if port in (10808, 10809):
+    if port in (10808, 10809, 10810):
         raise TunnelConfigError("local_port must differ from the xray client ports")
     endpoints: list[TunnelEndpoint] = []
     seen: set[str] = set()
@@ -158,6 +159,7 @@ class TunnelIntent:
     online: bool = False
     connect: bool = False
     keep: bool = False
+    urgent: bool = False
 
 
 @dataclass(frozen=True)
@@ -263,8 +265,8 @@ class TunnelManager:
     """One worker, one owned SSH process, one outstanding e2e probe at most.
 
     intent() is read again before every attempt. confirm_network() is called
-    after failures, before advancing to another host. Neither is called to
-    probe remote SSH hosts when emergency demand is absent.
+    after failures, before advancing to another host. Offline or disabled
+    configurations never authorize a new handshake.
     """
     def __init__(self, intent: Callable[[], TunnelIntent],
                  confirm_network: Callable[[], bool],
@@ -293,6 +295,7 @@ class TunnelManager:
         self._retry_round = 0
         self._failures = 0
         self._next_check = 0.0
+        self._was_urgent = False
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ssh-probe")
         self._probe: Future | None = None
 
@@ -542,12 +545,17 @@ class TunnelManager:
         return AttemptResult.FAILED if failed else AttemptResult.CANCELLED
 
     def _backoff(self) -> None:
-        delay = SSH_RETRY_SCHEDULE[min(self._retry_round, len(SSH_RETRY_SCHEDULE) - 1)]
+        schedule = SSH_RETRY_SCHEDULE if self.intent().urgent else SSH_WARM_RETRY_SCHEDULE
+        delay = schedule[min(self._retry_round, len(schedule) - 1)]
         self._retry_round += 1
         self._retry_at = time.monotonic() + delay
 
     def step(self) -> None:
         request = self.intent()
+        if request.urgent and not self._was_urgent:
+            self._retry_at = min(self._retry_at, time.monotonic() + 1)
+            self._next_check = 0
+        self._was_urgent = request.urgent
         if not request.online and request.keep:
             # Keep an existing process/config intact across sleep or an expired
             # connectivity sample. No new probes or reconnects while offline.
@@ -621,7 +629,7 @@ class TunnelManager:
             self._backoff()
             return
         if result is AttemptResult.CANCELLED or not self._allowed(endpoint):
-            self._publish("IDLE", "emergency demand withdrawn")
+            self._publish("IDLE", "connection cancelled")
             return
         if not self.confirm_network() or not self._allowed(endpoint):
             return

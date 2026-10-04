@@ -156,51 +156,21 @@ class SshPriorityRegressions(ReviewFixture):
 
 
 class EvidenceRegressions(ReviewFixture):
-    def test_successful_reserve_closes_the_failed_scan_episode(self):
+    def test_failed_candidates_retry_independently_without_waiting_for_pass(self):
+        from xproxy.reserves import Reserve
         d = self.d
         clock = [1000.0]
         self.patch(time, "monotonic", side_effect=lambda: clock[0])
         self.patch(time, "time", side_effect=lambda: clock[0])
         d._update_network(True, "route")
-        d._record_active_health(True)
-        with d._standby_cond:
-            first = d._select_standby_candidate_locked()
-            d.emergency.failed(first)
-            second = d._select_standby_candidate_locked()
-            prepared = slot(second)
-            d._publish_standby_locked(prepared)
-            d.emergency.prepared(prepared)
-        for now in range(1015, 1601, 15):
-            clock[0] = now
-            d._update_network(True, "route")
-            d._record_active_health(True)
-        with d._standby_cond:
-            d._handle_prepare_failure_locked(second, "remote failed", False)
-            d.emergency.failed(second)
-            retry = d._select_standby_candidate_locked()
-        self.assertEqual(retry, first)
-        self.assertFalse(d.emergency._failed_recently(first))
-        self.assertFalse(d.emergency.reserve_lost())
-        self.assertFalse(d.emergency.needed())
-
-    def test_uninterrupted_long_failed_pass_still_confirms_lost_reserves(self):
-        d = self.d
-        clock = [1000.0]
-        self.patch(time, "monotonic", side_effect=lambda: clock[0])
-        self.patch(time, "time", side_effect=lambda: clock[0])
-        d._update_network(True, "route")
-        with d._standby_cond:
-            first = d._select_standby_candidate_locked()
-            d.emergency.failed(first)
-            second = d._select_standby_candidate_locked()
-        for now in range(1015, 1601, 15):
-            clock[0] = now
-            d._update_network(True, "route")
-            d._record_active_health(True)
-        with d._standby_cond:
-            d.emergency.failed(second)
-            self.assertIsNone(d._select_standby_candidate_locked())
-        self.assertTrue(d.emergency.reserve_lost())
+        first = d._select_standby_candidate_locked()
+        record = d._reserves.setdefault(candidate_key(first), Reserve())
+        record.failed()
+        second = d._select_standby_candidate_locked()
+        self.assertNotEqual(second.key(), first.key())
+        d._inflight[candidate_key(second)] = second
+        clock[0] += 1
+        self.assertEqual(d._select_standby_candidate_locked(), first)
 
     def test_expired_wall_clock_evidence_invalidates_slots_when_network_resumes(self):
         d = self.d
@@ -209,14 +179,16 @@ class EvidenceRegressions(ReviewFixture):
         self.patch(time, "time", side_effect=lambda: clocks[1])
         d._update_network(True, "route")
         d._standby = slot(server(2))
-        d.emergency.failed(server(3))
+        from xproxy.reserves import Reserve
+        d._reserves[candidate_key(server(3))] = Reserve()
+        d._reserves[candidate_key(server(3))].failed()
         before = d.network.snapshot().generation
         clocks[:] = [1001.0, 1101.0]  # macOS sleep: monotonic barely advanced
         self.assertFalse(d.network.online())
         d._update_network(True, "route")
         self.assertGreater(d.network.snapshot().generation, before)
         self.assertIsNone(d._standby)
-        self.assertFalse(d.emergency._failed_recently(server(3)))
+        self.assertFalse(d._reserves)
         self.assertIsNone(d._active_channel_ok)
 
     def test_changed_active_credentials_are_prepared_and_promoted_after_failure(self):
@@ -226,7 +198,7 @@ class EvidenceRegressions(ReviewFixture):
         d.state.ranked = [updated]
         with d._standby_cond:
             self.assertIsNone(d._select_standby_candidate_locked())
-        self.assertFalse(d.emergency.reserve_lost())
+        self.assertFalse(d._standby_ready_for_fast_path())
         d._runtime_started = True
         d._record_active_health(False)
         d.state.consecutive_proxy_failures = 5
@@ -240,7 +212,7 @@ class EvidenceRegressions(ReviewFixture):
         d._standby_stop = False
         self.patch(daemon, "internet_alive", return_value=True)
         self.patch(daemon, "is_running", return_value=True)
-        self.patch(daemon, "proxy_alive", side_effect=[False, False, True])
+        self.patch(daemon, "proxy_alive", side_effect=[False, True])
         self.patch(daemon, "target_alive", return_value=(True, ""))
         self.patch(daemon, "standby_fingerprint", return_value="fp")
         apply = self.patch(daemon, "apply_config_text")

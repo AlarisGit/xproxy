@@ -1,9 +1,8 @@
-"""Emergency policy; SSH addresses are touched only by the demand-driven manager."""
+"""Warm SSH reserve and asymmetric VLESS failover/recovery policy."""
 from __future__ import annotations
 
 import hashlib
 import json
-import threading
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -12,9 +11,8 @@ from .healthcheck import internet_alive
 from .logger import get_logger
 from .notifier import notify
 from .settings import (
-    HEALTH_INTERVAL, STANDBY_FAILURE_TTL,
-    VLESS_RECOVERY_INTERVAL, VLESS_RECOVERY_SAMPLES,
-    VLESS_STABLE_SECONDS, VLESS_STANDBY_FRESH_SECONDS,
+    HEALTH_INTERVAL,
+    VLESS_STABLE_SECONDS, VLESS_STANDBY_FRESH_SECONDS, STREAM_CHECK_INTERVAL,
 )
 from .tunnels import LocalTunnelError, TunnelConfigFile, TunnelIntent, TunnelManager, TunnelSnapshot
 from .xray_config import _build_proxy_outbound, build_ssh_config_text
@@ -35,20 +33,12 @@ class EmergencyController:
     def __init__(self, daemon: Daemon) -> None:
         self.daemon = daemon
         self.file = TunnelConfigFile()
-        self._lock = threading.RLock()
-        self._failures: dict[str, float] = {}
-        self._recovery: tuple[str, int, float] | None = None
-        self._stable_since: float | None = None
-        self._stable_key = None
-        self._stable_last = 0.0
-        self._release = False
         self._applied_port: int | None = None
         self._transition_retry_at = 0.0
         self._announced_tunnel: tuple | None = None
         self._config_announced = False
         self._local_failure_until = 0.0
-        self._completed_pass: tuple[frozenset[str], float] | None = None
-        self._episode_confirmed = False
+        self._last_recovery_log = 0.0
         self.manager = TunnelManager(self.intent, self.confirm_network, self.tunnel_changed,
                                      preflight=self.preflight)
 
@@ -101,7 +91,7 @@ class EmergencyController:
                 d.state.transport = "ssh"
                 d.state.active = None
                 self._applied_port = int(servers[0]["port"])
-                log.info("restored SSH routing from live config; fresh VLESS evidence required before reconnect")
+                log.info("restored SSH routing from live config; warm tunnel will be checked before use")
             else:
                 d.state.transport = "unknown"
                 d.state.active = None
@@ -122,83 +112,28 @@ class EmergencyController:
                 break
 
     def reset_evidence(self) -> None:
-        with self._lock:
-            self._failures.clear()
-            self._recovery = None
-            self._stable_since = None
-            self._stable_key = None
-            self._release = False
-            self._local_failure_until = 0.0
-            self._completed_pass = None
-            self._episode_confirmed = False
+        self._local_failure_until = 0.0
 
     def local_failure(self) -> None:
-        with self._lock:
-            self._local_failure_until = time.monotonic() + 60
-
-    def complete_pass(self, candidates: list[Server], started: float) -> None:
-        with self._lock:
-            keys = frozenset(candidate_key(s) for s in candidates)
-            if keys and all(self._failures.get(key, -1) >= started for key in keys):
-                self._completed_pass = (keys, time.monotonic())
-
-    def failed(self, server: Server) -> None:
-        with self._lock:
-            self._failures[candidate_key(server)] = time.monotonic()
-            self._recovery = None
-
-    def prepared(self, slot: PreparedStandby) -> None:
-        key = candidate_key(slot.server) + slot.fingerprint
-        now = time.monotonic()
-        with self._lock:
-            self._local_failure_until = 0.0
-            self._completed_pass = None
-            self._failures.pop(candidate_key(slot.server), None)
-            previous = self._recovery
-            if previous is None or previous[0] != key:
-                self._recovery = (key, 1, now)
-            elif now - previous[2] >= VLESS_RECOVERY_INTERVAL:
-                self._recovery = (key, previous[1] + 1, now)
-        self.daemon._wake_event.set()
-
-    def _failed_recently(self, server: Server) -> bool:
-        with self._lock:
-            ts = self._failures.get(candidate_key(server))
-        return ts is not None and time.monotonic() - ts <= STANDBY_FAILURE_TTL
-
-    def reserve_lost(self) -> bool:
-        d = self.daemon
-        active = d.state.active_snapshot()
-        candidates = [s for s in d.state.ranked_snapshot() if active is None or s.key() != active.key()]
-        # An empty subscription/configuration is not evidence of blocking.
-        with self._lock:
-            completed = self._completed_pass
-        pass_failed = completed is not None and time.monotonic() - completed[1] <= STANDBY_FAILURE_TTL and \
-            completed[0] == frozenset(candidate_key(s) for s in candidates)
-        return bool(candidates) and (pass_failed or all(self._failed_recently(s) for s in candidates))
+        self._local_failure_until = time.monotonic() + 60
 
     def needed(self) -> bool:
+        """Whether traffic needs SSH; independent of maintaining the tunnel."""
         d = self.daemon
-        if d._stop or not self.enabled or time.monotonic() < self._local_failure_until or not d.network.online() or d._standby_ready_for_fast_path():
-            return False
-        if d.state.transport == "ssh":
-            last = d.state.last_vless
-            return self._episode_confirmed or (last is not None and self._failed_recently(last)) or self.reserve_lost()
-        if d.state.transport != "vless":
-            return False
-        if time.monotonic() - d._health_checked_at > HEALTH_INTERVAL * 3:
-            return False
-        if d._active_channel_ok is True:
-            return d.state.active is not None and self.reserve_lost()
-        return d.state.proxy_failures_snapshot() >= d._fail_threshold_for_current_state()
+        return (not d._stop and d.network.online() and d.state.transport in ("vless", "ssh") and
+                time.monotonic() >= self._local_failure_until and
+                d._active_channel_ok is False and d._failure_confirmed() and
+                not d._standby_ready_for_fast_path())
 
     def intent(self) -> TunnelIntent:
         d = self.daemon
-        needed = self.needed()
-        current = self.manager.snapshot()
-        existing = current.endpoint is not None and current.status != "IDLE"
-        keep = d.state.transport == "ssh" or needed or (existing and self.enabled and not self._release)
-        return TunnelIntent(d.network.online() and not d._stop, needed and not d.dry_run, keep)
+        online = d.network.online() and not d._stop
+        # An invalid/removed configuration forbids reconnects, while a current
+        # traffic-carrying SSH may drain until a verified VLESS is available.
+        connect = self.enabled and not d.dry_run and not d._stop
+        keep = not d.dry_run and (self.enabled or d.state.transport == "ssh")
+        urgent = d._active_channel_ok is False and d._failure_confirmed()
+        return TunnelIntent(online, connect and online, keep, urgent)
 
     def confirm_network(self) -> bool:
         if self.daemon._stop:
@@ -214,8 +149,6 @@ class EmergencyController:
         if snapshot.status in ("CONNECTING", "CHECKING"):
             return
         ident = snapshot.endpoint.id if snapshot.endpoint else "-"
-        if snapshot.status == "READY" and d.state.transport == "ssh" and self.needed():
-            self._episode_confirmed = True
         key = (snapshot.status, ident, snapshot.detail)
         if key == self._announced_tunnel:
             return
@@ -234,68 +167,84 @@ class EmergencyController:
                    f"{'; ' + snapshot.detail if snapshot.detail else ''}",
                    urgent=snapshot.status in ("FAILED", "LOCAL_ERROR"))
 
-    def needs_fresh_standby(self, slot: PreparedStandby) -> bool:
-        if self.daemon.state.transport == "ssh":
-            return time.time() - slot.last_ok_at >= VLESS_RECOVERY_INTERVAL
-        return self.manager.snapshot().endpoint is not None and \
-            time.time() - slot.last_ok_at >= VLESS_STANDBY_FRESH_SECONDS
+    def recovery_seconds(self) -> float:
+        from .env_config import get
+        try:
+            seconds = float(get("XPROXY_VLESS_RECOVERY_SECONDS", str(VLESS_STABLE_SECONDS)))
+            if 0 < seconds <= 86400:
+                return seconds
+        except (TypeError, ValueError):
+            pass
+        return VLESS_STABLE_SECONDS
+
+    def recovery_allowed(self, slot: PreparedStandby) -> bool:
+        d = self.daemon
+        # Escape a confirmed broken SSH with one good VLESS, including when all
+        # SSH hosts are blocked. A single suspect sample does not bypass hold.
+        if d._active_channel_ok is False and d._failure_confirmed():
+            return True
+        if d._active_channel_ok is not True:
+            return False
+        now = time.monotonic()
+        if now - d._health_checked_at > HEALTH_INTERVAL * 3:
+            return False
+        with d._standby_cond:
+            records = [record for record in d._reserves.values()
+                       if record.fresh() and record.since is not None and
+                       now - record.since >= self.recovery_seconds() and
+                       record.transfer_at and now - record.transfer_at <= STREAM_CHECK_INTERVAL * 2]
+            primary = next((r for r in records if candidate_key(r.slot.server) == candidate_key(slot.server)
+                            and r.slot.fingerprint == slot.fingerprint), None)
+            if primary is None:
+                return False
+            # Check both fingerprints just before changing traffic: routing,
+            # geo-assets and credential changes invalidate old evidence too.
+            from .standby import standby_fingerprint
+            try:
+                return any(r.slot.server.key() != primary.slot.server.key() and
+                           standby_fingerprint(r.slot.server, info=d.platform) == r.slot.fingerprint and
+                           standby_fingerprint(primary.slot.server, info=d.platform) == primary.slot.fingerprint
+                           for r in records)
+            except Exception:
+                return False
 
     def tick(self) -> None:
         d = self.daemon
         if d.dry_run or not d.network.online():
-            self._stable_since = None
             return
         now = time.monotonic()
         snapshot = self.manager.snapshot()
         with d._standby_cond:
             slot = d._standby
         if d.state.transport == "ssh":
-            self._release = False
-            self._stable_since = None
+            if now - self._last_recovery_log >= 60:
+                with d._standby_cond:
+                    stable = {}
+                    for record in d._reserves.values():
+                        if record.fresh():
+                            age = now - record.since if record.since is not None else 0
+                            endpoint = record.slot.server.key()
+                            stable[endpoint] = max(stable.get(endpoint, 0), age)
+                    ages = sorted(stable.values(), reverse=True)
+                log.info("VLESS recovery: fresh_endpoints=%d pair_stable=%.0fs required=%.0fs",
+                         len(ages), ages[1] if len(ages) >= 2 else 0, self.recovery_seconds())
+                self._last_recovery_log = now
             if now < self._transition_retry_at:
                 return
-            if slot is not None and slot.is_usable():
-                with self._lock:
-                    samples = self._recovery[1] if self._recovery and \
-                        self._recovery[0] == candidate_key(slot.server) + slot.fingerprint else 0
-                if samples >= VLESS_RECOVERY_SAMPLES or d._active_channel_ok is False:
-                    if d._promote_standby("ssh-recovery"):
-                        self._applied_port = None
-                        self.event("transport", "🟠 VLESS restored; SSH retained until active traffic "
-                                   "is stable and a fresh VLESS standby is available")
-                    else:
-                        self._transition_retry_at = now + 60
-                    return
-            # Same local forward can recover without rewriting/restarting xray.
+            if (slot is not None and slot.is_usable() and
+                    0 <= time.time() - slot.last_ok_at <= VLESS_STANDBY_FRESH_SECONDS and
+                    self.recovery_allowed(slot)):
+                if d._promote_standby("ssh-recovery"):
+                    self._applied_port = None
+                    self.event("transport", "🟢 VLESS restored; SSH remains ready as a reserve")
+                else:
+                    self._transition_retry_at = now + 1
+                return
             if snapshot.ready and self._applied_port != snapshot.local_port:
                 self._activate(snapshot)
             return
-        healthy = d.state.transport == "vless" and d._active_channel_ok is True and \
-            now - d._health_checked_at <= HEALTH_INTERVAL * 3
-        if not healthy:
-            self._stable_since = None
-        else:
-            key = candidate_key(d.state.active) if d.state.active else None
-            if key != self._stable_key or now - self._stable_last > HEALTH_INTERVAL * 3:
-                self._stable_since = now
-            self._stable_key, self._stable_last = key, now
-            if self._stable_since is None:
-                self._stable_since = now
-        if self.needed():
-            self._release = False
-            if snapshot.ready and d._active_channel_ok is False and now >= self._transition_retry_at:
-                self._activate(snapshot)
-            return
-        # Track active stability even while a new standby is still being found.
-        # No extra hold is needed once a fresh independent standby arrives.
-        if snapshot.endpoint is None or not healthy or slot is None or not slot.is_usable() or \
-                (d.state.active is not None and slot.server.key() == d.state.active.key()):
-            return
-        if self._stable_since is not None and now - self._stable_since >= VLESS_STABLE_SECONDS and \
-                time.time() - slot.last_ok_at <= VLESS_STANDBY_FRESH_SECONDS and not self._release:
-            self._release = True
-            self.event("transport", "🟢 Emergency episode complete: VLESS active and standby "
-                       "healthy; SSH checks and connections stopped")
+        if self.needed() and snapshot.ready and now >= self._transition_retry_at:
+            self._activate(snapshot)
 
     def _activate(self, snapshot: TunnelSnapshot) -> None:
         d = self.daemon
@@ -328,9 +277,6 @@ class EmergencyController:
             d._clear_waiting_for_standby("SSH activated")
             d._invalidate_standby("transport changed to SSH")
             self.reset_evidence()
-            self._episode_confirmed = True
-            if previous is not None:
-                self.failed(previous)
             d._wake_standby_worker()
             if previous_transport != "ssh":
                 self.event("transport", f"🟠 Emergency mode active: traffic through SSH "

@@ -9,10 +9,14 @@ HTTP-пробы делаются через `requests.Session(trust_env=False)`,
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import random
 import shutil
 import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Iterable, Optional
 
 import requests
@@ -30,11 +34,41 @@ from .settings import (
     TARGET_CHECK_TIMEOUT,
     TARGET_CHECK_URLS,
     USER_AGENT,
+    UPSTREAM_PROBE_PORT,
+    STREAM_CHECK_URL, STREAM_CHECK_TIMEOUT, STREAM_CHECK_BYTES,
 )
 
 log = get_logger("xproxy.healthcheck")
 
 _HEADERS = {"User-Agent": USER_AGENT}
+
+
+def _bounded_http(url: str, proxies: dict | None, kind: str, timeout: float,
+                  *, size: int = 65536) -> Optional[str]:
+    """A wall-clock bound including DNS, SOCKS, TLS and the entire response.
+
+    Requests' read timeout alone permits indefinitely trickling responses.
+    A child also makes cancellation finite without leaking timed-out threads.
+    """
+    spec = dict(url=url, proxies=proxies, kind=kind, timeout=timeout, bytes=size)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-B", str(Path(__file__).with_name("http_probe.py"))],
+            input=json.dumps(spec), capture_output=True, text=True,
+            timeout=timeout,
+        )
+        body = json.loads(result.stdout) if result.returncode == 0 else {}
+        return str(body.get("value", "ok")) if body.get("ok") else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def transfer_alive(*, socks_host: str = SOCKS_HOST, socks_port: int = SOCKS_PORT) -> bool:
+    from .env_config import get
+    url = get("XPROXY_STREAM_CHECK_URL", STREAM_CHECK_URL)
+    return bool(url) and _bounded_http(url, _socks_proxies(socks_host, socks_port),
+                                      "transfer", STREAM_CHECK_TIMEOUT,
+                                      size=STREAM_CHECK_BYTES) is not None
 
 
 def _make_session(proxies: Optional[dict]) -> requests.Session:
@@ -47,6 +81,8 @@ def _make_session(proxies: Optional[dict]) -> requests.Session:
 
 
 def _probe(session: requests.Session, url: str, via: str) -> Optional[str]:
+    if via == "proxy":
+        return _bounded_http(url, session.proxies, "ip", HEALTH_TIMEOUT, size=128)
     try:
         resp = session.get(url, timeout=HEALTH_TIMEOUT, allow_redirects=False)
     except requests.RequestException as exc:
@@ -64,18 +100,23 @@ def _probe(session: requests.Session, url: str, via: str) -> Optional[str]:
 
 def _any_probe(urls: Iterable[str], proxies: Optional[dict],
                attempts: int = 2, should_continue=None) -> Optional[str]:
-    """Приоритизированный обход — быстрые URL пробуются первыми.
-
-    Порядок в IP_CHECK_URLS важен: стабильные/быстрые источники в начале,
-    медленные в резерве. Мы не шафлим — идём по порядку, первые успехи
-    закрывают потребность. attempts ограничивает число попыток (не URL),
-    чтобы не тратить время на все 4 чекера при первой же удаче.
-    """
+    """Первые attempts URL: через прокси параллельно, напрямую по порядку."""
     pool = list(urls)
     via = "proxy" if proxies else "direct"
     session = _make_session(proxies)
     tried = 0
     try:
+        if proxies:
+            if should_continue is not None and not should_continue():
+                return None
+            # Independent destinations share one deadline rather than adding
+            # two read timeouts. Each child is reaped before this returns.
+            with ThreadPoolExecutor(max_workers=2) as pool_executor:
+                results = list(pool_executor.map(lambda url: _probe(session, url, via),
+                                                  pool[:attempts]))
+            if should_continue is not None and not should_continue():
+                return None
+            return next((value for value in results if value), None)
         for url in pool:
             if should_continue is not None and not should_continue():
                 return None
@@ -93,6 +134,20 @@ def _any_probe(urls: Iterable[str], proxies: Optional[dict],
 def _socks_proxies(host: str = SOCKS_HOST, port: int = SOCKS_PORT) -> dict:
     socks = f"socks5h://{host}:{port}"
     return {"http": socks, "https": socks}
+
+
+def _active_probe_port() -> int:
+    # Compatibility with a config from before this upgrade. The next verified
+    # rebuild adds the dedicated forced-upstream listener.
+    from .platform_utils import detect_platform
+    try:
+        cfg = json.loads(detect_platform().xray_config.read_text())
+        if any(i.get("tag") == "xproxy-upstream-probe" and i.get("port") == UPSTREAM_PROBE_PORT
+               for i in cfg.get("inbounds", [])):
+            return UPSTREAM_PROBE_PORT
+    except (OSError, ValueError, TypeError):
+        pass
+    return SOCKS_PORT
 
 
 def internet_alive() -> bool:
@@ -150,13 +205,13 @@ def _internet_http_probe(session: requests.Session, url: str) -> bool:
 def proxy_alive(
     *,
     socks_host: str = SOCKS_HOST,
-    socks_port: int = SOCKS_PORT,
+    socks_port: int | None = None,
     should_continue=None,
 ) -> bool:
     """Живой ли xray-прокси."""
     return _any_probe(
         IP_CHECK_URLS,
-        proxies=_socks_proxies(socks_host, socks_port),
+        proxies=_socks_proxies(socks_host, socks_port if socks_port is not None else _active_probe_port()),
         should_continue=should_continue,
     ) is not None
 
@@ -203,22 +258,13 @@ def _target_probe(session: requests.Session, url: str) -> Optional[str]:
     Таймаут и сетевые ошибки — провал.
     Возвращает краткое описание результата или None при провале.
     """
-    try:
-        resp = session.get(url, timeout=TARGET_CHECK_TIMEOUT, allow_redirects=False, stream=True)
-    except requests.RequestException as exc:
-        log.debug("target probe %s fail: %s", url, exc)
-        return None
-    # Любой HTTP-ответ (даже 401) = целевой ресурс доступен
-    log.debug("target probe %s → %s", url, resp.status_code)
-    status = str(resp.status_code)
-    resp.close()
-    return status
+    return _bounded_http(url, session.proxies, "target", TARGET_CHECK_TIMEOUT)
 
 
 def target_alive(
     *,
     socks_host: str = SOCKS_HOST,
-    socks_port: int = SOCKS_PORT,
+    socks_port: int | None = None,
     should_continue=None,
 ) -> tuple[bool, str]:
     """Проверка доступности целевых ресурсов через прокси.
@@ -232,7 +278,7 @@ def target_alive(
     if not TARGET_CHECK_URLS:
         return True, ""
 
-    proxies = _socks_proxies(socks_host, socks_port)
+    proxies = _socks_proxies(socks_host, socks_port if socks_port is not None else _active_probe_port())
     session = _make_session(proxies)
     try:
         for url in TARGET_CHECK_URLS:

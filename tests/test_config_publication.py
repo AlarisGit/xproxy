@@ -22,6 +22,7 @@ class ConfigPublicationTests(ReviewFixture):
         self.d._standby = prepared
         self.patch(daemon, "standby_fingerprint", return_value="fp")
         self.patch(daemon, "apply_config_text")
+        self.patch(emergency.EmergencyController, "recovery_allowed", return_value=True)
         self.patch(daemon, "proxy_alive", return_value=True)
         self.patch(daemon, "target_alive", return_value=(True, ""))
         self.patch(daemon, "commit_config")
@@ -96,6 +97,7 @@ class ConfigPublicationTests(ReviewFixture):
         self.patch(daemon, "public_ips", return_value=("direct", "proxy"))
         self.patch(daemon, "tcp_probe", return_value=True)
         self.patch(daemon, "apply_server", side_effect=lambda s, **kw: self.config.write_text(vless_config(s)))
+        self.patch(emergency.EmergencyController, "recovery_allowed", return_value=True)
         self.patch(daemon, "proxy_alive", return_value=True)
         self.patch(daemon, "target_alive", return_value=(True, ""))
         commit = self.patch(daemon, "commit_config")
@@ -112,6 +114,7 @@ class ConfigPublicationTests(ReviewFixture):
     def test_health_standby_refresh_and_same_upstream_rebuild_do_not_publish(self):
         d = self.d
         self.patch(daemon, "is_running", return_value=True)
+        self.patch(emergency.EmergencyController, "recovery_allowed", return_value=True)
         self.patch(daemon, "proxy_alive", return_value=True)
         self.patch(daemon, "target_alive", return_value=(True, ""))
         self.patch(d, "_geo_ready_for_rebuild", return_value=True)

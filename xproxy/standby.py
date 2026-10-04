@@ -14,10 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .healthcheck import proxy_alive, target_alive
+from .healthcheck import proxy_alive, target_alive, transfer_alive
 from .logger import get_logger
 from .platform_utils import PlatformInfo, detect_platform, detect_xray_asset_env
-from .servers import Server, tcp_probe
+from .servers import Server
 from .settings import (
     BOOT_GRACE,
     CONFIG_TMPL,
@@ -26,7 +26,6 @@ from .settings import (
     ROUTING_JSON,
     STANDBY_PRE_STALE_TTL,
     STANDBY_READY_TTL,
-    TCP_PROBE_TIMEOUT,
 )
 from .xray_config import build_xray_config_text
 from .xray_control import validate_config_for_service, wait_for_proxy_port
@@ -67,6 +66,7 @@ class PreparedStandby:
     pre_stale_at: float
     expires_at: float
     status: str = "READY"
+    transfer_ok: bool | None = None
 
     def lifecycle_state(
         self,
@@ -122,15 +122,13 @@ def prepare_standby(
     ready_ttl: float = STANDBY_READY_TTL,
     pre_stale_ttl: float = STANDBY_PRE_STALE_TTL,
     should_continue: Callable[[], bool] | None = None,
+    check_transfer: bool = False,
 ) -> PreparedStandby:
     """Build and validate a standby production config for `server`."""
     _validate_ttl("ready_ttl", ready_ttl)
     _validate_ttl("pre_stale_ttl", pre_stale_ttl)
     info = info or detect_platform()
     _continue(should_continue)
-    if not tcp_probe(server.address, server.port, timeout=TCP_PROBE_TIMEOUT):
-        raise StandbyError(f"tcp probe failed for {_fmt_server(server)}")
-
     fingerprint_before = standby_fingerprint(server, info=info)
     _continue(should_continue)
     config_text = build_xray_config_text(server)
@@ -140,7 +138,8 @@ def prepare_standby(
         raise StandbyLocalError(f"xray -test failed for {_fmt_server(server)}: {last}")
 
     _continue(should_continue)
-    validate_standby_end_to_end(config_text, should_continue=should_continue)
+    transfer_ok = validate_standby_end_to_end(config_text, should_continue=should_continue,
+                                             check_transfer=check_transfer)
     _continue(should_continue)
     fingerprint_after = standby_fingerprint(server, info=info)
     if fingerprint_after != fingerprint_before:
@@ -157,6 +156,7 @@ def prepare_standby(
         last_ok_at=now,
         pre_stale_at=now + ready_ttl,
         expires_at=now + ready_ttl + pre_stale_ttl,
+        transfer_ok=transfer_ok,
     )
 
 
@@ -201,7 +201,8 @@ def validate_standby_end_to_end(
     *,
     boot_timeout: float = BOOT_GRACE,
     should_continue: Callable[[], bool] | None = None,
-) -> None:
+    check_transfer: bool = False,
+) -> bool | None:
     """Run a temporary xray instance and check traffic through its SOCKS port."""
     xray_bin = shutil.which("xray")
     if xray_bin is None:
@@ -265,10 +266,12 @@ def validate_standby_end_to_end(
         _continue(should_continue)
         target_ok, target_detail = target_alive(
             socks_host="127.0.0.1",
-            socks_port=socks_port,
+            socks_port=http_port,
         )
         if not target_ok:
             raise StandbyError(f"standby target check failed: {target_detail}")
+        _continue(should_continue)
+        return transfer_alive(socks_port=http_port) if check_transfer else None
     finally:
         if proc is not None:
             _terminate_process(proc)
@@ -308,6 +311,8 @@ def _standby_inbounds(
     seen_socks = False
     seen_http = False
     for inbound in inbounds:
+        if inbound.get("tag") == "xproxy-upstream-probe":
+            continue
         item = dict(inbound)
         proto = str(item.get("protocol") or "").lower()
         tag = str(item.get("tag") or "").lower()

@@ -50,11 +50,13 @@ else:
 # ---------- Локальный xray ----------
 SOCKS_HOST = "127.0.0.1"
 SOCKS_PORT = 10808
+UPSTREAM_PROBE_PORT = 10810
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 10809
 
 # ---------- Тайминги (секунды) ----------
-HEALTH_INTERVAL = 15          # как часто проверяем прокси
+HEALTH_INTERVAL = 5           # пауза между проверками активного канала
+HEALTH_RETRY_INTERVAL = 1     # быстрый повтор подозрительного результата
 SUBSCR_REFRESH = 30 * 60      # обновление подписки
 GEO_REFRESH = 6 * 3600        # максимальный интервал между успешными скачиваниями geosite/geoip
 # Экспоненциальный бэкофф повторов при ошибках скачивания geo (секунды).
@@ -63,7 +65,7 @@ GEO_REFRESH = 6 * 3600        # максимальный интервал меж
 GEO_RETRY_SCHEDULE = (10, 60, 5 * 60, 30 * 60, 60 * 60, 6 * 3600)
 GIT_PULL_INTERVAL = 3600      # 0 = выключить autoupdate
 BOOT_GRACE = 10               # ожидание после рестарта xray
-HEALTH_TIMEOUT = 8            # таймаут HTTP-пробы
+HEALTH_TIMEOUT = 3            # общий deadline HTTP-пробы, включая DNS и тело
 TCP_PROBE_TIMEOUT = 3         # таймаут TCP-pre-probe сервера
 
 # ---------- Autoupdate ----------
@@ -74,31 +76,36 @@ AUTOUPDATE_RESTARTS_LIMIT = 3      # если рестартов в окне >= 
 STALE_SUBSCRIPTION_SEC = 24 * 3600  # подписка считается устаревшей через 24ч без live-фетча
 
 # ---------- Анти-флаппинг ----------
-FAIL_THRESHOLD = 5            # сколько подряд-фейлов прокси нужно до ротации
+FAIL_THRESHOLD = 2            # не зависит от наличия VLESS/SSH резерва
 ROTATION_COOLDOWN = 60        # не ротируем чаще, чем раз в минуту
 SERVER_PENALTY_DURATION = 5 * 60   # на сколько уводим упавший сервер в конец списка
 
 # ---------- Standby ----------
-STANDBY_FAIL_THRESHOLD = 1         # подряд-фейлов до promotion, если standby готов
-STANDBY_READY_TTL = 5 * 60         # READY → PRE_STALE после e2e-проверки
-STANDBY_PRE_STALE_TTL = 10 * 60    # PRE_STALE → STALE; PRE_STALE ещё можно promoted
-STANDBY_RETRY_INTERVAL = 60        # как часто пытаться подготовить standby при неудаче
+STANDBY_FAIL_THRESHOLD = FAIL_THRESHOLD
+STANDBY_READY_TTL = 10            # срок свежести аварийного VLESS резерва
+STANDBY_PRE_STALE_TTL = 5         # устаревший слот не участвует в fast path
+STANDBY_RETRY_INTERVAL = 5
+STANDBY_WORKERS = 2
+VLESS_RETRY_SCHEDULE = (1, 5, 15, 30, 60)
 
-# Emergency SSH is opt-in through conf/tunnels.json. These timers never cause
-# contact with an SSH host unless VLESS failure has been confirmed.
+# SSH is opt-in through conf/tunnels.json and stays warm while online.
 NETWORK_STATUS_TTL = 90
-STANDBY_FAILURE_TTL = 5 * 60
 SSH_LOCAL_PORT = 20808
 SSH_CONNECT_TIMEOUT = 10
 SSH_START_TIMEOUT = 30
-SSH_HEALTH_INTERVAL = 30
+SSH_HEALTH_INTERVAL = 10
 SSH_HEALTH_FAILURES = 2
-SSH_READY_TTL = 90
-SSH_RETRY_SCHEDULE = (30, 60, 120, 300)
-VLESS_RECOVERY_SAMPLES = 2
+SSH_READY_TTL = 20
+SSH_RETRY_SCHEDULE = (1, 3, 5, 10, 15)  # когда текущий канал отказал
+SSH_WARM_RETRY_SCHEDULE = (5, 15, 30, 60)
 VLESS_RECOVERY_INTERVAL = 15
-VLESS_STABLE_SECONDS = 120
+VLESS_STABLE_SECONDS = 600         # одновременно устойчивая пара перед уходом с SSH
 VLESS_STANDBY_FRESH_SECONDS = 30
+STREAM_CHECK_INTERVAL = 60
+STREAM_CHECK_TIMEOUT = 10
+# Optional XPROXY_STREAM_CHECK_URL overrides the bounded body-transfer probe.
+STREAM_CHECK_URL = "https://speed.cloudflare.com/__down?bytes=262144"
+STREAM_CHECK_BYTES = 262144
 
 # ---------- Config sync ----------
 CONFIG_SYNC_TIMEOUT = 30           # общий timeout SCP-публикации config.json
@@ -168,7 +175,7 @@ TARGET_CHECK_URLS = (
     "https://api.telegram.org/bot0000000000:AAHw000000000000000000000000/getMe",
 )
 
-TARGET_CHECK_TIMEOUT = 10  # таймаут пробы целевого ресурса (секунды)
+TARGET_CHECK_TIMEOUT = HEALTH_TIMEOUT
 
 # ---------- HTTP ----------
 USER_AGENT = "xproxy/0.1 (+https://github.com/AlarisGit/xproxy)"

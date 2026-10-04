@@ -6,9 +6,12 @@ import json
 import signal
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
+from .reserves import Reserve
 from .connectivity import Connectivity
 from .emergency import EmergencyController, candidate_key
 from .instance_lock import InstanceLock
@@ -37,7 +40,8 @@ from .settings import (
     FAIL_THRESHOLD,
     GEO_REFRESH,
     GIT_PULL_INTERVAL,
-    HEALTH_INTERVAL,
+    HEALTH_INTERVAL, HEALTH_RETRY_INTERVAL, STANDBY_WORKERS,
+    STANDBY_READY_TTL, VLESS_STANDBY_FRESH_SECONDS, STREAM_CHECK_INTERVAL,
     HEARTBEAT_HOUR,
     HEARTBEAT_JITTER_MIN,
     ROTATION_COOLDOWN,
@@ -45,7 +49,6 @@ from .settings import (
     STALE_SUBSCRIPTION_SEC,
     SCHEDULE_JITTER_RATIO,
     STARTUP_JITTER,
-    STANDBY_FAIL_THRESHOLD,
     STANDBY_RETRY_INTERVAL,
     VLESS_RECOVERY_INTERVAL,
     SUBSCR_REFRESH,
@@ -110,9 +113,10 @@ class Daemon:
         self._health_checked_at = 0.0
         self._next_health_at = 0.0
         self._rebuild_pending = True
-        self._scan_attempted: set[str] = set()
-        self._scan_retry_at = 0.0
-        self._scan_started_at = 0.0
+        self._reserves: dict[str, Reserve] = {}
+        self._inflight: dict[str, Server] = {}
+        self._health_samples = deque(maxlen=5)
+        self._health_sample_key = None
         self._country_ranks = load_country_ranks()
         # --- Jitter / анти-стампед ---
         # Каждый инстанс получает СВОИ периоды для периодических задач.
@@ -160,8 +164,6 @@ class Daemon:
         self._active_waiting_for_standby: bool = False
         self._active_waiting_reason: str = ""
         self._active_waiting_generation: int = 0
-        self._standby_waiting_generation: int = 0
-        self._standby_waiting_attempted: set[tuple[str, int]] = set()
         self._notified_standby_slot_key: Optional[tuple[str, int]] = None
         self._active_channel_ok: Optional[bool] = None
         self._journal: StatusJournal | None = None
@@ -235,9 +237,6 @@ class Daemon:
             self._network_generation = snapshot.generation
             with self._standby_cond:
                 self._invalidate_standby_locked("network changed or resumed")
-                self._scan_attempted.clear()
-                self._scan_retry_at = 0
-                self._standby_waiting_attempted.clear()
             self.emergency.reset_evidence()
             self.state.note_proxy_ok()
             self._health_checked_at = 0
@@ -361,7 +360,8 @@ class Daemon:
                         self.tick()
                     except Exception:
                         log.exception("tick failed")
-                    self._wake_event.wait(HEALTH_INTERVAL)
+                    self._wake_event.wait(max(0.05, min(HEALTH_INTERVAL,
+                        self._next_health_at - time.monotonic())))
                     self._wake_event.clear()
             finally:
                 self._stop = True
@@ -420,6 +420,8 @@ class Daemon:
         self.emergency.reload()
         now = time.monotonic()
         if now < self._next_health_at:
+            if self.state.transport == "vless" and self._active_channel_ok is False and self._failure_confirmed():
+                self._handle_rotation_needed("proxy-failing")
             self.emergency.tick()
             return
         signature = network_signature() if self._runtime_started else None
@@ -443,7 +445,8 @@ class Daemon:
             self.state.note_proxy_ok()
         self._record_status(online)
         self.tick_heartbeat()
-        self._next_health_at = time.monotonic() + HEALTH_INTERVAL
+        delay = HEALTH_RETRY_INTERVAL if self._active_channel_ok is False else HEALTH_INTERVAL
+        self._next_health_at = time.monotonic() + delay
 
     def _recover_interrupted_config(self) -> bool:
         from .xray_control import TRANSACTION_PATH
@@ -458,8 +461,6 @@ class Daemon:
                 with self._standby_cond:
                     self._invalidate_standby_locked("interrupted configuration recovered")
                     self._clear_waiting_for_standby_locked("configuration recovered")
-                    self._scan_attempted.clear()
-                    self._scan_started_at = self._scan_retry_at = 0
                 self.emergency.reset_evidence()
                 self.state.note_proxy_ok()
                 self._active_channel_ok = None
@@ -879,7 +880,7 @@ class Daemon:
             thread = self._standby_thread
         stop_probes()
         if thread and thread.is_alive():
-            thread.join(timeout=3.0)
+            thread.join(timeout=45.0)
 
     def _wake_standby_worker(self) -> None:
         with self._standby_cond:
@@ -923,6 +924,10 @@ class Daemon:
                  state, target, reason, detail, urgent)
 
     def _record_active_health(self, ok: bool) -> None:
+        key = (self.state.transport, candidate_key(self.state.active) if self.state.active else None)
+        if key != self._health_sample_key:
+            self._health_samples.clear()
+            self._health_sample_key = key
         self._active_channel_ok = ok
         self._health_checked_at = time.monotonic()
         if ok:
@@ -938,7 +943,9 @@ class Daemon:
         active = self.state.active_snapshot()
         with self._standby_cond:
             standby = self._standby
-            standby_ok = standby is not None and standby.is_usable()
+            ttl = VLESS_STANDBY_FRESH_SECONDS if self.state.transport == "ssh" else STANDBY_READY_TTL
+            standby_ok = (standby is not None and standby.is_usable() and
+                          0 <= time.time() - standby.last_ok_at <= ttl)
         tunnel = self.emergency.manager.snapshot()
         if not direct:
             status = Status("DOWN", "DOWN", "N/A", "N/A", "N/A")
@@ -999,9 +1006,8 @@ class Daemon:
 
     def _invalidate_standby_locked(self, reason: str) -> None:
         self._standby_generation += 1
-        self._scan_attempted.clear()
-        self._scan_retry_at = 0
-        self._scan_started_at = 0
+        self._reserves.clear()
+        self._health_samples.clear()
         self.emergency.reset_evidence()
         previous = self._standby
         if previous is not None:
@@ -1019,8 +1025,8 @@ class Daemon:
         ranked: list[Server],
     ) -> None:
         self._standby_generation += 1
-        self._scan_attempted.clear()
-        self._scan_retry_at = 0
+        allowed = {candidate_key(server) for server in ranked}
+        self._reserves = {key: value for key, value in self._reserves.items() if key in allowed}
         self.emergency.reset_evidence()
         if self._standby is None:
             self._standby_refresh_candidate = None
@@ -1191,11 +1197,6 @@ class Daemon:
             previous_key = _server_key(previous.server)
 
         self._standby = prepared
-        # A successful reserve closes this search episode. Failures from
-        # before it cannot complete a new all-reserves-failed pass later.
-        self._scan_attempted.clear()
-        self._scan_started_at = 0
-        self._scan_retry_at = 0
         self._standby_refresh_candidate = None
         detail = f"{prepared.ttl_detail()} slot={prepared.fingerprint[:8]}"
         same_usable_endpoint = (
@@ -1223,117 +1224,131 @@ class Daemon:
         return True
 
     def _standby_worker_loop(self) -> None:
-        while not self._standby_stop and not self._stop:
-            with self._standby_cond:
-                if not self.network.online():
-                    self._standby_cond.wait(timeout=HEALTH_INTERVAL)
-                    continue
-                candidate = self._select_standby_candidate_locked()
-                if candidate is None:
-                    self._standby_cond.wait(timeout=VLESS_RECOVERY_INTERVAL)
-                    continue
-                self._standby_preparing = True
-                refreshing = self._standby_prepare_is_refresh
-                self._standby_last_attempt = time.time()
-                generation = self._standby_generation
-            def current():
-                return not self._standby_stop and not self._stop and self.network.online() and \
-                    generation == self._standby_generation
-            try:
-                prepared = prepare_standby(candidate, info=self.platform, should_continue=current)
-            except Exception as exc:
-                remote_failure = isinstance(exc, StandbyError) and not isinstance(exc, StandbyLocalError)
-                # Never count an interrupted network probe as route blocking.
-                if remote_failure and current():
-                    remote_failure = self.emergency.confirm_network() and current()
+        # Two isolated xray probes, independently scheduled. A blocked candidate
+        # cannot delay publication of a successful result from the other worker.
+        jobs = {}
+        with ThreadPoolExecutor(max_workers=STANDBY_WORKERS,
+                                thread_name_prefix="vless-probe") as pool:
+            while not self._standby_stop and not self._stop:
                 with self._standby_cond:
-                    self._standby_preparing = False
-                    if current():
-                        if remote_failure:
-                            self._handle_prepare_failure_locked(candidate, str(exc), refreshing)
-                            self.emergency.failed(candidate)
-                            self._penalize_if_not_active(candidate, "standby end-to-end failure")
+                    for future in list(jobs):
+                        if not future.done():
+                            continue
+                        candidate, generation = jobs.pop(future)
+                        key = candidate_key(candidate)
+                        self._inflight.pop(key, None)
+                        if generation != self._standby_generation or not self.network.online():
+                            continue
+                        try:
+                            prepared = future.result()
+                        except Exception as exc:
+                            record = self._reserves.setdefault(key, Reserve())
+                            record.failed()
+                            if self._active_channel_ok is False and self._failure_confirmed():
+                                record.retry_at = min(record.retry_at, time.monotonic() + 5)
+                            if not isinstance(exc, StandbyError) or isinstance(exc, StandbyLocalError):
+                                # Local errors affect preparation, not warm SSH.
+                                record.retry_at = time.monotonic() + STANDBY_RETRY_INTERVAL
+                            else:
+                                self._penalize_if_not_active(candidate, "standby end-to-end failure")
+                            if self._standby is not None and candidate_key(self._standby.server) == key:
+                                previous, self._standby = self._standby, None
+                                self._notify_standby_empty_locked("probe-failed", previous)
+                            log.info("standby preparation failed (%s): %s", _fmt(candidate), exc)
                         else:
-                            self.emergency.local_failure()
-                        log.info("standby preparation failed (%s): %s", _fmt(candidate), exc)
-                    self._standby_cond.notify_all()
-                self._wake_event.set()
-                continue
-            with self._standby_cond:
-                self._standby_preparing = False
-                if not current() or not self._eligible_preparation(prepared.server):
-                    self._standby_cond.notify_all()
-                    continue
-                if self._publish_standby_locked(prepared, generation=generation):
-                    self.emergency.prepared(prepared)
-                self._standby_cond.notify_all()
-            # The main guard is the sole decision maker for promotions.
-            self._wake_event.set()
+                            if not self._eligible_preparation(prepared.server):
+                                continue
+                            record = self._reserves.setdefault(key, Reserve())
+                            record.success(prepared)
+                            interval = (VLESS_RECOVERY_INTERVAL if self.state.transport == "ssh"
+                                        else HEALTH_INTERVAL)
+                            record.retry_at = time.monotonic() + interval
+                            self.emergency.reset_evidence()
+                        self._choose_reserve_locked()
+                        self._wake_event.set()
+                    self._standby_preparing = bool(jobs)
+                    if not self._standby_stop and not self._stop and self.network.online():
+                        while len(jobs) < STANDBY_WORKERS:
+                            candidate = self._select_standby_candidate_locked()
+                            if candidate is None:
+                                break
+                            key = candidate_key(candidate)
+                            generation = self._standby_generation
+                            self._inflight[key] = candidate
+                            record = self._reserves.get(key)
+                            transfer = (self.state.transport == "ssh" and self._active_channel_ok is True and
+                                        (record is None or not record.transfer_at or
+                                         time.monotonic() - record.transfer_at >= STREAM_CHECK_INTERVAL))
+                            def current(generation=generation):
+                                return (not self._standby_stop and not self._stop and
+                                        self.network.online() and generation == self._standby_generation)
+                            future = pool.submit(prepare_standby, candidate, info=self.platform,
+                                                 should_continue=current, check_transfer=transfer,
+                                                 ready_ttl=(VLESS_STANDBY_FRESH_SECONDS if
+                                                     self.state.transport == "ssh" else STANDBY_READY_TTL))
+                            jobs[future] = (candidate, generation)
+                    self._standby_cond.wait(timeout=0.1 if jobs else 0.5)
+        with self._standby_cond:
+            self._inflight.clear()
+            self._standby_preparing = False
+
+    def _choose_reserve_locked(self) -> None:
+        ttl = VLESS_STANDBY_FRESH_SECONDS if self.state.transport == "ssh" else STANDBY_READY_TTL
+        ready = [record.slot for record in self._reserves.values()
+                 if record.fresh(ttl) and record.slot.is_usable() and
+                 self._eligible_preparation(record.slot.server)]
+        if self._standby is not None:
+            current = candidate_key(self._standby.server)
+            ready.sort(key=lambda slot: candidate_key(slot.server) != current)
+        if ready and self._standby is not ready[0]:
+            self._publish_standby_locked(ready[0])
 
     def _select_standby_candidate_locked(self) -> Optional[Server]:
-        if self._standby_preparing:
-            return None
-        self._standby_prepare_is_refresh = False
-        if self._standby is not None:
-            state = self._standby.lifecycle_state()
-            if self._standby_refresh_candidate is not None:
-                if state in ("READY", "PRE_STALE"):
-                    if not self._active_waiting_for_standby and \
-                            time.time() - self._standby_last_attempt < \
-                            STANDBY_RETRY_INTERVAL:
-                        return None
-                    candidate = self._standby_refresh_candidate
-                    log.info("standby config refresh pending, preparing updated "
-                             "slot: %s (current=%s state=%s)",
-                             _fmt(candidate), _fmt(self._standby.server), state)
-                    self._standby_prepare_is_refresh = True
-                    return candidate
-                self._standby_refresh_candidate = None
-            if state == "READY":
-                if self.emergency.needs_fresh_standby(self._standby):
-                    return self._standby.server
-                return None
-            if state == "PRE_STALE":
-                if self._standby.status != "PRE_STALE":
-                    log.info("standby pre-stale, revalidating current slot: %s",
-                             _fmt(self._standby.server))
-                self._standby.status = "PRE_STALE"
-                return self._standby.server
-            else:
-                log.info("standby no longer usable: %s state=%s",
-                         _fmt(self._standby.server), state)
-                previous = self._standby
-                previous.status = "STALE"
-                self._standby = None
-                self._notify_standby_empty_locked(
-                    "standby-stale",
-                    previous,
-                    detail=f"state={state}",
-                )
-        active = self.state.active_snapshot()
-        if not self.state.ranked_snapshot():
-            return None
         now = time.monotonic()
-        if now < self._scan_retry_at:
-            return None
+        self._standby_prepare_is_refresh = False
+        refresh = self._standby_refresh_candidate
+        if refresh is not None and refresh.key() not in {s.key() for s in self._inflight.values()}:
+            record = self._reserves.get(candidate_key(refresh))
+            if record is None or now >= record.retry_at:
+                self._standby_prepare_is_refresh = True
+                return refresh
         candidates = [s for s in self.state.next_candidates() if self._eligible_preparation(s)]
-        if active is not None and active.country:
+        # Keep the working reserve(s), regardless of country priority changes.
+        retained = [key for key, record in self._reserves.items()
+                    if record.slot is not None and record.failures < 2 and
+                    any(candidate_key(s) == key for s in candidates)]
+        if self._standby is not None:
+            current = candidate_key(self._standby.server)
+            retained.sort(key=lambda key: key != current)
+        wanted = 2 if self.state.transport == "ssh" else 1
+        endpoints = set()
+        selected = []
+        for key in retained:
+            server = self._reserves[key].slot.server
+            if server.key() not in endpoints and len(selected) < wanted:
+                endpoints.add(server.key())
+                selected.append(key)
+        busy = {s.key() for s in self._inflight.values()}
+        for key in selected:
+            record = self._reserves[key]
+            if record.slot.server.key() not in busy and now >= record.retry_at:
+                return record.slot.server
+        if len(selected) >= wanted:
+            return None
+        active = self.state.active_snapshot()
+        if active is not None:
             candidates.sort(key=lambda s: s.country == active.country)
+        last = self.state.last_vless
+        candidates.sort(key=lambda s: (not (last is not None and s.key() == last.key()),
+                                        not (candidate_key(s) in self._reserves and
+                                             self._reserves[candidate_key(s)].slot is not None)))
         for candidate in candidates:
-            token = candidate_key(candidate)
-            if token in self._scan_attempted:
+            key = candidate_key(candidate)
+            if candidate.key() in busy or candidate.key() in endpoints:
                 continue
-            if not self._scan_attempted:
-                self._scan_started_at = now
-            self._scan_attempted.add(token)
-            return candidate
-        if self._scan_attempted:
-            self.emergency.complete_pass(candidates, self._scan_started_at)
-            log.info("standby pass exhausted; next pass in %ss", STANDBY_RETRY_INTERVAL)
-            self._scan_attempted.clear()
-            self._scan_started_at = 0
-            self._standby_waiting_attempted.clear()
-            self._scan_retry_at = now + STANDBY_RETRY_INTERVAL
+            record = self._reserves.get(key)
+            if record is None or now >= record.retry_at:
+                return candidate
         return None
 
     def _eligible_preparation(self, candidate: Server) -> bool:
@@ -1347,9 +1362,9 @@ class Daemon:
     def _enter_waiting_for_standby(self, reason: str) -> None:
         with self._standby_cond:
             if not self._active_waiting_for_standby:
+                for record in self._reserves.values():
+                    record.retry_at = min(record.retry_at, time.monotonic() + 1)
                 self._active_waiting_generation += 1
-                self._standby_waiting_generation = self._active_waiting_generation
-                self._standby_waiting_attempted.clear()
                 log.warning("active failed (%s), waiting for standby", reason)
                 self._notify_active_state(
                     "WAITING_FOR_STANDBY",
@@ -1371,8 +1386,6 @@ class Daemon:
         self._active_waiting_for_standby = False
         self._active_waiting_reason = ""
         self._active_waiting_generation += 1
-        self._standby_waiting_generation = self._active_waiting_generation
-        self._standby_waiting_attempted.clear()
         self._standby_cond.notify_all()
 
     def _promotion_running(self) -> bool:
@@ -1420,6 +1433,7 @@ class Daemon:
         if not applied or self.dry_run:
             return
 
+        known_failed = self._active_channel_ok is False and self._failure_confirmed()
         try:
             restored = restore_backup(self.platform)
         except Exception as exc:  # noqa: BLE001
@@ -1427,7 +1441,7 @@ class Daemon:
             restored = False
 
         if restored:
-            healthy = self.network.online() and proxy_alive() and target_alive()[0]
+            healthy = not known_failed and self.network.online() and proxy_alive() and target_alive()[0]
             self._record_active_health(bool(healthy))
             log.warning("rolled back failed standby promotion to %s "
                         "(failed=%s, standby=%s)",
@@ -1497,7 +1511,11 @@ class Daemon:
                              self._active_waiting_for_standby)
                     return False
 
-        if require_active_failure and not self._active_still_needs_standby(reason):
+        if self._standby is None:
+            return False
+        fresh_failure = (self._active_channel_ok is False and
+                         0 <= time.monotonic() - self._health_checked_at <= HEALTH_INTERVAL)
+        if require_active_failure and not fresh_failure and not self._active_still_needs_standby(reason):
             self._clear_waiting_for_standby("active-recovered-before-promotion")
             return False
 
@@ -1525,7 +1543,8 @@ class Daemon:
                 log.warning("standby fingerprint check failed: %s", exc)
                 current_fp = None
             promotion_state = prepared.lifecycle_state(current_fp) if current_fp is not None else "STALE"
-            if promotion_state not in ("READY", "PRE_STALE"):
+            ttl = VLESS_STANDBY_FRESH_SECONDS if self.state.transport == "ssh" else STANDBY_READY_TTL
+            if promotion_state not in ("READY", "PRE_STALE") or not 0 <= time.time() - prepared.last_ok_at <= ttl:
                 log.warning("standby not ready for promotion: %s",
                             _fmt(prepared.server))
                 prepared.status = "STALE"
@@ -1571,7 +1590,8 @@ class Daemon:
             def current():
                 return self.dry_run or (not self._stop and self.network.online() and
                     self.network.snapshot().generation == network_generation and
-                    standby_fingerprint(prepared.server, info=self.platform) == prepared.fingerprint)
+                    standby_fingerprint(prepared.server, info=self.platform) == prepared.fingerprint and
+                    (reason != "ssh-recovery" or self.emergency.recovery_allowed(prepared)))
             try:
                 apply_config_text(
                     prepared.config_text,
@@ -1639,6 +1659,11 @@ class Daemon:
                         self.emergency.confirm_network()
                     if self.network.online() and self.network.snapshot().generation == network_generation:
                         self.state.penalize(prepared.server)
+                    with self._standby_cond:
+                        record = self._reserves.setdefault(candidate_key(prepared.server), Reserve())
+                        record.failed()
+                        self._standby_generation += 1
+                        self._discard_current_standby_locked(prepared.server, "production probe failed")
                     self._rollback_failed_promotion(
                         prepared,
                         prev,
@@ -1663,6 +1688,11 @@ class Daemon:
                         self.emergency.confirm_network()
                     if self.network.online() and self.network.snapshot().generation == network_generation:
                         self.state.penalize(prepared.server)
+                    with self._standby_cond:
+                        record = self._reserves.setdefault(candidate_key(prepared.server), Reserve())
+                        record.failed()
+                        self._standby_generation += 1
+                        self._discard_current_standby_locked(prepared.server, "production target failed")
                     self._rollback_failed_promotion(
                         prepared,
                         prev,
@@ -1694,8 +1724,8 @@ class Daemon:
             self._record_active_health(True)
             with self._standby_cond:
                 self._standby_generation += 1
-                self._scan_attempted.clear()
-                self._scan_retry_at = 0
+                self._reserves.pop(candidate_key(prepared.server), None)
+                self._choose_reserve_locked()
             self.emergency.reset_evidence()
             log.info("standby promoted %s -> %s reason=%s",
                      prev_country, _fmt(prepared.server), reason)
@@ -1818,12 +1848,22 @@ class Daemon:
 
     def _standby_ready_for_fast_path(self) -> bool:
         with self._standby_cond:
-            return self._standby is not None and self._standby.is_usable()
+            return (self._standby is not None and self._standby.is_usable() and
+                    0 <= time.time() - self._standby.last_ok_at <= STANDBY_READY_TTL)
 
     def _fail_threshold_for_current_state(self) -> int:
-        if self._standby_ready_for_fast_path() or self.emergency.manager.snapshot().ready:
-            return max(1, STANDBY_FAIL_THRESHOLD)
         return FAIL_THRESHOLD
+
+    def _failure_confirmed(self) -> bool:
+        return (self.state.proxy_failures_snapshot() >= FAIL_THRESHOLD or
+                self._health_samples.count(False) >= 3)
+
+    def _note_health_sample(self, ok: bool) -> None:
+        key = (self.state.transport, candidate_key(self.state.active) if self.state.active else None)
+        if key != self._health_sample_key:
+            self._health_samples.clear()
+            self._health_sample_key = key
+        self._health_samples.append(ok)
 
     # ---------- health / rotation ----------
     def tick_health(self, *, has_internet: bool | None = None) -> None:
@@ -1862,12 +1902,13 @@ class Daemon:
         if not current():
             return
         if not proxy_ok:
+            self._note_health_sample(False)
             self._record_active_health(False)
             # --- Прокси совсем не работает (даже IP-чекеры не проходят) ---
             fails = self.state.note_proxy_fail()
             threshold = self._fail_threshold_for_current_state()
             log.warning("proxy probe failed (%d/%d)", fails, threshold)
-            if fails < threshold:
+            if not self._failure_confirmed():
                 return
 
             self._handle_rotation_needed(reason="proxy-failing")
@@ -1878,6 +1919,7 @@ class Daemon:
         if not current():
             return
         if not target_ok:
+            self._note_health_sample(False)
             self._record_active_health(False)
             # Целевой ресурс недоступен через этот прокси.
             # Считаем proxy fail — сервер блокирует нужные ресурсы.
@@ -1887,12 +1929,13 @@ class Daemon:
                         "(proxy failures: %d/%d)",
                         target_detail, _fmt(self.state.active),
                         fails, threshold)
-            if fails < threshold:
+            if not self._failure_confirmed():
                 return
 
             self._handle_rotation_needed(reason="target-blocked")
             return
 
+        self._note_health_sample(True)
         if self.state.consecutive_proxy_failures:
             log.info("proxy recovered (active: %s)", _fmt(self.state.active))
             self._notify_active_state(
@@ -1912,6 +1955,9 @@ class Daemon:
 
     def _handle_rotation_needed(self, reason: str) -> None:
         if self.state.transport == "ssh":
+            with self._standby_cond:
+                for record in self._reserves.values():
+                    record.retry_at = min(record.retry_at, time.monotonic() + 1)
             self._wake_standby_worker()
             return
         if self._promotion_running():

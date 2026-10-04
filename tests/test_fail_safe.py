@@ -585,8 +585,7 @@ class FailSafeTests(unittest.TestCase):
             country="Standby",
         )
 
-        with mock.patch.object(standby, "tcp_probe", return_value=True), \
-                mock.patch.object(standby, "build_xray_config_text",
+        with mock.patch.object(standby, "build_xray_config_text",
                                   return_value='{"inbounds":[],"outbounds":[]}'), \
                 mock.patch.object(standby, "validate_config_for_service",
                                   return_value=(True, "ok")), \
@@ -1033,7 +1032,7 @@ class FailSafeTests(unittest.TestCase):
         self.assertIsNone(d._standby)
         notify_mock.assert_not_called()
 
-    def test_daemon_promotes_pre_stale_standby(self) -> None:
+    def test_daemon_rejects_pre_stale_standby(self) -> None:
         from xproxy import daemon
         from xproxy.standby import PreparedStandby
 
@@ -1076,8 +1075,8 @@ class FailSafeTests(unittest.TestCase):
                 mock.patch("xproxy.state._save_active"):
             promoted = d._promote_standby("test-reason")
 
-        self.assertTrue(promoted)
-        apply_mock.assert_called_once()
+        self.assertFalse(promoted)
+        apply_mock.assert_not_called()
         notify_mock.assert_not_called()
 
     def test_ready_standby_promotion_bypasses_rotation_cooldown(self) -> None:
@@ -1094,6 +1093,8 @@ class FailSafeTests(unittest.TestCase):
                 mock.patch.object(d, "_standby_ready_for_fast_path",
                                   return_value=True), \
                 mock.patch.object(d, "_handle_rotation_needed") as handle_mock:
+            d.tick_health()
+            handle_mock.assert_not_called()
             d.tick_health()
 
         self.assertEqual(d.state.consecutive_proxy_failures, STANDBY_FAIL_THRESHOLD)
@@ -1407,7 +1408,7 @@ class FailSafeTests(unittest.TestCase):
         self.assertTrue(promoted)
         self.assertFalse(d._promotion_in_progress)
 
-    def test_waiting_standby_selection_backs_off_after_candidate_pass(self) -> None:
+    def test_standby_selection_excludes_inflight_candidates(self) -> None:
         from xproxy import daemon
 
         active = Server(
@@ -1440,11 +1441,12 @@ class FailSafeTests(unittest.TestCase):
         d.state.active = active
         d._active_waiting_for_standby = True
         d._active_waiting_generation = 3
-        d._standby_waiting_generation = 3
 
         with d._standby_cond:
             self.assertEqual(d._select_standby_candidate_locked(), one)
+            d._inflight[daemon.candidate_key(one)] = one
             self.assertEqual(d._select_standby_candidate_locked(), two)
+            d._inflight[daemon.candidate_key(two)] = two
             self.assertIsNone(d._select_standby_candidate_locked())
 
     def test_subscription_refresh_preserves_matching_standby_slot(self) -> None:
